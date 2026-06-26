@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+venv/
+.env
+local.properties
+*.apk
+.DS_Store
+*.pyo
