@@ -1,10 +1,10 @@
 """
-资产盘点专项拍照工具 App - v3.4.0
+资产盘点专项拍照工具 App - v3.5.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
 - 水印自选模式（3段下拉 X-X-X + 大中小字号 + 位置）
-- 四类拍照引导（远景/近景/内部/瑕疵）
+- 四类拍照引导（远景/近景/内部/瑕疵）+ 连续拍照
 - Excel A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
 - 进度持久化（跨Excel文件可识别已拍条目）
 - 照片路径验证（缩略图不会引用失效路径）
@@ -868,15 +868,19 @@ class GpsManager:
 # ============================================================
 
 class CameraManager:
+    CAMERA_REQUEST_CODE = 0x123
+
     def __init__(self):
         self.photo_path = ""
         self.pending_callback = None
         self.gps = GpsManager()
         self.geocoder = GeoCoder()
-        self._plyer_failed = False
+        self._camera_launched = False
 
     def take_photo(self, callback):
+        """启动相机拍照，拍完后callback(photo_path)被调用，失败传None。"""
         self.pending_callback = callback
+        self._camera_launched = False
         if IS_ANDROID:
             self._request_camera_permission()
         else:
@@ -889,62 +893,82 @@ class CameraManager:
                 self._on_permission_result
             )
         except:
-            self._simulate_photo()
+            self._launch_camera_intent()
 
     def _on_permission_result(self, permissions, grants):
         if all(grants):
-            self._launch_camera()
+            self._launch_camera_intent()
         else:
-            self._simulate_photo()
-
-    def _launch_camera(self):
-        if self._plyer_failed:
-            self._launch_camera_intent()
-            return
-        try:
-            from plyer import camera
-            self.photo_path = os.path.join(
-                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg"
-            )
-            camera.take_picture(filename=self.photo_path, on_complete=self._on_photo_complete)
-        except:
-            self._plyer_failed = True
-            self._launch_camera_intent()
+            if self.pending_callback:
+                self.pending_callback(None)
 
     def _launch_camera_intent(self):
+        """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机，
+        使用 FileProvider 提供输出文件 URI，on_activity_result 回调时检测文件是否存在。
+        """
         try:
-            from android import mActivity
-            from android.content import Intent, FileProvider
-            from android.net import Uri
-            from java.io import File
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            Intent = autoclass('android.content.Intent')
+            File = autoclass('java.io.File')
+
+            activity = PythonActivity.mActivity
+            package_name = activity.getPackageName()
 
             self.photo_path = os.path.join(
-                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg"
+                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
             )
-            intent = Intent("android.media.action.IMAGE_CAPTURE")
             photo_file = File(self.photo_path)
-            uri = FileProvider.getUriForFile(mActivity, mActivity.getPackageName() + ".fileprovider", photo_file)
-            intent.putExtra("android.provider.extra_OUTPUT", uri)
-            intent.addFlags(1)
-            mActivity.startActivityForResult(intent, 0x123)
-            Clock.schedule_once(self._check_intent_result, 3.0)
-        except:
+
+            intent = Intent(Intent.ACTION_IMAGE_CAPTURE)
+
+            FileProvider = None
+            for fp_cls_name in [
+                'androidx.core.content.FileProvider',
+                'android.support.v4.content.FileProvider',
+            ]:
+                try:
+                    FileProvider = autoclass(fp_cls_name)
+                    break
+                except:
+                    continue
+
+            if FileProvider is not None:
+                uri = FileProvider.getUriForFile(activity, package_name + ".fileprovider", photo_file)
+                intent.putExtra("output", uri)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            else:
+                Uri = autoclass('android.net.Uri')
+                uri = Uri.fromFile(photo_file)
+                intent.putExtra("output", uri)
+
+            self._camera_launched = True
+            activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
+        except Exception as e:
+            Logger.error("Camera launch failed: %s" % e)
+            Logger.error(traceback.format_exc())
             self._simulate_photo()
 
-    def _check_intent_result(self, dt):
-        if os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
-            if self.pending_callback:
-                self.pending_callback(self.photo_path)
-        else:
-            Clock.schedule_once(self._check_intent_result, 2.0)
-
-    def _on_photo_complete(self, path):
-        if self.pending_callback and path and os.path.exists(path):
-            self.pending_callback(path)
-        else:
-            self.pending_callback(None)
+    def on_camera_result(self, result_code):
+        """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。"""
+        if not self._camera_launched:
+            return
+        self._camera_launched = False
+        if result_code == -1:  # RESULT_OK
+            if os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
+                if self.pending_callback:
+                    cb = self.pending_callback
+                    self.pending_callback = None
+                    cb(self.photo_path)
+                return
+        if self.pending_callback:
+            cb = self.pending_callback
+            self.pending_callback = None
+            cb(None)
 
     def _simulate_photo(self):
+        """桌面端测试：生成一张模拟照片"""
         self.photo_path = os.path.join(APP_DIR, f"test_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg")
         img = PILImage.new('RGB', (640, 480), (180, 180, 180))
         draw = ImageDraw.Draw(img)
@@ -954,7 +978,7 @@ class CameraManager:
         draw.text((150, 250), now_str, fill=(0, 0, 0), font=font)
         img.save(self.photo_path)
         if self.pending_callback:
-            Clock.schedule_once(lambda dt: self.pending_callback(self.photo_path), 0.5)
+            Clock.schedule_once(lambda dt: self.pending_callback(self.photo_path), 0.3)
 
     def get_location_name(self, lat, lng):
         """根据 GPS 坐标逆地理编码获取地名，供水印「地址名」段使用。
@@ -1043,7 +1067,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.4.0", font_size='12sp',
+            text="v3.5.0", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -1148,26 +1172,28 @@ class PhotoViewerPopup(Popup):
     def __init__(self, row_index, photos, delete_callback, **kwargs):
         super().__init__(**kwargs)
         self.title = f"已拍照片 ({len(photos)}张)"
-        self.size_hint = (0.9, 0.8)
+        self.size_hint = (0.92, 0.8)
         self.row_index = row_index
         self.photos = photos
         self.delete_callback = delete_callback
 
-        main_layout = BoxLayout(orientation='vertical', spacing=8, padding=8)
+        main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
         scroll = ScrollView()
-        list_layout = GridLayout(cols=1, spacing=8, size_hint_y=None)
+        list_layout = GridLayout(cols=1, spacing=dp(8), size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
 
         for i, photo_path in enumerate(photos):
-            item = BoxLayout(orientation='horizontal', size_hint_y=None, height=110, spacing=8)
+            item = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(130), spacing=dp(8))
             if os.path.exists(photo_path):
-                item.add_widget(KivyImage(source=photo_path, size_hint_x=0.35, allow_stretch=True, keep_ratio=True))
+                item.add_widget(KivyImage(source=photo_path, size_hint_x=0.38, allow_stretch=True, keep_ratio=True))
 
-            info_box = BoxLayout(orientation='vertical', spacing=4, size_hint_x=0.65)
-            info_box.add_widget(Label(text=os.path.basename(photo_path), font_size='11sp',
-                                      halign='left', size_hint_y=0.4, text_size=(None, None)))
-            del_btn = Button(text="删除此照片", font_size='12sp', size_hint_y=0.4,
-                            background_color=THEME['danger'], background_normal='')
+            info_box = BoxLayout(orientation='vertical', spacing=dp(6), size_hint_x=0.62)
+            info_box.add_widget(Label(text=os.path.basename(photo_path), font_size='12sp',
+                                      halign='left', valign='top', size_hint_y=0.5,
+                                      text_size=(None, None)))
+            del_btn = Button(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
+                            background_color=THEME['danger'], background_normal='',
+                            color=(1,1,1,1), bold=True)
             del_btn.bind(on_release=lambda x, idx=i: self._delete_photo(idx))
             info_box.add_widget(del_btn)
             item.add_widget(info_box)
@@ -1176,12 +1202,15 @@ class PhotoViewerPopup(Popup):
         scroll.add_widget(list_layout)
         main_layout.add_widget(scroll)
 
-        del_all_btn = Button(text="删除全部照片（重拍）", font_size='14sp', size_hint_y=None, height=44,
-                            background_color=THEME['danger'], background_normal='')
+        del_all_btn = Button(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
+                            background_color=THEME['danger'], background_normal='',
+                            color=(1,1,1,1), bold=True)
         del_all_btn.bind(on_release=self._delete_all)
         main_layout.add_widget(del_all_btn)
 
-        close_btn = Button(text="关闭", font_size='14sp', size_hint_y=None, height=44)
+        close_btn = Button(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
+                          background_color=THEME['accent'], background_normal='',
+                          color=(1,1,1,1), bold=True)
         close_btn.bind(on_release=self.dismiss)
         main_layout.add_widget(close_btn)
         self.content = main_layout
@@ -1398,13 +1427,14 @@ class SettingsScreen(Screen):
 
 class RowWidget(BoxLayout):
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
-                 progress_key, progress_mgr, photo_callback, view_photos_callback, **kwargs):
+                 progress_key, progress_mgr, photo_callback, view_photos_callback, reset_callback, **kwargs):
         super().__init__(**kwargs)
-        self.orientation = 'horizontal'
+        self.orientation = 'vertical'
         self.size_hint_y = None
-        self.height = dp(80)
-        self.padding = [dp(8), dp(6), dp(8), dp(6)]
-        self.spacing = dp(6)
+        self._base_height = dp(120)
+        self.height = self._base_height
+        self.padding = [dp(10), dp(8), dp(10), dp(8)]
+        self.spacing = dp(4)
 
         self.row_index = row_index
         self.borrower = borrower
@@ -1414,6 +1444,7 @@ class RowWidget(BoxLayout):
         self.progress_key = progress_key
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
+        self.reset_callback = reset_callback
         self.progress_mgr = progress_mgr
         self.done = progress_mgr.is_photographed(progress_key)
         self.photo_count = progress_mgr.get_photo_count(progress_key)
@@ -1423,70 +1454,108 @@ class RowWidget(BoxLayout):
             self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[4])
         self.bind(pos=self._update_bg, size=self._update_bg)
 
-        # 信息区域
-        info = BoxLayout(spacing=4, size_hint_x=0.6)
-        info.padding = [4, 0, 0, 0]
-
-        # 客户名
-        name_box = BoxLayout(orientation='vertical')
-        name_box.add_widget(Label(text="客户名", font_size='11sp', color=THEME['text_dim'],
-                                  size_hint_y=0.3, halign='left', text_size=(None, None)))
-        name_box.add_widget(Label(
-            text=borrower[:12] + ("…" if len(borrower) > 12 else ""),
-            font_size='16sp',
-            color=THEME['success'] if self.done else THEME['text'],
-            size_hint_y=0.7, halign='left', text_size=(None, None),
-        ))
-        info.add_widget(name_box)
-
-        # 抵押物地址 + 性质
-        prop_box = BoxLayout(orientation='vertical')
-        prop_box.add_widget(Label(text="地址/性质", font_size='11sp', color=THEME['text_dim'],
-                                  size_hint_y=0.3, halign='left', text_size=(None, None)))
-        addr_short = (address_general + address_precise)[:10]
-        if len((address_general + address_precise)) > 10:
-            addr_short += "…"
-        prop_label = addr_short
+        full_address = (address_general + address_precise).strip()
+        addr_display = full_address if full_address else "（无地址）"
         if property_type:
-            prop_label += " " + property_type[:6]
-        prop_box.add_widget(Label(
-            text=prop_label, font_size='13sp', color=THEME['text'], size_hint_y=0.7,
-            halign='left', text_size=(None, None),
-        ))
-        info.add_widget(prop_box)
+            addr_display += "  [%s]" % property_type
 
-        self.add_widget(info)
+        name_text = borrower if borrower else "（无客户名）"
 
-        # 按钮区域
-        btn_area = BoxLayout(spacing=dp(6), size_hint_x=0.4)
+        # 客户名（加粗，自动换行）
+        self.name_label = Label(
+            text=name_text,
+            font_size='16sp',
+            bold=True,
+            color=THEME['success'] if self.done else THEME['text'],
+            size_hint_y=None,
+            halign='left', valign='middle',
+        )
+        self.name_label.bind(width=self._update_name_text_size)
+        self.name_label.text_size = (None, None)
+        self.name_label.bind(texture_size=self._update_heights)
+        self.add_widget(self.name_label)
+
+        # 地址+性质（自动换行，灰色小字）
+        self.addr_label = Label(
+            text=addr_display,
+            font_size='13sp',
+            color=THEME['text_dim'],
+            size_hint_y=None,
+            halign='left', valign='top',
+        )
+        self.addr_label.bind(width=self._update_addr_text_size)
+        self.addr_label.text_size = (None, None)
+        self.addr_label.bind(texture_size=self._update_heights)
+        self.add_widget(self.addr_label)
+
+        # 间隔
+        self.add_widget(Label(size_hint_y=None, height=dp(4)))
+
+        # 按钮行
+        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
 
         self.photo_btn = Button(
-            text="📷", font_size='20sp', size_hint_x=0.35,
+            text="拍照", font_size='15sp',
+            size_hint_x=0.28,
             background_color=THEME['success'] if self.done else THEME['accent'],
             background_normal='',
+            color=(1, 1, 1, 1), bold=True,
         )
         self.photo_btn.bind(on_release=self._on_photo)
-        btn_area.add_widget(self.photo_btn)
+        btn_row.add_widget(self.photo_btn)
 
         self.view_btn = Button(
-            text="📂%d" % self.photo_count if self.photo_count > 0 else "📂",
-            font_size='15sp', size_hint_x=0.35,
+            text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
+            font_size='14sp', size_hint_x=0.38,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
             background_normal='',
+            color=(1, 1, 1, 1), bold=True,
         )
         self.view_btn.bind(on_release=self._on_view_photos)
-        btn_area.add_widget(self.view_btn)
+        btn_row.add_widget(self.view_btn)
 
-        summary = progress_mgr.get_photo_type_summary(progress_key)
-        status = Label(text=f"✓{summary}" if self.done else "待拍", font_size='13sp',
-                      color=THEME['success'] if self.done else THEME['text_dim'], size_hint_x=0.3)
-        btn_area.add_widget(status)
+        self.reset_btn = Button(
+            text="清零", font_size='14sp', size_hint_x=0.22,
+            background_color=THEME['danger'] if self.photo_count > 0 else (0.35, 0.35, 0.35, 1),
+            background_normal='',
+            color=(1, 1, 1, 1), bold=True,
+            disabled=self.photo_count == 0,
+        )
+        self.reset_btn.bind(on_release=self._on_reset)
+        btn_row.add_widget(self.reset_btn)
 
-        self.add_widget(btn_area)
+        self.type_status = Label(text="", font_size='12sp',
+                                color=THEME['success'] if self.done else THEME['text_dim'],
+                                size_hint_x=0.12)
+        btn_row.add_widget(self.type_status)
+
+        self.add_widget(btn_row)
+
+        self._update_type_status()
+        Clock.schedule_once(lambda dt: self._update_heights(), 0)
+
+    def _update_name_text_size(self, instance, value):
+        instance.text_size = (value, None)
+
+    def _update_addr_text_size(self, instance, value):
+        instance.text_size = (value, None)
+
+    def _update_heights(self, *args):
+        name_h = self.name_label.texture_size[1] if self.name_label.texture_size else dp(24)
+        addr_h = self.addr_label.texture_size[1] if self.addr_label.texture_size else dp(20)
+        self.name_label.height = max(dp(24), name_h + dp(4))
+        self.addr_label.height = max(dp(20), addr_h + dp(4))
+        self.height = self.name_label.height + self.addr_label.height + dp(48) + dp(16) + dp(4)
 
     def _update_bg(self, *args):
         self.bg_rect.pos = self.pos
         self.bg_rect.size = self.size
+
+    def _update_type_status(self):
+        types = self.progress_mgr.get_photo_types(self.progress_key)
+        done_types = sum(1 for t in PHOTO_TYPE_LABELS if types.get(t, False))
+        self.type_status.text = "%d/4" % done_types
+        self.type_status.color = THEME['success'] if done_types >= 4 else (THEME['warning'] if done_types > 0 else THEME['text_dim'])
 
     def _on_photo(self, instance):
         self.photo_callback(self.row_index, self.borrower, self.address_general,
@@ -1495,18 +1564,20 @@ class RowWidget(BoxLayout):
     def _on_view_photos(self, instance):
         self.view_photos_callback(self.row_index)
 
+    def _on_reset(self, instance):
+        self.reset_callback(self.row_index)
+
     def mark_done(self):
         self.done = True
         self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
         self.photo_btn.background_color = THEME['success']
-        self.view_btn.text = "📂%d" % self.photo_count
-        for child in self.children:
-            if isinstance(child, BoxLayout):
-                for c in child.children:
-                    if isinstance(c, Label) and ("✓" in c.text or "待拍" in c.text or "/" in c.text):
-                        c.text = f"✓{self.progress_mgr.get_photo_type_summary(self.progress_key)}"
-                        c.color = THEME['success']
-                        break
+        self.name_label.color = THEME['success']
+        self.view_btn.text = "查看已拍(%d)" % self.photo_count
+        self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1)
+        self.reset_btn.disabled = self.photo_count == 0
+        self.reset_btn.background_color = THEME['danger'] if self.photo_count > 0 else (0.35, 0.35, 0.35, 1)
+        self._update_type_status()
+        Clock.schedule_once(lambda dt: self._update_heights(), 0)
 
 
 # ============================================================
@@ -1532,16 +1603,16 @@ class MainScreen(Screen):
         self._current_property_type = ""
         self._current_photo_type = ""
         self._current_key = ""
+        self._continuous_shooting = False
+        self._photos_in_session = 0
 
         main = BoxLayout(orientation='vertical')
         self._build_ui(main)
         self.add_widget(main)
 
     def _build_ui(self, parent):
-        # 顶部状态栏留白
         parent.add_widget(Label(size_hint_y=None, height=dp(get_status_bar_height_dp())))
 
-        # 顶部标题栏
         title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
         title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='18sp', bold=True, color=THEME['text'],
                                    size_hint_x=0.55, halign='left', valign='middle'))
@@ -1557,7 +1628,6 @@ class MainScreen(Screen):
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
-        # 工具栏
         toolbar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
         open_btn = Button(text="📂 打开Excel", font_size='15sp', size_hint_x=0.38,
                          background_color=THEME['accent'], background_normal='',
@@ -1576,20 +1646,18 @@ class MainScreen(Screen):
         toolbar.add_widget(clear_btn)
         parent.add_widget(toolbar)
 
-        # 列表区域
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
         self.list_layout = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[dp(8), dp(6), dp(8), dp(6)])
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
-        # 底部状态栏
         footer = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
 
-        report_btn = Button(text="📄 生成报告", font_size='15sp',
-                           background_color=THEME['success'], background_normal='',
-                           size_hint_x=0.35, color=(1,1,1,1), bold=True)
-        report_btn.bind(on_release=self._generate_report)
+        report_btn = Button(text="（已屏蔽）生成报告", font_size='14sp',
+                           background_color=(0.35, 0.35, 0.35, 1), background_normal='',
+                           size_hint_x=0.35, color=(0.7, 0.7, 0.7, 1))
+        report_btn.disabled = True
         footer.add_widget(report_btn)
 
         self.status_label = Label(text="请点击「打开Excel」选择文件", font_size='14sp',
@@ -1598,7 +1666,6 @@ class MainScreen(Screen):
         footer.add_widget(self.status_label)
         parent.add_widget(footer)
 
-        # 空状态提示
         self._show_empty_state()
 
     def _show_empty_state(self):
@@ -1610,6 +1677,23 @@ class MainScreen(Screen):
                 size_hint_y=None, height=200,
             )
             self.list_layout.add_widget(msg)
+
+    def _build_header_row(self):
+        header = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36),
+                           padding=[dp(10), dp(4), dp(10), dp(4)], spacing=dp(6))
+        with header.canvas.before:
+            Color(0.20, 0.22, 0.28, 1)
+            self._header_rect = RoundedRectangle(pos=header.pos, size=header.size, radius=[4])
+        header.bind(pos=self._update_header_rect, size=self._update_header_rect)
+        header.add_widget(Label(text="客户名 / 抵押物地址", font_size='13sp', bold=True,
+                                color=THEME['accent'], size_hint_x=0.6, halign='left'))
+        header.add_widget(Label(text="操作", font_size='13sp', bold=True,
+                                color=THEME['accent'], size_hint_x=0.4, halign='center'))
+        return header
+
+    def _update_header_rect(self, instance, *args):
+        self._header_rect.pos = instance.pos
+        self._header_rect.size = instance.size
 
     def _show_file_dialog(self, instance):
         """打开系统文件选择器。Android使用SAF(Intent.ACTION_OPEN_DOCUMENT)获取可访问URI，
@@ -1654,44 +1738,40 @@ class MainScreen(Screen):
             self.status_label.color = THEME['danger']
 
     def on_activity_result(self, request_code, result_code, intent):
-        """处理Android Activity结果回调（文件选择器返回）。
-        此方法由App通过android.activity.bind调用。"""
-        if not hasattr(self, '_android_file_picker_code'):
+        """处理Android Activity结果回调（文件选择器+相机）。"""
+        if request_code == self.camera_mgr.CAMERA_REQUEST_CODE:
+            self.camera_mgr.on_camera_result(result_code)
             return
-        if request_code != self._android_file_picker_code:
-            return
-        # result_code -1 = RESULT_OK
-        if result_code != -1 or intent is None:
-            return
-        try:
-            from jnius import autoclass
-            uri = intent.getData()
-            if uri is None:
+
+        if request_code == getattr(self, '_android_file_picker_code', -1):
+            if result_code != -1 or intent is None:
                 return
-            uri_str = str(uri.toString())
-
-            # 获取持久URI权限
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
-            Intent = autoclass('android.content.Intent')
-            resolver = activity.getContentResolver()
             try:
-                take_flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-                resolver.takePersistableUriPermission(uri, take_flags)
-            except:
-                pass
+                from jnius import autoclass
+                uri = intent.getData()
+                if uri is None:
+                    return
+                uri_str = str(uri.toString())
 
-            # 复制文件到app私有目录
-            dest = os.path.join(APP_DIR, "_imported_excel.xlsx")
-            android_copy_uri_to_app_dir(uri_str, dest)
-            Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
-        except Exception as e:
-            Logger.error("on_activity_result: %s" % e)
-            self.status_label.text = "文件选择失败: %s" % str(e)[:40]
-            self.status_label.color = THEME['danger']
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                activity = PythonActivity.mActivity
+                Intent = autoclass('android.content.Intent')
+                resolver = activity.getContentResolver()
+                try:
+                    take_flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    resolver.takePersistableUriPermission(uri, take_flags)
+                except:
+                    pass
+
+                dest = os.path.join(APP_DIR, "_imported_excel.xlsx")
+                android_copy_uri_to_app_dir(uri_str, dest)
+                Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
+            except Exception as e:
+                Logger.error("on_activity_result (file): %s" % e)
+                self.status_label.text = "文件选择失败: %s" % str(e)[:40]
+                self.status_label.color = THEME['danger']
 
     def _on_file_selected(self, selection):
-        """桌面端plyer filechooser回调"""
         if not selection:
             return
         path = selection[0] if isinstance(selection, list) else str(selection)
@@ -1702,7 +1782,6 @@ class MainScreen(Screen):
             self.status_label.color = THEME['danger']
 
     def _show_path_input_dialog(self):
-        """桌面端备用：手动输入路径"""
         content = BoxLayout(orientation='vertical', spacing=8, padding=8)
         content.add_widget(Label(text="请输入 Excel 文件路径：", size_hint_y=None, height=dp(30),
                                  font_size='14sp'))
@@ -1740,6 +1819,9 @@ class MainScreen(Screen):
         self.list_layout.clear_widgets()
         self.row_widgets = []
 
+        if self.rows:
+            self.list_layout.add_widget(self._build_header_row())
+
         for i, row in enumerate(self.rows):
             borrower = row[0] if len(row) > 0 else ""
             address_general = row[1] if len(row) > 1 else ""
@@ -1755,6 +1837,7 @@ class MainScreen(Screen):
                 progress_key=pk, progress_mgr=self.progress_mgr,
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
+                reset_callback=self._on_reset_photos,
             )
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
@@ -1779,17 +1862,19 @@ class MainScreen(Screen):
         query = self.search_input.text.lower().strip()
         for rw in self.row_widgets:
             if not query or query in rw.borrower.lower():
-                rw.height = dp(80)
                 rw.opacity = 1
+                rw.size_hint_y = None
+                Clock.schedule_once(lambda dt, w=rw: w._update_heights(), 0)
             else:
-                rw.height = 0
                 rw.opacity = 0
+                rw.height = 0
 
     def _clear_search(self, instance):
         self.search_input.text = ""
         self._on_search(None, "")
 
     def _go_settings(self, instance):
+        self._continuous_shooting = False
         self.manager.current = 'settings'
 
     def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
@@ -1799,19 +1884,28 @@ class MainScreen(Screen):
         self._current_addr_precise = address_precise
         self._current_property_type = property_type
         self._current_key = self.progress_mgr._make_key(borrower, (address_general + address_precise).strip())
+        self._photos_in_session = 0
         popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
         popup.open()
 
     def _on_photo_type_selected(self, photo_type):
         self._current_photo_type = photo_type
-        self.status_label.text = "拍照中 (%s)…" % photo_type
+        self._continuous_shooting = True
+        self._photos_in_session = 0
+        self.status_label.text = "正在启动相机 (%s)…" % photo_type
         self.status_label.color = THEME['warning']
-        self.camera_mgr.take_photo(self._on_photo_done)
+        Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.3)
+
+    def _launch_next_photo(self):
+        if self._continuous_shooting:
+            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.5)
 
     def _on_photo_done(self, photo_path):
         if photo_path is None:
-            self.status_label.text = "拍照失败！"
-            self.status_label.color = THEME['danger']
+            self._continuous_shooting = False
+            self.status_label.text = "拍照已取消"
+            self.status_label.color = THEME['text_dim']
+            self._refresh_row_done(self._current_row)
             return
 
         row_index = self._current_row
@@ -1822,13 +1916,13 @@ class MainScreen(Screen):
         photo_type = self._current_photo_type
         key = self._current_key
 
+        self._photos_in_session += 1
         seq = self.progress_mgr.get_next_photo_index(key) + 1
+
         date_str = get_date_str()
         datetime_str = get_datetime_str()
-        full_addr = (addr_general + addr_precise).strip()
 
-        # 水印/重命名/保存都是耗时 IO，放后台线程避免 ANR 闪退
-        self.status_label.text = "处理中…"
+        self.status_label.text = "处理中 (%s-%02d)…" % (photo_type, self._photos_in_session)
         self.status_label.color = THEME['warning']
 
         config_data = self.config.data
@@ -1837,30 +1931,26 @@ class MainScreen(Screen):
 
         def _process():
             try:
-                # 逆地理编码：GPS 坐标 -> 地名（后台线程，不阻塞 UI）
-                # 水印「地址名」段使用 GPS 定位地名，无 GPS 显示提示
                 place_name = self.camera_mgr.get_location_name(lat, lng)
 
-                # 添加水印（段选择模式）
                 PhotoProcessor.add_watermark(
                     photo_path, config_data,
                     time_str=datetime_str, address=place_name,
                     lat=lat, lng=lng,
                 )
 
-                # 生成文件名（段选择模式）
                 filename = PhotoProcessor.generate_filename(
                     naming_segments, borrower, addr_general, addr_precise,
                     property_type, seq, date_str, photo_type,
                 )
+                name_base, ext = os.path.splitext(filename)
+                filename = "%s_%s_%02d%s" % (name_base, photo_type, self._photos_in_session, ext if ext else '.jpg')
                 new_path = os.path.join(APP_DIR, filename)
                 if photo_path != new_path:
                     if os.path.exists(new_path):
-                        name, ext = os.path.splitext(filename)
-                        # 避免重名：追加序号
                         suffix = 2
                         while os.path.exists(new_path):
-                            new_path = os.path.join(APP_DIR, "%s-%02d%s" % (name, suffix, ext))
+                            new_path = os.path.join(APP_DIR, "%s_%s_%02d_%d%s" % (name_base, photo_type, self._photos_in_session, suffix, ext if ext else '.jpg'))
                             suffix += 1
                     os.rename(photo_path, new_path)
 
@@ -1869,6 +1959,7 @@ class MainScreen(Screen):
                 Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename), 0)
             except Exception as e:
                 Logger.error("MainScreen._on_photo_done: %s" % e)
+                Logger.error(traceback.format_exc())
                 err_msg = str(e)
                 Clock.schedule_once(lambda dt: self._on_photo_failed(err_msg), 0)
 
@@ -1877,16 +1968,18 @@ class MainScreen(Screen):
     @mainthread
     def _on_photo_saved(self, row_index, filename):
         self._refresh_row_done(row_index)
-        self.status_label.text = "✓ " + filename
+        self.status_label.text = "✓ %s（继续拍照或按返回键结束）" % filename[:30]
         self.status_label.color = THEME['success']
+        self._launch_next_photo()
 
     @mainthread
     def _on_photo_failed(self, err_msg):
+        self._continuous_shooting = False
         self.status_label.text = "保存失败: %s" % err_msg[:30]
         self.status_label.color = THEME['danger']
 
     def _refresh_row_done(self, row_index):
-        if row_index < len(self.row_widgets):
+        if 0 <= row_index < len(self.row_widgets):
             self.row_widgets[row_index].mark_done()
         self._update_progress()
 
@@ -1895,8 +1988,10 @@ class MainScreen(Screen):
             return
         row = self.rows[row_index]
         borrower = row[0] if len(row) > 0 else ""
-        address = row[1] if len(row) > 1 else ""
-        key = self.progress_mgr._make_key(borrower, address)
+        address_general = row[1] if len(row) > 1 else ""
+        address_precise = row[2] if len(row) > 2 else ""
+        full_addr = (address_general + address_precise).strip()
+        key = self.progress_mgr._make_key(borrower, full_addr)
         photos = self.progress_mgr.get_photos(key)
         if not photos:
             self.status_label.text = "暂无照片"
@@ -1911,49 +2006,41 @@ class MainScreen(Screen):
             return
         row = self.rows[row_index]
         borrower = row[0] if len(row) > 0 else ""
-        address = row[1] if len(row) > 1 else ""
-        key = self.progress_mgr._make_key(borrower, address)
+        address_general = row[1] if len(row) > 1 else ""
+        address_precise = row[2] if len(row) > 2 else ""
+        full_addr = (address_general + address_precise).strip()
+        key = self.progress_mgr._make_key(borrower, full_addr)
         if photo_index == -1:
             self.progress_mgr.delete_all_photos(key)
         else:
             self.progress_mgr.delete_photo(key, photo_index)
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
-    def _generate_report(self, instance):
-        if not self.rows:
-            self.status_label.text = "请先加载 Excel 文件！"
-            self.status_label.color = THEME['danger']
+    def _on_reset_photos(self, row_index):
+        if row_index >= len(self.rows):
             return
-
-        self.status_label.text = "生成报告中…"
+        row = self.rows[row_index]
+        borrower = row[0] if len(row) > 0 else ""
+        address_general = row[1] if len(row) > 1 else ""
+        address_precise = row[2] if len(row) > 2 else ""
+        full_addr = (address_general + address_precise).strip()
+        key = self.progress_mgr._make_key(borrower, full_addr)
+        photos = self.progress_mgr.get_photos(key)
+        for p in photos:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
+        self.progress_mgr.delete_all_photos(key)
+        self._continuous_shooting = False
+        Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
+        self.status_label.text = "已清零该客户照片"
         self.status_label.color = THEME['warning']
 
-        def _do_generate():
-            output_path = self.report_generator.generate(
-                (self.headers, self.rows), self.progress_mgr,
-            )
-            Clock.schedule_once(lambda dt: self._on_report_done(output_path), 0)
-
-        threading.Thread(target=_do_generate).start()
-
-    def _on_report_done(self, output_path):
-        if output_path:
-            self.status_label.text = "✓ 报告已生成"
-            self.status_label.color = THEME['success']
-            content = BoxLayout(orientation='vertical', spacing=8)
-            content.add_widget(Label(text="报告已生成：", font_size='14sp'))
-            content.add_widget(Label(text=output_path, font_size='11sp',
-                                    color=THEME['success'], text_size=(400, None)))
-            if IS_ANDROID:
-                content.add_widget(Label(text="文件已保存到设备", font_size='11sp'))
-            popup = Popup(title='报告生成完成', content=content, size_hint=(0.8, 0.4))
-            close_btn = Button(text="确定", size_hint_y=None, height=40)
-            close_btn.bind(on_release=popup.dismiss)
-            content.add_widget(close_btn)
-            popup.open()
-        else:
-            self.status_label.text = "报告生成失败！"
-            self.status_label.color = THEME['danger']
+    def _generate_report(self, instance):
+        self.status_label.text = "报告功能暂未开放"
+        self.status_label.color = THEME['text_dim']
 
 
 # ============================================================
@@ -1980,24 +2067,25 @@ class LoanPhotoApp(App):
         return sm
 
     def _on_keyboard(self, window, key, scancode, codepoint, modifier):
-        """拦截返回键（key=27 = ESCAPE/BACK）：
-        在主页面/设置页时返回上一页，在欢迎页时双按退出。"""
         if key == 27:
             current = self.sm.current
             if current == 'settings':
                 self.sm.current = 'main'
                 return True
             elif current == 'main':
-                # 主页面按返回→回到欢迎页
+                main_screen = self.sm.get_screen('main')
+                if getattr(main_screen, '_continuous_shooting', False):
+                    main_screen._continuous_shooting = False
+                    main_screen.status_label.text = "已结束连续拍照"
+                    main_screen.status_label.color = THEME['text_dim']
+                    return True
                 self.sm.current = 'welcome'
                 return True
             elif current == 'welcome':
-                # 欢迎页双按退出
                 if hasattr(self, '_back_pressed') and (datetime.now() - self._back_pressed).total_seconds() < 2:
                     self.stop()
                 else:
                     self._back_pressed = datetime.now()
-                    # 在欢迎页显示提示
                     try:
                         from kivy.uix.popup import Popup
                         popup = Popup(title='',
