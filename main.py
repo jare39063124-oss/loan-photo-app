@@ -236,8 +236,32 @@ if IS_ANDROID:
         ANDROID_API = api_version
     except:
         ANDROID_API = 30
+
+    from jnius import PythonJavaClass, java_method
+
+    class _UiRunnable(PythonJavaClass):
+        __javainterfaces__ = ['java/lang/Runnable']
+        def __init__(self, func):
+            super().__init__()
+            self._func = func
+        @java_method('()V')
+        def run(self):
+            try:
+                self._func()
+            except Exception:
+                Logger.error(traceback.format_exc())
+
+    def run_on_ui_thread(func):
+        from jnius import autoclass
+        activity = autoclass('org.kivy.android.PythonActivity').mActivity
+        if activity is not None:
+            activity.runOnUiThread(_UiRunnable(func))
+        else:
+            func()
 else:
     ANDROID_API = 0
+    def run_on_ui_thread(func):
+        func()
 
 
 def get_status_bar_height_dp():
@@ -913,22 +937,21 @@ class CameraManager:
         try:
             from android.permissions import check_permission
             cam_ok = check_permission('android.permission.CAMERA')
-            loc_ok = check_permission('android.permission.ACCESS_FINE_LOCATION')
-            if cam_ok and loc_ok:
+            if cam_ok:
                 self._launch_camera_intent()
                 return
         except:
             pass
         try:
             request_permissions(
-                [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION],
+                [Permission.CAMERA],
                 self._on_permission_result
             )
         except:
             self._launch_camera_intent()
 
     def _on_permission_result(self, permissions, grants):
-        if all(grants):
+        if any(grants):
             self._launch_camera_intent()
         else:
             if self.pending_callback:
@@ -938,131 +961,165 @@ class CameraManager:
         """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机。
         策略：
         1) Android 10+ (API 29+) 使用 MediaStore 创建 content:// URI（无需 FileProvider）
-        2) 低版本尝试 FileProvider（多种类名）
-        3) 兜底：关闭 StrictMode，使用外部缓存目录 file:// URI
+        2) 低版本尝试 FileProvider（多种类名，需要 Manifest 中已声明）
+        3) 兜底：关闭 StrictMode VmPolicy 惩罚，使用外部缓存目录 file:// URI
+        所有启动操作都在 UI 线程执行，避免线程问题。
         """
-        try:
-            from jnius import autoclass
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            Intent = autoclass('android.content.Intent')
-            File = autoclass('java.io.File')
+        def _do_launch():
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                Intent = autoclass('android.content.Intent')
+                File = autoclass('java.io.File')
+                Uri = autoclass('android.net.Uri')
 
-            activity = PythonActivity.mActivity
-            package_name = activity.getPackageName()
-            resolver = activity.getContentResolver()
+                activity = PythonActivity.mActivity
+                if activity is None:
+                    Logger.error("Camera: activity is None")
+                    if self.pending_callback:
+                        cb = self.pending_callback
+                        self.pending_callback = None
+                        Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+                    return
+                package_name = activity.getPackageName()
+                resolver = activity.getContentResolver()
 
-            intent = Intent(Intent.ACTION_IMAGE_CAPTURE)
+                intent = Intent(Intent.ACTION_IMAGE_CAPTURE)
 
-            # ---------- 策略1：Android 10+ 使用 MediaStore ----------
-            uri = None
-            if ANDROID_API >= 29:
+                # ---------- 策略1：Android 10+ 使用 MediaStore ----------
+                uri = None
+                if ANDROID_API >= 29:
+                    try:
+                        ContentValues = autoclass('android.content.ContentValues')
+                        MediaStore_Images = autoclass('android.provider.MediaStore$Images$Media')
+                        cv = ContentValues()
+                        fname = f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                        cv.put(MediaStore_Images.DISPLAY_NAME, fname)
+                        cv.put(MediaStore_Images.MIME_TYPE, "image/jpeg")
+                        media_uri = resolver.insert(MediaStore_Images.EXTERNAL_CONTENT_URI, cv)
+                        if media_uri is not None:
+                            uri = media_uri
+                            self.photo_path = None
+                            self._media_uri = uri
+                            Logger.info("Camera: Using MediaStore URI (API %d)", ANDROID_API)
+                        else:
+                            Logger.warning("Camera: MediaStore insert returned null")
+                    except Exception as e:
+                        Logger.warning("Camera: MediaStore failed: %s", str(e)[:200])
+
+                # ---------- 策略2：FileProvider（需 Manifest 中声明 FileProvider）----------
+                if uri is None:
+                    try:
+                        cache_dir = activity.getExternalCacheDir()
+                        save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
+                        os.makedirs(save_dir, exist_ok=True)
+                        self.photo_path = os.path.join(
+                            save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                        )
+                        photo_file = File(self.photo_path)
+                        if photo_file.exists():
+                            photo_file.delete()
+                        photo_file.createNewFile()
+                        self._media_uri = None
+
+                        provider_classes = [
+                            'androidx.core.content.FileProvider',
+                            'android.support.v4.content.FileProvider',
+                        ]
+                        for fp_cls_name in provider_classes:
+                            try:
+                                FileProvider = autoclass(fp_cls_name)
+                                test_uri = FileProvider.getUriForFile(
+                                    activity, package_name + ".fileprovider", photo_file
+                                )
+                                if test_uri is not None:
+                                    uri = test_uri
+                                    Logger.info("Camera: Using FileProvider %s", fp_cls_name)
+                                    break
+                            except Exception as e:
+                                Logger.warning("Camera: FileProvider %s failed: %s", fp_cls_name, str(e)[:80])
+                                continue
+                    except Exception as e:
+                        Logger.warning("Camera: FileProvider strategy failed: %s", str(e)[:100])
+
+                # ---------- 策略3：关闭 StrictMode + file:// URI（兜底）----------
+                if uri is None:
+                    try:
+                        cache_dir = activity.getExternalCacheDir()
+                        save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
+                        os.makedirs(save_dir, exist_ok=True)
+                        self.photo_path = os.path.join(
+                            save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                        )
+                        photo_file = File(self.photo_path)
+                        if photo_file.exists():
+                            photo_file.delete()
+                        photo_file.createNewFile()
+                        self._media_uri = None
+                        try:
+                            StrictMode = autoclass('android.os.StrictMode')
+                            VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
+                            b = VmPolicyBuilder()
+                            b.penaltyLog()
+                            policy = b.build()
+                            StrictMode.setVmPolicy(policy)
+                            Logger.info("Camera: StrictMode set to penaltyLog, using file:// URI")
+                        except Exception as e:
+                            Logger.warning("Camera: StrictMode config failed: %s", str(e)[:80])
+                        uri = Uri.fromFile(photo_file)
+                        Logger.info("Camera: Using file:// URI: %s", self.photo_path)
+                    except Exception as e:
+                        Logger.error("Camera: file:// URI strategy failed: %s", str(e)[:200])
+
+                if uri is None:
+                    Logger.error("Camera: All URI strategies failed!")
+                    if self.pending_callback:
+                        cb = self.pending_callback
+                        self.pending_callback = None
+                        Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+                    return
+
+                intent.putExtra("output", uri)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+                # 检查是否有相机应用能处理此 intent
+                pm = activity.getPackageManager()
+                resolves = pm.queryIntentActivities(intent, 0)
+                if resolves is None or resolves.size() == 0:
+                    Logger.error("Camera: No camera app found that can handle IMAGE_CAPTURE")
+                    if self.pending_callback:
+                        cb = self.pending_callback
+                        self.pending_callback = None
+                        Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+                    return
+                Logger.info("Camera: Found %d camera app(s)", resolves.size())
+
+                # 授予所有匹配的相机应用 URI 临时权限
                 try:
                     from jnius import cast
-                    ContentValues = autoclass('android.content.ContentValues')
-                    MediaStore_Images = autoclass('android.provider.MediaStore$Images$Media')
-                    cv = ContentValues()
-                    fname = f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                    cv.put(MediaStore_Images.DISPLAY_NAME, fname)
-                    cv.put(MediaStore_Images.MIME_TYPE, "image/jpeg")
-                    cv.put(MediaStore_Images.RELATIVE_PATH, "Pictures/AssetPhotos")
-                    media_uri = resolver.insert(MediaStore_Images.EXTERNAL_CONTENT_URI, cv)
-                    if media_uri is not None:
-                        uri = media_uri
-                        self.photo_path = None  # 标记为 MediaStore URI，稍后读取
-                        self._media_uri = uri
-                        Logger.info("Camera: Using MediaStore URI (API %d)", ANDROID_API)
+                    for i in range(resolves.size()):
+                        resolve_info = resolves.get(i)
+                        pkg = resolve_info.activityInfo.packageName
+                        activity.grantUriPermission(pkg, uri,
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 except Exception as e:
-                    Logger.warning("Camera: MediaStore failed: %s", str(e)[:100])
+                    Logger.warning("Camera: grantUriPermission failed: %s", str(e)[:80])
 
-            # ---------- 策略2：FileProvider ----------
-            if uri is None:
-                os.makedirs(APP_DIR, exist_ok=True)
-                # 优先使用外部缓存目录（权限更宽松）
-                cache_dir = None
-                try:
-                    cache_dir = activity.getExternalCacheDir()
-                except:
-                    pass
-                save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
-                self.photo_path = os.path.join(
-                    save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                )
-                photo_file = File(self.photo_path)
-                self._media_uri = None
-
-                provider_classes = [
-                    'androidx.core.content.FileProvider',
-                    'android.support.v4.content.FileProvider',
-                    'org.kivy.android.FileProvider',
-                    'org.kivy.android.GenericFileProvider',
-                ]
-                for fp_cls_name in provider_classes:
-                    try:
-                        FileProvider = autoclass(fp_cls_name)
-                        test_uri = FileProvider.getUriForFile(activity, package_name + ".fileprovider", photo_file)
-                        if test_uri is not None:
-                            uri = test_uri
-                            Logger.info("Camera: Using FileProvider %s", fp_cls_name)
-                            break
-                    except Exception as e:
-                        continue
-
-            # ---------- 策略3：关闭 StrictMode + file:// URI（兜底）----------
-            if uri is None:
-                os.makedirs(APP_DIR, exist_ok=True)
-                cache_dir = None
-                try:
-                    cache_dir = activity.getExternalCacheDir()
-                except:
-                    pass
-                save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
-                self.photo_path = os.path.join(
-                    save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                )
-                photo_file = File(self.photo_path)
-                self._media_uri = None
-                try:
-                    StrictMode = autoclass('android.os.StrictMode')
-                    VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
-                    policy = VmPolicyBuilder().build()
-                    StrictMode.setVmPolicy(policy)
-                    Logger.info("Camera: StrictMode disabled, using file:// URI fallback")
-                except Exception:
-                    pass
-                Uri = autoclass('android.net.Uri')
-                uri = Uri.fromFile(photo_file)
-
-            intent.putExtra("output", uri)
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-
-            # 授予所有可能的相机应用 URI 临时权限
-            try:
-                List = autoclass('java.util.List')
-                from jnius import cast
-                resolves = activity.getPackageManager().queryIntentActivities(intent, 0)
-                for i in range(resolves.size()):
-                    resolve_info = resolves.get(i)
-                    pkg = resolve_info.activityInfo.packageName
-                    activity.grantUriPermission(pkg, uri,
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                self._camera_launched = True
+                activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
+                Logger.info("Camera: Intent launched successfully with URI type: %s",
+                            "MediaStore" if self._media_uri else ("content" if str(uri.toString()).startswith("content:") else "file"))
             except Exception as e:
-                Logger.warning("Camera: grantUriPermission failed: %s", str(e)[:80])
-
-            self._camera_launched = True
-            activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
-            Logger.info("Camera: Intent launched")
-        except Exception as e:
-            Logger.error("Camera launch failed: %s" % e)
-            Logger.error(traceback.format_exc())
-            if IS_ANDROID:
+                Logger.error("Camera launch failed: %s" % e)
+                Logger.error(traceback.format_exc())
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
                     Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
-            else:
-                self._simulate_photo()
+
+        # 确保在 UI 线程启动相机（权限回调可能在非 UI 线程）
+        run_on_ui_thread(_do_launch)
 
     def on_camera_result(self, result_code):
         """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。"""
