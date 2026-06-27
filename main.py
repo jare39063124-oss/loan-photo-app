@@ -29,23 +29,51 @@ import hashlib
 CRASH_LOG_FILE = None
 _EARLY_IS_ANDROID = ('ANDROID_ARGUMENT' in os.environ) or (sys.platform == 'android')
 
-def _get_android_external_dir():
-    """安全获取 Android 外部存储目录"""
-    from android.storage import getExternalStorageDirectory
-    return getExternalStorageDirectory()
+def _resolve_android_app_dir():
+    """返回 Android 上可写的 app 专属外部存储路径（无需权限、不受 scoped storage 限制）。
+
+    路径 = /storage/emulated/0/Android/data/<package>/files/loan_photos
+    用户可通过文件管理器访问：内部存储 → Android → data → <package> → files → loan_photos
+
+    所有 Android 版本均无需运行时权限；Android 10+ scoped storage 下也可写。
+    """
+    if not _EARLY_IS_ANDROID:
+        return os.path.join(os.path.expanduser('~'), 'loan_photos')
+
+    # 1) 首选：App-specific external storage（无需权限）
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        activity = PythonActivity.mActivity
+        if activity is not None:
+            ext_files_dir = activity.getExternalFilesDir(None)
+            if ext_files_dir is not None:
+                base = str(ext_files_dir.getAbsolutePath())
+                if base and base.lower() != 'null':
+                    return os.path.join(base, 'loan_photos')
+    except Exception:
+        pass
+
+    # 2) 退路1：python-for-android 私有内部存储（一定可写，但用户在文件管理器看不到）
+    try:
+        home = os.path.expanduser('~')
+        if home and os.path.isdir(home):
+            return os.path.join(home, 'loan_photos')
+    except Exception:
+        pass
+
+    # 3) 退路2：临时目录（最差兜底）
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), 'loan_photos')
 
 def setup_crash_handler():
     global CRASH_LOG_FILE
     try:
-        if _EARLY_IS_ANDROID:
-            ext = _get_android_external_dir()
-            log_dir = os.path.join(ext, 'loan_photos')
-        else:
-            log_dir = os.path.join(os.path.expanduser('~'), 'loan_photos')
+        log_dir = _resolve_android_app_dir()
         os.makedirs(log_dir, exist_ok=True)
         CRASH_LOG_FILE = os.path.join(log_dir, 'crash_log.txt')
     except Exception:
-        # 最后兜底：写到家目录而非脚本旁（脚本在 APK 内只读）
+        # 最后兜底：写到当前目录（APK 内只读会失败，但不会抛出）
         try:
             log_dir = os.path.join(os.path.expanduser('~'), 'loan_photos')
             os.makedirs(log_dir, exist_ok=True)
@@ -111,7 +139,6 @@ IS_ANDROID = platform == 'android'
 
 if IS_ANDROID:
     from android.permissions import request_permissions, Permission
-    from android.storage import getExternalStorageDirectory
     try:
         from android import api_version
         ANDROID_API = api_version
@@ -121,11 +148,21 @@ else:
     ANDROID_API = 0
 
 # === 目录 ===
-if IS_ANDROID:
-    APP_DIR = os.path.join(getExternalStorageDirectory(), 'loan_photos')
-else:
+# 复用 setup_crash_handler() 已解析出的 app 专属外部存储路径：
+# /storage/emulated/0/Android/data/<package>/files/loan_photos/
+# - 无需任何运行时权限（所有 Android 版本）
+# - 不受 Android 10+ scoped storage 限制
+# - 用户可通过文件管理器访问
+APP_DIR = _resolve_android_app_dir()
+try:
+    os.makedirs(APP_DIR, exist_ok=True)
+except Exception as e:
+    # 极端情况下创建失败，回退到 app 私有内部存储（一定可写）
     APP_DIR = os.path.join(os.path.expanduser('~'), 'loan_photos')
-os.makedirs(APP_DIR, exist_ok=True)
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 PROGRESS_FILE = os.path.join(APP_DIR, 'photo_progress.json')
 CONFIG_FILE = os.path.join(APP_DIR, 'app_config.json')
