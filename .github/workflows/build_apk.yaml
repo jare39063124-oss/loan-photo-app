@@ -74,8 +74,10 @@ jobs:
         
     - name: Install Buildozer Android target dependencies
       run: |
-        # Install required Android SDK packages
-        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
+        # Accept ALL SDK licenses first
+        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+        # Install required Android SDK packages (pinned versions)
+        yes | $HOME/android-sdk/cmdline-tools/latest/bin.sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653" "cmdline-tools;latest"
         
     - name: Build debug APK
       run: |
