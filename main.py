@@ -754,18 +754,20 @@ class CameraManager:
         if self.pending_callback:
             Clock.schedule_once(lambda dt: self.pending_callback(self.photo_path), 0.5)
 
-    def get_location_name(self, lat, lng, fallback=""):
+    def get_location_name(self, lat, lng):
         """根据 GPS 坐标逆地理编码获取地名，供水印「地址名」段使用。
         在后台线程调用（HTTP/计算不会阻塞 UI）。
-        无 GPS 或解析失败时回退到 fallback（Excel 抵押物地址）。"""
+        无 GPS 时返回 'GPS未开启或无权限'。"""
         if lat and lng:
             try:
                 name = self.geocoder.reverse_geocode(float(lng), float(lat))
                 if name:
                     return name
+                return "GPS定位解析失败"
             except Exception as e:
                 Logger.error("CameraManager.get_location_name: %s" % e)
-        return fallback
+                return "GPS定位解析失败"
+        return "GPS未开启或无权限"
 
 # ============================================================
 # 自定义小组件
@@ -1509,8 +1511,8 @@ class MainScreen(Screen):
         def _process():
             try:
                 # 逆地理编码：GPS 坐标 -> 地名（后台线程，不阻塞 UI）
-                # 水印「地址名」段使用 GPS 定位地名，无 GPS 时回退到 Excel 地址
-                place_name = self.camera_mgr.get_location_name(lat, lng, fallback=full_addr)
+                # 水印「地址名」段使用 GPS 定位地名，无 GPS 显示提示
+                place_name = self.camera_mgr.get_location_name(lat, lng)
 
                 # 添加水印（段选择模式）
                 PhotoProcessor.add_watermark(
