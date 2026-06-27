@@ -56,10 +56,11 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip setuptools wheel
-        pip install buildozer
+        pip install buildozer>=1.5.0
         pip install kivy[base]
         pip install openpyxl plyer pillow
         pip install cython
+        pip install pyjnius
         
     - name: Install Android SDK
       run: |
@@ -74,7 +75,7 @@ jobs:
     - name: Install Buildozer Android target dependencies
       run: |
         # Install required Android SDK packages
-        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
+        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;28c"
         
     - name: Build debug APK
       run: |
