@@ -72,7 +72,20 @@ jobs:
         cat local.properties
 
     - name: Build APK
-      run: buildozer android debug
+      run: |
+        set -o pipefail
+        buildozer android debug 2>&1 | tee buildozer.log
+        EXIT_CODE=${PIPESTATUS[0]}
+        echo "=== EXIT CODE: $EXIT_CODE ==="
+        ls -la bin/ 2>/dev/null || echo "No bin dir"
+        exit $EXIT_CODE
+
+    - name: Upload build log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: buildozer-log
+        path: buildozer.log
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
