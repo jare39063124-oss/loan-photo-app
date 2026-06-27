@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.3.3
+资产盘点专项拍照工具 App - v3.4.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -238,6 +238,80 @@ if IS_ANDROID:
         ANDROID_API = 30
 else:
     ANDROID_API = 0
+
+
+def get_status_bar_height_dp():
+    """获取Android状态栏高度（dp），非Android返回0"""
+    if not IS_ANDROID:
+        return 0
+    try:
+        from jnius import autoclass
+        activity = autoclass('org.kivy.android.PythonActivity').mActivity
+        resources = activity.getResources()
+        resource_id = resources.getIdentifier('status_bar_height', 'dimen', 'android')
+        if resource_id > 0:
+            px = resources.getDimensionPixelSize(resource_id)
+            density = resources.getDisplayMetrics().density
+            return int(px / density) + 2
+    except:
+        pass
+    return 28
+
+
+def setup_android_status_bar():
+    """在Android上设置状态栏颜色、禁用edge-to-edge，防止内容被遮挡"""
+    if not IS_ANDROID:
+        return
+    try:
+        from jnius import autoclass
+        activity = autoclass('org.kivy.android.PythonActivity').mActivity
+        window = activity.getWindow()
+        if ANDROID_API >= 30:
+            window.setDecorFitsSystemWindows(True)
+        # 状态栏颜色用深色（与主题bg一致: #1C1C24）
+        window.setStatusBarColor(0xFF1C1C24)
+        # 状态栏文字浅色（白色图标，适配深色背景）
+        from jnius import autoclass as _ac
+        View = _ac('android.view.View')
+        decor = window.getDecorView()
+        flags = decor.getSystemUiVisibility()
+        # 清除 LIGHT_STATUS_BAR 标志（使状态栏图标为白色）
+        flags = flags & ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        decor.setSystemUiVisibility(flags)
+    except Exception as e:
+        Logger.warning("setup_android_status_bar: %s" % e)
+
+
+def android_copy_uri_to_app_dir(uri_str, dest_path):
+    """通过Android ContentResolver从content URI或文件路径复制文件到app私有目录，
+    解决scoped storage下PermissionError问题。
+    支持: content:// URI 和 /storage/... 路径
+    """
+    from jnius import autoclass
+    FileInputStream = autoclass('java.io.FileInputStream')
+    FileOutputStream = autoclass('java.io.FileOutputStream')
+    File = autoclass('java.io.File')
+    Uri = autoclass('android.net.Uri')
+    activity = autoclass('org.kivy.android.PythonActivity').mActivity
+    resolver = activity.getContentResolver()
+
+    if uri_str.startswith('content://'):
+        uri = Uri.parse(uri_str)
+        in_stream = resolver.openInputStream(uri)
+    else:
+        # 尝试直接用文件路径
+        in_stream = FileInputStream(uri_str)
+
+    out_stream = FileOutputStream(dest_path)
+    buffer = bytearray(8192)
+    while True:
+        read = in_stream.read(buffer)
+        if read == -1:
+            break
+        out_stream.write(buffer, 0, read)
+    in_stream.close()
+    out_stream.close()
+    return dest_path
 
 # === 目录 ===
 # 复用 setup_crash_handler() 已解析出的 app 专属外部存储路径：
@@ -923,11 +997,11 @@ class SectionLabel(Label):
     def __init__(self, text="", **kwargs):
         super().__init__(**kwargs)
         self.text = text
-        self.font_size = '14sp'
+        self.font_size = '17sp'
         self.bold = True
         self.color = THEME['accent']
         self.size_hint_y = None
-        self.height = dp(32)
+        self.height = dp(40)
         self.halign = 'left'
         self.valign = 'middle'
 
@@ -941,40 +1015,41 @@ class WelcomeScreen(Screen):
         super().__init__(**kwargs)
         self.name = 'welcome'
 
-        root = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(8))
+        root = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(10))
 
-        # 顶部留白
-        root.add_widget(Label(size_hint_y=0.05))
+        # 顶部状态栏留白（Android上为状态栏高度，桌面端为小间距）
+        self._status_spacer = Label(size_hint_y=None, height=dp(get_status_bar_height_dp()))
+        root.add_widget(self._status_spacer)
 
         # Logo 图标
         root.add_widget(Label(
-            text="📷", font_size='64sp',
-            size_hint_y=None, height=dp(80), color=THEME['accent'],
+            text="📷", font_size='72sp',
+            size_hint_y=None, height=dp(90), color=THEME['accent'],
         ))
 
         # 标题
         root.add_widget(Label(
-            text="资产盘点专项拍照工具", font_size='24sp',
+            text="资产盘点专项拍照工具", font_size='26sp',
             bold=True, color=THEME['text'],
-            size_hint_y=None, height=dp(40),
+            size_hint_y=None, height=dp(48),
         ))
 
         # 副标题
         root.add_widget(Label(
-            text="银行抵押物现场勘查工具", font_size='14sp',
+            text="银行抵押物现场勘查工具", font_size='15sp',
             color=THEME['text_dim'],
-            size_hint_y=None, height=dp(28),
+            size_hint_y=None, height=dp(32),
         ))
 
         # 版本
         root.add_widget(Label(
-            text="v3.3.3", font_size='11sp',
+            text="v3.4.0", font_size='12sp',
             color=THEME['text_dim'],
-            size_hint_y=None, height=dp(20),
+            size_hint_y=None, height=dp(24),
         ))
 
         # 间距
-        root.add_widget(Label(size_hint_y=0.05))
+        root.add_widget(Label(size_hint_y=None, height=dp(12)))
 
         # 功能简介卡片
         feat_card = CardWidget(size_hint_y=None)
@@ -987,11 +1062,11 @@ class WelcomeScreen(Screen):
         ]
         for feat in features:
             feat_card.add_widget(Label(
-                text=feat, font_size='13sp',
+                text=feat, font_size='15sp',
                 color=THEME['text_dim'],
-                size_hint_y=None, height=dp(26),
+                size_hint_y=None, height=dp(32),
                 halign='left', valign='middle',
-                text_size=(None, dp(26)),
+                text_size=(None, dp(32)),
             ))
         root.add_widget(feat_card)
 
@@ -999,20 +1074,20 @@ class WelcomeScreen(Screen):
         root.add_widget(Label(size_hint_y=1))
 
         # 作者信息
-        author_card = CardWidget(size_hint_y=None, height=dp(70))
+        author_card = CardWidget(size_hint_y=None, height=dp(80))
         author_card.add_widget(Label(
-            text=AUTHOR_INFO, font_size='11sp',
+            text=AUTHOR_INFO, font_size='13sp',
             color=THEME['text_dim'], halign='center', valign='middle',
         ))
         root.add_widget(author_card)
 
         # 间距
-        root.add_widget(Label(size_hint_y=None, height=dp(8)))
+        root.add_widget(Label(size_hint_y=None, height=dp(10)))
 
-        # 进入按钮 - 高对比度、大尺寸、明确可点击
+        # 进入按钮 - 大尺寸适合手指点击
         start_btn = Button(
-            text="开始使用", font_size='20sp',
-            size_hint_y=None, height=dp(56),
+            text="开始使用", font_size='22sp',
+            size_hint_y=None, height=dp(60),
             background_color=THEME['accent'],
             background_normal='',
             color=(1, 1, 1, 1),
@@ -1039,21 +1114,22 @@ class PhotoTypePopup(Popup):
         self.auto_dismiss = True
         self.on_select = on_select
 
-        layout = BoxLayout(orientation='vertical', spacing=8, padding=12)
-        layout.add_widget(Label(text="请选择本次拍摄的照片类型：", font_size='14sp', size_hint_y=None, height=30))
+        layout = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(14))
+        layout.add_widget(Label(text="请选择本次拍摄的照片类型：", font_size='16sp', size_hint_y=None, height=dp(40)))
 
         for type_name, type_desc in PHOTO_TYPES:
             btn = Button(
-                text=f"{type_name}\n{type_desc}", font_size='13sp',
-                size_hint_y=None, height=60,
+                text=f"{type_name}\n{type_desc}", font_size='16sp',
+                size_hint_y=None, height=dp(72),
                 background_color=THEME['accent'], background_normal='',
-                halign='center',
+                halign='center', color=(1,1,1,1), bold=True,
             )
             btn.bind(on_release=lambda x, t=type_name: self._select(t))
             layout.add_widget(btn)
 
-        cancel_btn = Button(text="取消", font_size='14sp', size_hint_y=None, height=40,
-                           background_color=(0.5, 0.5, 0.5, 1), background_normal='')
+        cancel_btn = Button(text="取消", font_size='16sp', size_hint_y=None, height=dp(52),
+                           background_color=(0.5, 0.5, 0.5, 1), background_normal='',
+                           color=(1,1,1,1))
         cancel_btn.bind(on_release=self.dismiss)
         layout.add_widget(cancel_btn)
         self.content = layout
@@ -1129,42 +1205,47 @@ class SettingsScreen(Screen):
         self.name = 'settings'
         self.config = app_config
 
-        main = BoxLayout(orientation='vertical', padding=12, spacing=8)
+        main = BoxLayout(orientation='vertical', padding=dp(12), spacing=dp(8))
 
-        # 标题栏
-        title_bar = BoxLayout(size_hint_y=None, height=48, spacing=8)
-        back_btn = Button(text="← 返回", font_size='14sp', size_hint_x=0.25,
-                         background_color=THEME['accent'], background_normal='')
+        # 顶部状态栏留白
+        main.add_widget(Label(size_hint_y=None, height=dp(get_status_bar_height_dp())))
+
+        # 标题栏 - 增大高度和按钮
+        title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
+        back_btn = Button(text="← 返回", font_size='18sp', size_hint_x=0.28,
+                         background_color=THEME['accent'], background_normal='',
+                         color=(1,1,1,1), bold=True,
+                         size_hint_y=None, height=dp(52))
         back_btn.bind(on_release=self._go_back)
         title_bar.add_widget(back_btn)
-        title_bar.add_widget(Label(text="设置", font_size='18sp', bold=True, color=THEME['text']))
+        title_bar.add_widget(Label(text="设置", font_size='22sp', bold=True, color=THEME['text']))
         main.add_widget(title_bar)
 
         scroll = ScrollView()
-        content = BoxLayout(orientation='vertical', spacing=10, size_hint_y=None, padding=[0, 0, 0, 20])
+        content = BoxLayout(orientation='vertical', spacing=dp(12), size_hint_y=None, padding=[dp(4), dp(4), dp(4), dp(30)])
         content.bind(minimum_height=content.setter('height'))
 
-        # === 命名规则（4段下拉自选模式 X-X-X-X）===
+        # === 命名规则 ===
         naming_card = CardWidget(size_hint_y=None)
         naming_card.bind(minimum_height=naming_card.setter('height'))
 
         naming_card.add_widget(SectionLabel(text="📋 照片命名规则"))
 
         naming_card.add_widget(Label(text="格式：X-X-X-X（每段自选，空值段自动省略）",
-                                     font_size='10sp', color=THEME['text_dim'],
-                                     size_hint_y=None, height=18))
+                                     font_size='13sp', color=THEME['text_dim'],
+                                     size_hint_y=None, height=dp(24)))
 
         cur_segments = self.config.get('naming_segments', DEFAULT_CONFIG['naming_segments'])
         self.naming_spinners = []
         for idx in range(4):
-            row = BoxLayout(size_hint_y=None, height=40, spacing=6)
-            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='11sp',
-                                 color=THEME['text_dim'], size_hint_x=0.18))
+            row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='15sp',
+                                 color=THEME['text_dim'], size_hint_x=0.2))
             cur_val = cur_segments[idx] if idx < len(cur_segments) else "空值"
             sp = Spinner(
                 text=cur_val,
                 values=NAMING_SEGMENT_OPTIONS,
-                size_hint_x=0.82, font_size='11sp',
+                size_hint_x=0.8, font_size='15sp',
             )
             sp.bind(text=lambda inst, val, i=idx: self._on_naming_segment_change(i, val))
             self.naming_spinners.append(sp)
@@ -1172,46 +1253,47 @@ class SettingsScreen(Screen):
             naming_card.add_widget(row)
 
         preview = self._get_naming_preview()
-        self.naming_preview_label = Label(text="预览：%s" % preview, font_size='11sp',
-                                          color=THEME['text_dim'], size_hint_y=None, height=22)
+        self.naming_preview_label = Label(text="预览：%s" % preview, font_size='13sp',
+                                          color=THEME['text_dim'], size_hint_y=None, height=dp(28))
         naming_card.add_widget(self.naming_preview_label)
 
-        save_naming_btn = Button(text="保存命名规则", font_size='13sp', size_hint_y=None, height=40,
-                                background_color=THEME['accent'], background_normal='')
+        save_naming_btn = Button(text="保存命名规则", font_size='16sp', size_hint_y=None, height=dp(52),
+                                background_color=THEME['accent'], background_normal='',
+                                color=(1,1,1,1), bold=True)
         save_naming_btn.bind(on_release=self._save_naming)
         naming_card.add_widget(save_naming_btn)
 
         content.add_widget(naming_card)
 
-        # === 水印设置（3段下拉自选模式 X-X-X）===
+        # === 水印设置 ===
         watermark_card = CardWidget(size_hint_y=None)
         watermark_card.bind(minimum_height=watermark_card.setter('height'))
 
         watermark_card.add_widget(SectionLabel(text="💧 水印设置"))
 
         # 水印开关
-        toggle_box = BoxLayout(size_hint_y=None, height=36, spacing=8)
-        toggle_box.add_widget(Label(text="启用水印", font_size='13sp', color=THEME['text'], size_hint_x=0.6))
+        toggle_box = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        toggle_box.add_widget(Label(text="启用水印", font_size='16sp', color=THEME['text'], size_hint_x=0.6))
         self.wm_check = CheckBox(active=self.config.get('watermark_enabled', True), size_hint_x=0.4)
         toggle_box.add_widget(self.wm_check)
         watermark_card.add_widget(toggle_box)
 
         watermark_card.add_widget(Label(text="水印格式：X-X-X（每段自选）",
-                                        font_size='10sp', color=THEME['text_dim'],
-                                        size_hint_y=None, height=18))
+                                        font_size='13sp', color=THEME['text_dim'],
+                                        size_hint_y=None, height=dp(24)))
 
         # 水印段选择（3段）
         cur_wm_segments = self.config.get('watermark_segments', DEFAULT_CONFIG['watermark_segments'])
         self.wm_spinners = []
         for idx in range(3):
-            row = BoxLayout(size_hint_y=None, height=40, spacing=6)
-            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='11sp',
-                                 color=THEME['text_dim'], size_hint_x=0.18))
+            row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='15sp',
+                                 color=THEME['text_dim'], size_hint_x=0.2))
             cur_val = cur_wm_segments[idx] if idx < len(cur_wm_segments) else "空值"
             sp = Spinner(
                 text=cur_val,
                 values=WATERMARK_SEGMENT_OPTIONS,
-                size_hint_x=0.82, font_size='11sp',
+                size_hint_x=0.8, font_size='15sp',
             )
             sp.bind(text=lambda inst, val, i=idx: self._on_wm_segment_change(i, val))
             self.wm_spinners.append(sp)
@@ -1219,47 +1301,48 @@ class SettingsScreen(Screen):
             watermark_card.add_widget(row)
 
         # 水印位置
-        pos_box = BoxLayout(size_hint_y=None, height=40, spacing=8)
-        pos_box.add_widget(Label(text="位置：", font_size='12sp', color=THEME['text'], size_hint_x=0.3))
+        pos_box = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        pos_box.add_widget(Label(text="位置：", font_size='15sp', color=THEME['text'], size_hint_x=0.25))
         cur_pos = self.config.get('watermark_position', DEFAULT_CONFIG['watermark_position'])
         cur_pos_label = WATERMARK_POSITION_LABELS.get(cur_pos, '右下')
         self.pos_spinner = Spinner(
             text=cur_pos_label,
             values=list(WATERMARK_POSITION_LABELS.values()),
-            size_hint_x=0.7, font_size='12sp',
+            size_hint_x=0.75, font_size='15sp',
         )
         pos_box.add_widget(self.pos_spinner)
         watermark_card.add_widget(pos_box)
 
         # 字号（大/中/小）
-        font_size_box = BoxLayout(size_hint_y=None, height=40, spacing=8)
-        font_size_box.add_widget(Label(text="字号：", font_size='12sp', color=THEME['text'], size_hint_x=0.3))
+        font_size_box = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        font_size_box.add_widget(Label(text="字号：", font_size='15sp', color=THEME['text'], size_hint_x=0.25))
         cur_fs = self.config.get('watermark_font_size', DEFAULT_CONFIG['watermark_font_size'])
         if cur_fs not in WATERMARK_FONT_SIZE_OPTIONS:
             cur_fs = '中'
         self.font_spinner = Spinner(
             text=cur_fs,
             values=WATERMARK_FONT_SIZE_OPTIONS,
-            size_hint_x=0.7, font_size='12sp',
+            size_hint_x=0.75, font_size='15sp',
         )
         font_size_box.add_widget(self.font_spinner)
         watermark_card.add_widget(font_size_box)
 
-        save_wm_btn = Button(text="保存水印设置", font_size='13sp', size_hint_y=None, height=40,
-                            background_color=THEME['accent'], background_normal='')
+        save_wm_btn = Button(text="保存水印设置", font_size='16sp', size_hint_y=None, height=dp(52),
+                            background_color=THEME['accent'], background_normal='',
+                            color=(1,1,1,1), bold=True)
         save_wm_btn.bind(on_release=self._save_watermark)
         watermark_card.add_widget(save_wm_btn)
 
         content.add_widget(watermark_card)
 
         # === 关于 ===
-        about_card = CardWidget(size_hint_y=None, height=120)
+        about_card = CardWidget(size_hint_y=None, height=dp(140))
         about_card.add_widget(SectionLabel(text="ℹ️ 关于"))
-        about_card.add_widget(Label(text=AUTHOR_INFO, font_size='12sp',
+        about_card.add_widget(Label(text=AUTHOR_INFO, font_size='14sp',
                                     color=THEME['text_dim'], halign='center'))
         content.add_widget(about_card)
 
-        content.add_widget(Label(size_hint_y=None, height=20))
+        content.add_widget(Label(size_hint_y=None, height=dp(20)))
 
         scroll.add_widget(content)
         main.add_widget(scroll)
@@ -1319,9 +1402,9 @@ class RowWidget(BoxLayout):
         super().__init__(**kwargs)
         self.orientation = 'horizontal'
         self.size_hint_y = None
-        self.height = 68
-        self.padding = [6, 4, 6, 4]
-        self.spacing = 4
+        self.height = dp(80)
+        self.padding = [dp(8), dp(6), dp(8), dp(6)]
+        self.spacing = dp(6)
 
         self.row_index = row_index
         self.borrower = borrower
@@ -1346,11 +1429,11 @@ class RowWidget(BoxLayout):
 
         # 客户名
         name_box = BoxLayout(orientation='vertical')
-        name_box.add_widget(Label(text="客户名", font_size='9sp', color=THEME['text_dim'],
+        name_box.add_widget(Label(text="客户名", font_size='11sp', color=THEME['text_dim'],
                                   size_hint_y=0.3, halign='left', text_size=(None, None)))
         name_box.add_widget(Label(
             text=borrower[:12] + ("…" if len(borrower) > 12 else ""),
-            font_size='13sp',
+            font_size='16sp',
             color=THEME['success'] if self.done else THEME['text'],
             size_hint_y=0.7, halign='left', text_size=(None, None),
         ))
@@ -1358,7 +1441,7 @@ class RowWidget(BoxLayout):
 
         # 抵押物地址 + 性质
         prop_box = BoxLayout(orientation='vertical')
-        prop_box.add_widget(Label(text="地址/性质", font_size='9sp', color=THEME['text_dim'],
+        prop_box.add_widget(Label(text="地址/性质", font_size='11sp', color=THEME['text_dim'],
                                   size_hint_y=0.3, halign='left', text_size=(None, None)))
         addr_short = (address_general + address_precise)[:10]
         if len((address_general + address_precise)) > 10:
@@ -1367,7 +1450,7 @@ class RowWidget(BoxLayout):
         if property_type:
             prop_label += " " + property_type[:6]
         prop_box.add_widget(Label(
-            text=prop_label, font_size='11sp', color=THEME['text'], size_hint_y=0.7,
+            text=prop_label, font_size='13sp', color=THEME['text'], size_hint_y=0.7,
             halign='left', text_size=(None, None),
         ))
         info.add_widget(prop_box)
@@ -1375,10 +1458,10 @@ class RowWidget(BoxLayout):
         self.add_widget(info)
 
         # 按钮区域
-        btn_area = BoxLayout(spacing=4, size_hint_x=0.4)
+        btn_area = BoxLayout(spacing=dp(6), size_hint_x=0.4)
 
         self.photo_btn = Button(
-            text="📷", font_size='17sp', size_hint_x=0.35,
+            text="📷", font_size='20sp', size_hint_x=0.35,
             background_color=THEME['success'] if self.done else THEME['accent'],
             background_normal='',
         )
@@ -1387,7 +1470,7 @@ class RowWidget(BoxLayout):
 
         self.view_btn = Button(
             text="📂%d" % self.photo_count if self.photo_count > 0 else "📂",
-            font_size='13sp', size_hint_x=0.35,
+            font_size='15sp', size_hint_x=0.35,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
             background_normal='',
         )
@@ -1395,7 +1478,7 @@ class RowWidget(BoxLayout):
         btn_area.add_widget(self.view_btn)
 
         summary = progress_mgr.get_photo_type_summary(progress_key)
-        status = Label(text=f"✓{summary}" if self.done else "待拍", font_size='11sp',
+        status = Label(text=f"✓{summary}" if self.done else "待拍", font_size='13sp',
                       color=THEME['success'] if self.done else THEME['text_dim'], size_hint_x=0.3)
         btn_area.add_widget(status)
 
@@ -1455,35 +1538,38 @@ class MainScreen(Screen):
         self.add_widget(main)
 
     def _build_ui(self, parent):
-        # 顶部标题栏
-        title_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6), padding=[dp(8), 0, dp(8), 0])
-        title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='17sp', bold=True, color=THEME['text'],
-                                   size_hint_x=0.6, halign='left', valign='middle'))
+        # 顶部状态栏留白
+        parent.add_widget(Label(size_hint_y=None, height=dp(get_status_bar_height_dp())))
 
-        settings_btn = Button(text="⚙ 设置", font_size='14sp', size_hint_x=0.2,
+        # 顶部标题栏
+        title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
+        title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='18sp', bold=True, color=THEME['text'],
+                                   size_hint_x=0.55, halign='left', valign='middle'))
+
+        settings_btn = Button(text="⚙ 设置", font_size='16sp', size_hint_x=0.22,
                              background_color=THEME['accent'], background_normal='',
-                             color=(1,1,1,1))
+                             color=(1,1,1,1), bold=True)
         settings_btn.bind(on_release=self._go_settings)
         title_bar.add_widget(settings_btn)
 
-        self.progress_label = Label(text="0/0", font_size='12sp', color=THEME['text_dim'],
-                                    size_hint_x=0.2, halign='right', valign='middle')
+        self.progress_label = Label(text="0/0", font_size='15sp', color=THEME['text_dim'],
+                                    size_hint_x=0.23, halign='right', valign='middle')
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
         # 工具栏
-        toolbar = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6), padding=[dp(8), dp(4), dp(8), dp(4)])
-        open_btn = Button(text="📂 打开Excel", font_size='13sp', size_hint_x=0.35,
+        toolbar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
+        open_btn = Button(text="📂 打开Excel", font_size='15sp', size_hint_x=0.38,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
         toolbar.add_widget(open_btn)
 
-        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='13sp', size_hint_x=0.5)
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.47)
         self.search_input.bind(text=self._on_search)
         toolbar.add_widget(self.search_input)
 
-        clear_btn = Button(text="✕", font_size='16sp', size_hint_x=0.15,
+        clear_btn = Button(text="✕", font_size='18sp', size_hint_x=0.15,
                           background_color=(0.4, 0.4, 0.4, 1), background_normal='',
                           color=(1,1,1,1))
         clear_btn.bind(on_release=self._clear_search)
@@ -1492,21 +1578,21 @@ class MainScreen(Screen):
 
         # 列表区域
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
-        self.list_layout = GridLayout(cols=1, spacing=dp(4), size_hint_y=None, padding=[dp(6), dp(4), dp(6), dp(4)])
+        self.list_layout = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[dp(8), dp(6), dp(8), dp(6)])
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
         # 底部状态栏
-        footer = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6), padding=[dp(8), dp(4), dp(8), dp(4)])
+        footer = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
 
-        report_btn = Button(text="📄 生成报告", font_size='13sp',
+        report_btn = Button(text="📄 生成报告", font_size='15sp',
                            background_color=THEME['success'], background_normal='',
                            size_hint_x=0.35, color=(1,1,1,1), bold=True)
         report_btn.bind(on_release=self._generate_report)
         footer.add_widget(report_btn)
 
-        self.status_label = Label(text="请点击「打开Excel」选择文件", font_size='12sp',
+        self.status_label = Label(text="请点击「打开Excel」选择文件", font_size='14sp',
                                   color=THEME['warning'], size_hint_x=0.65,
                                   halign='center', valign='middle')
         footer.add_widget(self.status_label)
@@ -1526,19 +1612,86 @@ class MainScreen(Screen):
             self.list_layout.add_widget(msg)
 
     def _show_file_dialog(self, instance):
-        """打开系统文件选择器（Android 用 plyer.filechooser，桌面回退手动输入）"""
+        """打开系统文件选择器。Android使用SAF(Intent.ACTION_OPEN_DOCUMENT)获取可访问URI，
+        桌面端使用plyer.filechooser，最终fallback手动输入。"""
+        if IS_ANDROID:
+            self._android_open_file_picker()
+        else:
+            try:
+                from plyer import filechooser
+                filechooser.open_file(
+                    filters=[("Excel 文件", "*.xlsx", "*.xls")],
+                    on_selection=self._on_file_selected,
+                )
+            except Exception as e:
+                Logger.warning("MainScreen.filechooser: %s, fallback to path input" % e)
+                self._show_path_input_dialog()
+
+    def _android_open_file_picker(self):
+        """Android：使用Intent.ACTION_OPEN_DOCUMENT选择Excel文件，
+        通过ContentResolver获取持久读取权限，然后复制到app私有目录。"""
         try:
-            from plyer import filechooser
-            filechooser.open_file(
-                filters=[("Excel 文件", "*.xlsx", "*.xls")],
-                on_selection=self._on_file_selected,
-            )
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            Intent = autoclass('android.content.Intent')
+            activity = PythonActivity.mActivity
+
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("*/*")
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "application/vnd.ms-excel",
+            ])
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+            self._android_file_picker_code = 0x1001
+            activity.startActivityForResult(intent, self._android_file_picker_code)
         except Exception as e:
-            Logger.warning("MainScreen.filechooser: %s, fallback to path input" % e)
-            self._show_path_input_dialog()
+            Logger.error("Android file picker error: %s" % e)
+            self.status_label.text = "无法打开文件选择器"
+            self.status_label.color = THEME['danger']
+
+    def on_activity_result(self, request_code, result_code, intent):
+        """处理Android Activity结果回调（文件选择器返回）。
+        此方法由App通过android.activity.bind调用。"""
+        if not hasattr(self, '_android_file_picker_code'):
+            return
+        if request_code != self._android_file_picker_code:
+            return
+        # result_code -1 = RESULT_OK
+        if result_code != -1 or intent is None:
+            return
+        try:
+            from jnius import autoclass
+            uri = intent.getData()
+            if uri is None:
+                return
+            uri_str = str(uri.toString())
+
+            # 获取持久URI权限
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+            Intent = autoclass('android.content.Intent')
+            resolver = activity.getContentResolver()
+            try:
+                take_flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                resolver.takePersistableUriPermission(uri, take_flags)
+            except:
+                pass
+
+            # 复制文件到app私有目录
+            dest = os.path.join(APP_DIR, "_imported_excel.xlsx")
+            android_copy_uri_to_app_dir(uri_str, dest)
+            Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
+        except Exception as e:
+            Logger.error("on_activity_result: %s" % e)
+            self.status_label.text = "文件选择失败: %s" % str(e)[:40]
+            self.status_label.color = THEME['danger']
 
     def _on_file_selected(self, selection):
-        """plyer filechooser 回调：selection 是文件路径列表"""
+        """桌面端plyer filechooser回调"""
         if not selection:
             return
         path = selection[0] if isinstance(selection, list) else str(selection)
@@ -1578,8 +1731,10 @@ class MainScreen(Screen):
             self.status_label.color = THEME['success']
             self._refresh_list()
         except Exception as e:
-            self.status_label.text = "加载失败: %s" % str(e)[:40]
+            err_msg = str(e)
+            self.status_label.text = "加载失败: %s" % err_msg[:80]
             self.status_label.color = THEME['danger']
+            Logger.error("Excel load failed: %s" % traceback.format_exc())
 
     def _refresh_list(self):
         self.list_layout.clear_widgets()
@@ -1624,7 +1779,7 @@ class MainScreen(Screen):
         query = self.search_input.text.lower().strip()
         for rw in self.row_widgets:
             if not query or query in rw.borrower.lower():
-                rw.height = 68
+                rw.height = dp(80)
                 rw.opacity = 1
             else:
                 rw.height = 0
@@ -1809,28 +1964,81 @@ class LoanPhotoApp(App):
     def build(self):
         self.title = "资产盘点专项拍照工具"
         Window.clearcolor = THEME['bg']
+        Window.softinput_mode = 'pan'
+
+        # 拦截Android返回键：边缘滑动不直接退出App，而是返回上一页面
+        Window.bind(on_keyboard=self._on_keyboard)
 
         self.config = AppConfig()
 
         sm = ScreenManager(transition=SlideTransition(duration=0.25))
+        self.sm = sm
         sm.add_widget(WelcomeScreen(name='welcome'))
         sm.add_widget(MainScreen(app_config=self.config, name='main'))
         sm.add_widget(SettingsScreen(app_config=self.config, name='settings'))
         sm.current = 'welcome'
         return sm
 
+    def _on_keyboard(self, window, key, scancode, codepoint, modifier):
+        """拦截返回键（key=27 = ESCAPE/BACK）：
+        在主页面/设置页时返回上一页，在欢迎页时双按退出。"""
+        if key == 27:
+            current = self.sm.current
+            if current == 'settings':
+                self.sm.current = 'main'
+                return True
+            elif current == 'main':
+                # 主页面按返回→回到欢迎页
+                self.sm.current = 'welcome'
+                return True
+            elif current == 'welcome':
+                # 欢迎页双按退出
+                if hasattr(self, '_back_pressed') and (datetime.now() - self._back_pressed).total_seconds() < 2:
+                    self.stop()
+                else:
+                    self._back_pressed = datetime.now()
+                    # 在欢迎页显示提示
+                    try:
+                        from kivy.uix.popup import Popup
+                        popup = Popup(title='',
+                                     content=Label(text="再按一次退出", font_size='16sp'),
+                                     size_hint=(0.5, 0.15), auto_dismiss=True)
+                        popup.open()
+                        Clock.schedule_once(lambda dt: popup.dismiss(), 1.5)
+                    except:
+                        pass
+                return True
+        return False
+
     def on_start(self):
         if IS_ANDROID:
+            setup_android_status_bar()
+            self._register_android_activity_result()
             self._request_permissions()
+
+    def _register_android_activity_result(self):
+        """注册Android activity结果回调，把文件选择器结果转发给MainScreen"""
+        try:
+            from android.activity import bind as activity_bind
+            activity_bind(on_activity_result=self._on_android_activity_result)
+        except Exception as e:
+            Logger.warning("activity_bind failed: %s" % e)
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        """Android activity结果统一入口，转发给当前screen"""
+        if self.sm and self.sm.current == 'main':
+            main_screen = self.sm.get_screen('main')
+            if hasattr(main_screen, 'on_activity_result'):
+                main_screen.on_activity_result(request_code, result_code, intent)
 
     def _request_permissions(self):
         try:
             if ANDROID_API >= 33:
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION, Permission.READ_MEDIA_IMAGES]
+                         Permission.ACCESS_COARSE_LOCATION]
             elif ANDROID_API >= 30:
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION, Permission.READ_EXTERNAL_STORAGE]
+                         Permission.ACCESS_COARSE_LOCATION]
             else:
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
                          Permission.ACCESS_COARSE_LOCATION,
