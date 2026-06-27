@@ -5,21 +5,24 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04  # 使用 ubuntu-latest 也可以
-    
+    runs-on: ubuntu-22.04
+    env:
+      ANDROID_HOME: /home/runner/android-sdk
+      ANDROID_SDK_ROOT: /home/runner/android-sdk
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -45,53 +48,49 @@ jobs:
           libavcodec-dev \
           libmtdev-dev \
           xclip \
-          xsel
-        
+          xsel \
+          aidl
+
     - name: Set up Java
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
         java-version: '17'
-        
+
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip setuptools wheel
-        pip install buildozer>=1.5.0
+        pip install buildozer
         pip install kivy[base]
         pip install openpyxl plyer pillow
         pip install cython
-        pip install pyjnius
-        
+
     - name: Install Android SDK
       run: |
-        # Download Android command line tools
-        mkdir -p $HOME/android-sdk/cmdline-tools
+        mkdir -p $ANDROID_HOME/cmdline-tools
         cd /tmp
         wget -q https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip -O cmdline-tools.zip
-        unzip -q cmdline-tools.zip -d $HOME/android-sdk/cmdline-tools/
-        mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
-        echo "sdk.dir=$HOME/android-sdk" > $GITHUB_WORKSPACE/local.properties
-        
-    - name: Install Buildozer Android target dependencies
+        unzip -q cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools/
+        mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+        echo "sdk.dir=$ANDROID_HOME" > $GITHUB_WORKSPACE/local.properties
+
+    - name: Accept SDK licenses and install packages
       run: |
-        # Accept ALL SDK licenses first
-        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
-        # Install required Android SDK packages (pinned versions)
-        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
-        
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+        sleep 2
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+
     - name: Build debug APK
       run: |
         buildozer android debug
-      env:
-        ANDROID_HOME: ${{ env.HOME }}/android-sdk
-        ANDROID_SDK_ROOT: ${{ env.HOME }}/android-sdk
-        
+
     - name: Upload APK artifact
       uses: actions/upload-artifact@v4
       with:
         name: loan-photo-apk
         path: bin/*.apk
-        
+
     - name: Create Release
       if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
