@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.3
+资产盘点专项拍照工具 App - v3.3.2
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -128,29 +128,65 @@ from kivy.graphics import Color, Rectangle, Line, RoundedRectangle
 from kivy.metrics import dp, sp
 from kivy.storage.jsonstore import JsonStore
 from kivy.core.text import LabelBase
+from kivy.resources import resource_find, resource_add_path
 
 # ============================================================
-# 注册中文字体（必须在创建任何 Label 之前完成）
-# Kivy 默认 'Roboto' 字体不含 CJK 字符 → 所有中文显示为「豆腐块」
-# 把 'Roboto' 与 'sans-serif' 都替换为 NotoSansSC，让 Label/Button/Spinner 等
-# 默认就能正确渲染中文。
-# 字体文件由 buildozer.spec 的 source.include_exts=ttf,otf 一起打包进 APK。
+# 中文字体加载（注册为 'Roboto'，全局生效）
+# Kivy 默认 'Roboto' 字体不含 CJK → 中文豆腐块。
+# 策略：
+#   1. 把 assets/ 目录加入 Kivy resource 搜索路径
+#   2. 用 resource_find() 查找字体（兼容 APK 内 assets）
+#   3. fallback 到 Android 系统字体
+#   4. 注册名为 'Roboto'，所有 widget 默认即使用中文字体
 # ============================================================
-_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
-if os.path.exists(_FONT_PATH):
-    LabelBase.register('Roboto', _FONT_PATH)
-    LabelBase.register('sans-serif', _FONT_PATH)
-else:
-    # Android 上某些 p4a 版本 __file__ 路径不同，尝试备用路径
-    for _alt in (
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC-Regular.otf'),
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_ASSETS_DIR = os.path.join(_APP_DIR, 'assets')
+if os.path.isdir(_ASSETS_DIR):
+    resource_add_path(_ASSETS_DIR)
+
+_FONT_NAME = 'Roboto'
+_FONT_PATH = None
+
+_font_candidates = [
+    'NotoSansSC.ttf',
+    'NotoSansSC-Regular.otf',
+]
+for _fn in _font_candidates:
+    _found = resource_find(_fn)
+    if _found and os.path.exists(_found):
+        _FONT_PATH = _found
+        break
+
+if not _FONT_PATH:
+    for _sp in [
         '/system/fonts/NotoSansCJK-Regular.ttc',
-    ):
-        if os.path.exists(_alt):
-            LabelBase.register('Roboto', _alt)
-            LabelBase.register('sans-serif', _alt)
-            _FONT_PATH = _alt
+        '/system/fonts/NotoSansSC-Regular.otf',
+        '/system/fonts/NotoSansCJKsc-Regular.otf',
+        '/system/fonts/DroidSansFallback.ttf',
+        '/system/fonts/SourceHanSansCN-Regular.otf',
+    ]:
+        if os.path.exists(_sp):
+            _FONT_PATH = _sp
             break
+
+if _FONT_PATH:
+    try:
+        LabelBase.register('Roboto', _FONT_PATH)
+    except Exception:
+        _FONT_PATH = None
+
+CHINESE_FONT = 'Roboto'
+
+_diag_lines = ["=== Font diag ===", "__file__=%s" % __file__,
+               "assets_dir=%s exists=%s" % (_ASSETS_DIR, os.path.isdir(_ASSETS_DIR)),
+               "font_path=%s" % _FONT_PATH]
+try:
+    _diag_dir = _resolve_android_app_dir() if _EARLY_IS_ANDROID else os.path.expanduser('~')
+    os.makedirs(_diag_dir, exist_ok=True)
+    with open(os.path.join(_diag_dir, 'font_debug.log'), 'w', encoding='utf-8') as _f:
+        _f.write('\n'.join(_diag_lines))
+except Exception:
+    pass
 
 import openpyxl
 from openpyxl import load_workbook
@@ -190,7 +226,7 @@ except Exception as e:
 
 PROGRESS_FILE = os.path.join(APP_DIR, 'photo_progress.json')
 CONFIG_FILE = os.path.join(APP_DIR, 'app_config.json')
-FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
+FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
 
 # === 默认配置 ===
 # Excel 格式：A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
@@ -233,9 +269,8 @@ WATERMARK_POSITION_LABEL_TO_KEY = {v: k for k, v in WATERMARK_POSITION_LABELS.it
 
 # === 作者信息 ===
 AUTHOR_NAME = "王硕"
-AUTHOR_PHONE = "15940454123"
-AUTHOR_WECHAT = "15940454123（同微信）"
-AUTHOR_INFO = f"作者：{AUTHOR_NAME}\n联系方式：{AUTHOR_PHONE}\n{AUTHOR_WECHAT}\n有问题请联系作者"
+AUTHOR_PHONE = "15940454123（同微信）"
+AUTHOR_INFO = f"作者：{AUTHOR_NAME}\n联系方式：{AUTHOR_PHONE}\n有问题请联系作者"
 
 # === 颜色主题 ===
 THEME = {
@@ -860,9 +895,9 @@ class SectionLabel(Label):
         self.bold = True
         self.color = THEME['accent']
         self.size_hint_y = None
-        self.height = 30
+        self.height = dp(32)
         self.halign = 'left'
-        self.text_size = (Window.width * 0.85, None)
+        self.valign = 'middle'
 
 
 # ============================================================
@@ -873,37 +908,45 @@ class WelcomeScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.name = 'welcome'
-        layout = BoxLayout(orientation='vertical', padding=30, spacing=10)
-        layout.pos_hint = {'center_x': 0.5, 'center_y': 0.5}
 
-        # Logo 区域
-        logo_area = BoxLayout(orientation='vertical', size_hint_y=0.4)
-        logo_area.add_widget(Label(
-            text="📷", font_size='80sp',
-            size_hint_y=0.5, color=THEME['accent'],
+        root = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(8))
+
+        # 顶部留白
+        root.add_widget(Label(size_hint_y=0.05))
+
+        # Logo 图标
+        root.add_widget(Label(
+            text="📷", font_size='64sp',
+            size_hint_y=None, height=dp(80), color=THEME['accent'],
         ))
-        logo_area.add_widget(Label(
-            text="欢迎使用", font_size='20sp',
-            color=THEME['text_dim'], size_hint_y=0.15,
-        ))
-        logo_area.add_widget(Label(
-            text="资产盘点专项拍照工具", font_size='26sp',
+
+        # 标题
+        root.add_widget(Label(
+            text="资产盘点专项拍照工具", font_size='24sp',
             bold=True, color=THEME['text'],
-            size_hint_y=0.25,
+            size_hint_y=None, height=dp(40),
         ))
-        logo_area.add_widget(Label(
+
+        # 副标题
+        root.add_widget(Label(
             text="银行抵押物现场勘查工具", font_size='14sp',
-            color=THEME['text_dim'], size_hint_y=0.2,
-        ))
-        layout.add_widget(logo_area)
-
-        # 版本信息
-        layout.add_widget(Label(
-            text="v3.3", font_size='12sp',
-            color=THEME['text_dim'], size_hint_y=None, height=20,
+            color=THEME['text_dim'],
+            size_hint_y=None, height=dp(28),
         ))
 
-        # 功能简介
+        # 版本
+        root.add_widget(Label(
+            text="v3.3.2", font_size='11sp',
+            color=THEME['text_dim'],
+            size_hint_y=None, height=dp(20),
+        ))
+
+        # 间距
+        root.add_widget(Label(size_hint_y=0.05))
+
+        # 功能简介卡片
+        feat_card = CardWidget(size_hint_y=None)
+        feat_card.bind(minimum_height=feat_card.setter('height'))
         features = [
             "• 四类拍照引导（远景/近景/内部/瑕疵）",
             "• 水印自选模式（段+位置+字号）",
@@ -911,37 +954,42 @@ class WelcomeScreen(Screen):
             "• 一键生成勘查日报表",
         ]
         for feat in features:
-            layout.add_widget(Label(
+            feat_card.add_widget(Label(
                 text=feat, font_size='13sp',
-                color=THEME['text_dim'], size_hint_y=None, height=22,
-                halign='center',
+                color=THEME['text_dim'],
+                size_hint_y=None, height=dp(26),
+                halign='left', valign='middle',
+                text_size=(None, dp(26)),
             ))
+        root.add_widget(feat_card)
 
-        layout.add_widget(Label(size_hint_y=0.1))
+        # 弹性空间
+        root.add_widget(Label(size_hint_y=1))
 
         # 作者信息
-        author_card = CardWidget(size_hint_y=None, height=80)
+        author_card = CardWidget(size_hint_y=None, height=dp(70))
         author_card.add_widget(Label(
-            text=AUTHOR_INFO, font_size='12sp',
-            color=THEME['text_dim'], halign='center',
+            text=AUTHOR_INFO, font_size='11sp',
+            color=THEME['text_dim'], halign='center', valign='middle',
         ))
-        layout.add_widget(author_card)
+        root.add_widget(author_card)
 
-        layout.add_widget(Label(size_hint_y=0.05))
+        # 间距
+        root.add_widget(Label(size_hint_y=None, height=dp(8)))
 
-        # 进入按钮
+        # 进入按钮 - 高对比度、大尺寸、明确可点击
         start_btn = Button(
-            text="开始使用", font_size='18sp',
-            size_hint_y=None, height=52,
+            text="开始使用", font_size='20sp',
+            size_hint_y=None, height=dp(56),
             background_color=THEME['accent'],
             background_normal='',
+            color=(1, 1, 1, 1),
+            bold=True,
         )
         start_btn.bind(on_release=self._go_main)
-        layout.add_widget(start_btn)
+        root.add_widget(start_btn)
 
-        main_layout = FloatLayout()
-        main_layout.add_widget(layout)
-        self.add_widget(main_layout)
+        self.add_widget(root)
 
     def _go_main(self, instance):
         self.manager.current = 'main'
@@ -1376,55 +1424,59 @@ class MainScreen(Screen):
 
     def _build_ui(self, parent):
         # 顶部标题栏
-        title_bar = BoxLayout(size_hint_y=None, height=48, spacing=6, padding=[6, 0, 6, 0])
+        title_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6), padding=[dp(8), 0, dp(8), 0])
         title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='17sp', bold=True, color=THEME['text'],
-                                   size_hint_x=0.6, halign='left', text_size=(None, None)))
+                                   size_hint_x=0.6, halign='left', valign='middle'))
 
-        settings_btn = Button(text="⚙", font_size='18sp', size_hint_x=0.15,
-                             background_color=THEME['accent'], background_normal='')
+        settings_btn = Button(text="⚙ 设置", font_size='14sp', size_hint_x=0.2,
+                             background_color=THEME['accent'], background_normal='',
+                             color=(1,1,1,1))
         settings_btn.bind(on_release=self._go_settings)
         title_bar.add_widget(settings_btn)
 
         self.progress_label = Label(text="0/0", font_size='12sp', color=THEME['text_dim'],
-                                    size_hint_x=0.25, halign='right', text_size=(None, None))
+                                    size_hint_x=0.2, halign='right', valign='middle')
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
         # 工具栏
-        toolbar = BoxLayout(size_hint_y=None, height=44, spacing=6, padding=[6, 0, 6, 0])
+        toolbar = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6), padding=[dp(8), dp(4), dp(8), dp(4)])
         open_btn = Button(text="📂 打开Excel", font_size='13sp', size_hint_x=0.35,
-                         background_color=THEME['accent'], background_normal='')
+                         background_color=THEME['accent'], background_normal='',
+                         color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
         toolbar.add_widget(open_btn)
 
-        self.search_input = TextInput(hint_text="搜索借款人…", multiline=False, font_size='12sp', size_hint_x=0.5)
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='13sp', size_hint_x=0.5)
         self.search_input.bind(text=self._on_search)
         toolbar.add_widget(self.search_input)
 
-        clear_btn = Button(text="×", font_size='16sp', size_hint_x=0.15,
-                          background_color=(0.4, 0.4, 0.4, 1), background_normal='')
+        clear_btn = Button(text="✕", font_size='16sp', size_hint_x=0.15,
+                          background_color=(0.4, 0.4, 0.4, 1), background_normal='',
+                          color=(1,1,1,1))
         clear_btn.bind(on_release=self._clear_search)
         toolbar.add_widget(clear_btn)
         parent.add_widget(toolbar)
 
         # 列表区域
-        self.scroll_view = ScrollView()
-        self.list_layout = GridLayout(cols=1, spacing=4, size_hint_y=None, padding=[4, 0, 4, 0])
+        self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
+        self.list_layout = GridLayout(cols=1, spacing=dp(4), size_hint_y=None, padding=[dp(6), dp(4), dp(6), dp(4)])
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
         # 底部状态栏
-        footer = BoxLayout(size_hint_y=None, height=48, spacing=6, padding=[6, 0, 6, 0])
+        footer = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6), padding=[dp(8), dp(4), dp(8), dp(4)])
 
         report_btn = Button(text="📄 生成报告", font_size='13sp',
                            background_color=THEME['success'], background_normal='',
-                           size_hint_x=0.35)
+                           size_hint_x=0.35, color=(1,1,1,1), bold=True)
         report_btn.bind(on_release=self._generate_report)
         footer.add_widget(report_btn)
 
-        self.status_label = Label(text="请打开 Excel 文件", font_size='12sp',
-                                  color=THEME['warning'], size_hint_x=0.65)
+        self.status_label = Label(text="请点击「打开Excel」选择文件", font_size='12sp',
+                                  color=THEME['warning'], size_hint_x=0.65,
+                                  halign='center', valign='middle')
         footer.add_widget(self.status_label)
         parent.add_widget(footer)
 
@@ -1442,20 +1494,47 @@ class MainScreen(Screen):
             self.list_layout.add_widget(msg)
 
     def _show_file_dialog(self, instance):
-        content = BoxLayout(orientation='vertical', spacing=8)
-        content.add_widget(Label(text="请输入 Excel 文件路径：", size_hint_y=None, height=30))
-        path_input = TextInput(text=self.excel_path, multiline=False, font_size='13sp')
+        """打开系统文件选择器（Android 用 plyer.filechooser，桌面回退手动输入）"""
+        try:
+            from plyer import filechooser
+            filechooser.open_file(
+                filters=[("Excel 文件", "*.xlsx", "*.xls")],
+                on_selection=self._on_file_selected,
+            )
+        except Exception as e:
+            Logger.warning("MainScreen.filechooser: %s, fallback to path input" % e)
+            self._show_path_input_dialog()
+
+    def _on_file_selected(self, selection):
+        """plyer filechooser 回调：selection 是文件路径列表"""
+        if not selection:
+            return
+        path = selection[0] if isinstance(selection, list) else str(selection)
+        if path and os.path.exists(path):
+            self._load_excel_path(path)
+        elif path:
+            self.status_label.text = "文件不存在：%s" % path[:40]
+            self.status_label.color = THEME['danger']
+
+    def _show_path_input_dialog(self):
+        """桌面端备用：手动输入路径"""
+        content = BoxLayout(orientation='vertical', spacing=8, padding=8)
+        content.add_widget(Label(text="请输入 Excel 文件路径：", size_hint_y=None, height=dp(30),
+                                 font_size='14sp'))
+        path_input = TextInput(text=self.excel_path, multiline=False, font_size='13sp',
+                               size_hint_y=None, height=dp(40))
         content.add_widget(path_input)
-        load_btn = Button(text="加载", size_hint_y=None, height=44,
-                         background_color=THEME['accent'], background_normal='')
-        popup = Popup(title='选择 Excel 文件', content=content, size_hint=(0.85, 0.4))
-        load_btn.bind(on_release=lambda x: self._load_excel(path_input.text, popup))
+        load_btn = Button(text="加载", size_hint_y=None, height=dp(44),
+                         background_color=THEME['accent'], background_normal='',
+                         font_size='16sp', color=(1,1,1,1))
+        popup = Popup(title='选择 Excel 文件', content=content, size_hint=(0.9, 0.35),
+                      title_size='16sp')
+        load_btn.bind(on_release=lambda x: (popup.dismiss(), self._load_excel_path(path_input.text)))
         content.add_widget(load_btn)
         popup.open()
 
-    def _load_excel(self, path, popup):
-        popup.dismiss()
-        if not os.path.exists(path):
+    def _load_excel_path(self, path):
+        if not path or not os.path.exists(path):
             self.status_label.text = "文件不存在！"
             self.status_label.color = THEME['danger']
             return
@@ -1463,11 +1542,11 @@ class MainScreen(Screen):
         try:
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
-            self.status_label.text = f"✓ 已加载 {len(self.rows)} 条记录"
+            self.status_label.text = "✓ 已加载 %d 条记录" % len(self.rows)
             self.status_label.color = THEME['success']
             self._refresh_list()
         except Exception as e:
-            self.status_label.text = f"加载失败: {e}"
+            self.status_label.text = "加载失败: %s" % str(e)[:40]
             self.status_label.color = THEME['danger']
 
     def _refresh_list(self):
