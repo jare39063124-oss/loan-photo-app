@@ -8,7 +8,14 @@ import os
 import json
 import math
 import requests
+import logging
 from datetime import datetime
+
+# 安全日志：优先用 kivy.logger，回退到标准 logging（避免 NameError 闪退）
+try:
+    from kivy.logger import Logger
+except Exception:
+    Logger = logging.getLogger("geocoder")
 
 # 高德地图 API Key（用户可自行申请替换）
 # 免费额度：每天 5000 次

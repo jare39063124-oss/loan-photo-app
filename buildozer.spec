@@ -1,5 +1,5 @@
 [app]
-title = 信贷外勤拍照
+title = 资产盘点专项拍照工具
 package.name = loanphoto
 package.domain = com.banktool
 source.dir = .
@@ -7,7 +7,7 @@ source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
 android.add_assets = assets/
-version = 3.1.0
+version = 3.3.0
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
 

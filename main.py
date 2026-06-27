@@ -1,11 +1,11 @@
 """
-银行外勤拍照工具 App - v3.2
+资产盘点专项拍照工具 App - v3.3
 功能：
 - 欢迎页 + 设置页
-- 可自定义命名规则模板（支持 {unit} 房号变量）
-- 水印设置（开关/文字/位置/字号）
+- 文件命名自选模式（4段下拉 X-X-X-X）
+- 水印自选模式（3段下拉 X-X-X + 大中小字号 + 位置）
 - 四类拍照引导（远景/近景/内部/瑕疵）
-- Excel A=借款人名称 B=抵押物地址 C=抵押物性质 D=房号（可选）
+- Excel A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
 - 进度持久化（跨Excel文件可识别已拍条目）
 - 照片路径验证（缩略图不会引用失效路径）
 - 崩溃日志收集
@@ -14,6 +14,7 @@
 import os
 import json
 import sys
+import re
 import traceback
 from datetime import datetime
 from collections import defaultdict
@@ -22,21 +23,35 @@ import hashlib
 
 # ============================================================
 # 崩溃日志捕获
+# 注意：此处不能依赖 kivy.utils.platform，因为 kivy 尚未导入。
+# 用环境变量做早期 Android 检测（python-for-android 会注入 ANDROID_ARGUMENT）。
 # ============================================================
 CRASH_LOG_FILE = None
+_EARLY_IS_ANDROID = ('ANDROID_ARGUMENT' in os.environ) or (sys.platform == 'android')
+
+def _get_android_external_dir():
+    """安全获取 Android 外部存储目录"""
+    from android.storage import getExternalStorageDirectory
+    return getExternalStorageDirectory()
 
 def setup_crash_handler():
     global CRASH_LOG_FILE
     try:
-        if platform == 'android':
-            from android.storage import getExternalStorageDirectory
-            log_dir = os.path.join(getExternalStorageDirectory(), 'loan_photos')
+        if _EARLY_IS_ANDROID:
+            ext = _get_android_external_dir()
+            log_dir = os.path.join(ext, 'loan_photos')
         else:
             log_dir = os.path.join(os.path.expanduser('~'), 'loan_photos')
         os.makedirs(log_dir, exist_ok=True)
         CRASH_LOG_FILE = os.path.join(log_dir, 'crash_log.txt')
-    except:
-        CRASH_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crash_log.txt')
+    except Exception:
+        # 最后兜底：写到家目录而非脚本旁（脚本在 APK 内只读）
+        try:
+            log_dir = os.path.join(os.path.expanduser('~'), 'loan_photos')
+            os.makedirs(log_dir, exist_ok=True)
+            CRASH_LOG_FILE = os.path.join(log_dir, 'crash_log.txt')
+        except Exception:
+            CRASH_LOG_FILE = None
 
     def global_excepthook(exc_type, exc_value, exc_tb):
         msg = "="*50 + "\n"
@@ -46,11 +61,12 @@ def setup_crash_handler():
         msg += "Traceback:\n"
         msg += "".join(traceback.format_tb(exc_tb))
         msg += "\n"
-        try:
-            with open(CRASH_LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(msg)
-        except:
-            pass
+        if CRASH_LOG_FILE:
+            try:
+                with open(CRASH_LOG_FILE, 'a', encoding='utf-8') as f:
+                    f.write(msg)
+            except Exception:
+                pass
         # Also let original handler run
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
@@ -116,14 +132,43 @@ CONFIG_FILE = os.path.join(APP_DIR, 'app_config.json')
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
 
 # === 默认配置 ===
+# Excel 格式：A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
 DEFAULT_CONFIG = {
-    'naming_template': '{date}-{borrower}-{unit}-{seq:02d}',
+    'naming_segments': ['拍摄时间', '客户名', '抵押物地址（全）', '空值'],
     'watermark_enabled': True,
-    'watermark_text': '{date} {address}',
+    'watermark_segments': ['拍摄时间', '地址名', '经纬度'],
     'watermark_position': 'bottom-right',
-    'watermark_font_size': 28,
+    'watermark_font_size': '中',
     'watermark_opacity': 170,
 }
+
+# === 命名段选项（4段，用-连接成 X-X-X-X）===
+NAMING_SEGMENT_OPTIONS = [
+    "拍摄时间",
+    "客户名",
+    "抵押物地址（全）",
+    "抵押物地址（概）",
+    "抵押物地址（精确门牌号）",
+    "空值",
+]
+
+# === 水印段选项（3段，用-连接成 X-X-X）===
+WATERMARK_SEGMENT_OPTIONS = [
+    "经纬度",
+    "拍摄时间",
+    "地址名",
+    "空值",
+]
+
+# === 水印字号 ===
+WATERMARK_FONT_SIZE_OPTIONS = ["大", "中", "小"]
+WATERMARK_FONT_SIZE_MAP = {"大": 40, "中": 28, "小": 18}
+
+# === 水印位置 ===
+WATERMARK_POSITION_OPTIONS = ['bottom-right', 'bottom-left', 'top-right', 'top-left']
+WATERMARK_POSITION_LABELS = {'bottom-right': '右下', 'bottom-left': '左下',
+                             'top-right': '右上', 'top-left': '左上'}
+WATERMARK_POSITION_LABEL_TO_KEY = {v: k for k, v in WATERMARK_POSITION_LABELS.items()}
 
 # === 作者信息 ===
 AUTHOR_NAME = "王硕"
@@ -309,8 +354,8 @@ class ProgressManager:
 # ============================================================
 
 class ExcelReader:
-    """读取Excel，A=借款人名称 B=抵押物地址 C=抵押物性质 D=房号（可选）
-    返回 rows 每项: [borrower, address, property_type, unit]
+    """读取Excel，A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
+    返回 rows 每项: [borrower, address_general, address_precise, property_type]
     """
     def __init__(self, file_path):
         self.file_path = file_path
@@ -329,7 +374,7 @@ class ExcelReader:
         wb.close()
         # 自动判断表头
         if not self.headers:
-            self.headers = ["借款人名称", "抵押物地址", "抵押物性质", "房号"]
+            self.headers = ["客户名", "抵押物地址（概）", "抵押物地址（精确门牌号）", "抵押物性质"]
         return self.headers, self.rows
 
 # ============================================================
@@ -371,15 +416,17 @@ class ReportGenerator:
 
         for i, row in enumerate(rows):
             customer_name = row[0] if len(row) > 0 else ""
-            collateral_type = row[1] if len(row) > 1 else ""
-            remark = row[2] if len(row) > 2 else ""
+            address_general = row[1] if len(row) > 1 else ""
+            address_precise = row[2] if len(row) > 2 else ""
+            property_type = row[3] if len(row) > 3 else ""
 
             if customer_name:
+                full_address = (address_general + address_precise).strip()
                 ws.cell(row=current_row, column=1, value=seq_num)
                 ws.cell(row=current_row, column=2, value=report_date)
                 ws.cell(row=current_row, column=3, value=customer_name)
-                ws.cell(row=current_row, column=4, value=collateral_type)
-                ws.cell(row=current_row, column=5, value=remark)
+                ws.cell(row=current_row, column=4, value=full_address)
+                ws.cell(row=current_row, column=5, value=property_type)
                 ws.cell(row=current_row, column=6, value="")
                 seq_num += 1
                 current_row += 1
@@ -405,24 +452,48 @@ class PhotoProcessor:
     """水印、命名、保存"""
 
     @staticmethod
+    def build_watermark_text(segments, **kwargs):
+        """根据水印段配置生成水印文本（X-X-X 格式）
+        segments: ["经纬度"/"拍摄时间"/"地址名"/"空值", ...]
+        kwargs: time_str(拍摄时间), address(地址), lat, lng(经纬度)
+        """
+        parts = []
+        for seg in segments:
+            val = ""
+            if seg == "经纬度":
+                lat = kwargs.get('lat', '')
+                lng = kwargs.get('lng', '')
+                if lat and lng:
+                    val = "%s,%s" % (lng, lat)
+                else:
+                    val = "定位中"
+            elif seg == "拍摄时间":
+                val = kwargs.get('time_str', '')
+            elif seg == "地址名":
+                val = kwargs.get('address', '')
+            elif seg == "空值":
+                val = ""
+            if val:
+                parts.append(val)
+        return "-".join(parts)
+
+    @staticmethod
     def add_watermark(photo_path, config, **kwargs):
-        """根据配置添加水印"""
+        """根据配置添加水印（段选择模式）"""
         if not config.get('watermark_enabled', True):
             return
 
         try:
+            segments = config.get('watermark_segments', DEFAULT_CONFIG['watermark_segments'])
+            text = PhotoProcessor.build_watermark_text(segments, **kwargs)
+            if not text:
+                return
+
             img = PILImage.open(photo_path)
             draw = ImageDraw.Draw(img)
 
-            # 水印文本（替换模板变量）
-            watermark_template = config.get('watermark_text', '{date} {address}')
-            text = watermark_template
-            text = text.replace('{date}', kwargs.get('date_str', ''))
-            text = text.replace('{address}', kwargs.get('address', ''))
-            text = text.replace('{borrower}', kwargs.get('borrower', ''))
-            text = text.replace('{property_type}', kwargs.get('property_type', ''))
-
-            font_size = config.get('watermark_font_size', 28)
+            font_size_key = config.get('watermark_font_size', '中')
+            font_size = WATERMARK_FONT_SIZE_MAP.get(font_size_key, 28)
             opacity = config.get('watermark_opacity', 170)
             position = config.get('watermark_position', 'bottom-right')
 
@@ -461,7 +532,7 @@ class PhotoProcessor:
             final = img.convert('RGB') if img.mode == 'RGBA' else img
             final.save(photo_path, 'JPEG', quality=92)
         except Exception as e:
-            Logger.error(f"PhotoProcessor.add_watermark: {e}")
+            Logger.error("PhotoProcessor.add_watermark: %s" % e)
 
     @staticmethod
     def _get_font(size):
@@ -484,29 +555,38 @@ class PhotoProcessor:
         return ImageFont.load_default()
 
     @staticmethod
-    def generate_filename(naming_template, borrower="", address="", property_type="", unit="", seq=0, date_str="", photo_type=""):
-        """根据模板生成文件名
-        模板变量: {date} {borrower} {address} {property_type} {unit} {seq} {type}
+    def generate_filename(segments, borrower="", address_general="", address_precise="",
+                         property_type="", seq=0, date_str="", photo_type=""):
+        """根据段选择生成文件名（X-X-X-X 格式，空值段自动跳过）
+        segments: ["拍摄时间"/"客户名"/"抵押物地址（全）"/.../"空值", ...]
+        抵押物地址（全） = 抵押物地址（概） + 抵押物地址（精确门牌号）
         """
         if not date_str:
             date_str = get_date_str()
 
-        borrower = clean_filename(borrower)
-        address = clean_filename(address)
-        property_type = clean_filename(property_type)
-        unit = clean_filename(unit)
+        parts = []
+        for seg in segments:
+            val = ""
+            if seg == "拍摄时间":
+                val = date_str
+            elif seg == "客户名":
+                val = borrower if borrower else "未知"
+            elif seg == "抵押物地址（全）":
+                val = (address_general + address_precise).strip()
+            elif seg == "抵押物地址（概）":
+                val = address_general
+            elif seg == "抵押物地址（精确门牌号）":
+                val = address_precise
+            elif seg == "空值":
+                val = ""
+            val = clean_filename(val)
+            if val:
+                parts.append(val)
 
-        filename = naming_template
-        filename = filename.replace('{date}', date_str)
-        filename = filename.replace('{borrower}', borrower if borrower else '未知')
-        filename = filename.replace('{address}', address if address else '')
-        filename = filename.replace('{property_type}', property_type if property_type else '')
-        filename = filename.replace('{unit}', unit if unit else '')
-        filename = filename.replace('{seq}', f"{seq:02d}" if seq > 0 else "01")
-        filename = filename.replace('{type}', photo_type if photo_type else '')
-
-        # 清理文件名非法字符
+        filename = "-".join(parts)
         filename = clean_filename(filename)
+        if not filename:
+            filename = "photo_%s" % date_str
         if not filename.endswith('.jpg'):
             filename += '.jpg'
         return filename
@@ -543,6 +623,45 @@ class PhotoProcessor:
             Logger.error(f"PhotoProcessor.save_to_gallery: {e}")
 
 # ============================================================
+# GPS 管理器（非阻塞缓存）
+# ============================================================
+
+class GpsManager:
+    """异步获取 GPS 坐标并缓存，供水印经纬度段使用。
+    不会阻塞主线程：在后台缓存最后一次定位结果。
+    """
+    def __init__(self):
+        self.lat = ""
+        self.lng = ""
+        self._started = False
+        if IS_ANDROID:
+            self._start()
+
+    def _start(self):
+        try:
+            from plyer import gps
+            gps.configure(on_location=self._on_location)
+            gps.start(min_time=3000, min_distance=0)
+            self._started = True
+        except Exception:
+            self._started = False
+
+    def _on_location(self, **kwargs):
+        try:
+            lat = kwargs.get('lat')
+            lon = kwargs.get('lon')
+            if lat is not None and lon is not None:
+                self.lat = ("%.6f" % float(lat))
+                self.lng = ("%.6f" % float(lon))
+        except Exception:
+            pass
+
+    def get_coords(self):
+        """返回 (lat, lng)，未定位时返回 ('', '')"""
+        return self.lat, self.lng
+
+
+# ============================================================
 # 相机管理器
 # ============================================================
 
@@ -550,6 +669,7 @@ class CameraManager:
     def __init__(self):
         self.photo_path = ""
         self.pending_callback = None
+        self.gps = GpsManager()
         self.geocoder = GeoCoder()
         self._plyer_failed = False
 
@@ -634,19 +754,18 @@ class CameraManager:
         if self.pending_callback:
             Clock.schedule_once(lambda dt: self.pending_callback(self.photo_path), 0.5)
 
-    def get_location_name(self):
-        if not IS_ANDROID:
-            return "测试定位"
-        try:
-            from plyer import gps
-            gps.configure(on_location=lambda **kw: None)
-            gps.start()
-            import time
-            time.sleep(2)
-            gps.stop()
-            return "GPS定位完成"
-        except:
-            return "定位不可用"
+    def get_location_name(self, lat, lng, fallback=""):
+        """根据 GPS 坐标逆地理编码获取地名，供水印「地址名」段使用。
+        在后台线程调用（HTTP/计算不会阻塞 UI）。
+        无 GPS 或解析失败时回退到 fallback（Excel 抵押物地址）。"""
+        if lat and lng:
+            try:
+                name = self.geocoder.reverse_geocode(float(lng), float(lat))
+                if name:
+                    return name
+            except Exception as e:
+                Logger.error("CameraManager.get_location_name: %s" % e)
+        return fallback
 
 # ============================================================
 # 自定义小组件
@@ -701,9 +820,13 @@ class WelcomeScreen(Screen):
             size_hint_y=0.5, color=THEME['accent'],
         ))
         logo_area.add_widget(Label(
-            text="信贷外勤拍照", font_size='28sp',
+            text="欢迎使用", font_size='20sp',
+            color=THEME['text_dim'], size_hint_y=0.15,
+        ))
+        logo_area.add_widget(Label(
+            text="资产盘点专项拍照工具", font_size='26sp',
             bold=True, color=THEME['text'],
-            size_hint_y=0.3,
+            size_hint_y=0.25,
         ))
         logo_area.add_widget(Label(
             text="银行抵押物现场勘查工具", font_size='14sp',
@@ -713,15 +836,15 @@ class WelcomeScreen(Screen):
 
         # 版本信息
         layout.add_widget(Label(
-            text="v3.1", font_size='12sp',
+            text="v3.3", font_size='12sp',
             color=THEME['text_dim'], size_hint_y=None, height=20,
         ))
 
         # 功能简介
         features = [
             "• 四类拍照引导（远景/近景/内部/瑕疵）",
-            "• 水印自定义（位置/大小/内容）",
-            "• 灵活命名规则模板",
+            "• 水印自选模式（段+位置+字号）",
+            "• 文件命名自选模式（4段下拉）",
             "• 一键生成勘查日报表",
         ]
         for feat in features:
@@ -878,37 +1001,37 @@ class SettingsScreen(Screen):
         content = BoxLayout(orientation='vertical', spacing=10, size_hint_y=None, padding=[0, 0, 0, 20])
         content.bind(minimum_height=content.setter('height'))
 
-        # === 命名规则 ===
+        # === 命名规则（4段下拉自选模式 X-X-X-X）===
         naming_card = CardWidget(size_hint_y=None)
         naming_card.bind(minimum_height=naming_card.setter('height'))
 
         naming_card.add_widget(SectionLabel(text="📋 照片命名规则"))
 
-        naming_card.add_widget(Label(
-            text=("可用变量：\n"
-                  "{date} - 拍摄日期\n"
-                  "{borrower} - 借款人名称\n"
-                  "{address} - 抵押物地址\n"
-                  "{property_type} - 抵押物性质\n"
-                  "{unit} - 房号/单元号\n"
-                  "{seq} - 序号（01开始）\n"
-                  "{type} - 拍照类型"),
-            font_size='11sp', color=THEME['text_dim'],
-            size_hint_y=None, height=110, halign='left', text_size=(Window.width * 0.75, None),
-        ))
+        naming_card.add_widget(Label(text="格式：X-X-X-X（每段自选，空值段自动省略）",
+                                     font_size='10sp', color=THEME['text_dim'],
+                                     size_hint_y=None, height=18))
 
-        naming_card.add_widget(Label(text="命名模板：", font_size='12sp',
-                                     color=THEME['text'], size_hint_y=None, height=20))
-        self.template_input = TextInput(
-            text=self.config.get('naming_template', DEFAULT_CONFIG['naming_template']),
-            multiline=False, font_size='13sp', size_hint_y=None, height=40,
-        )
-        naming_card.add_widget(self.template_input)
+        cur_segments = self.config.get('naming_segments', DEFAULT_CONFIG['naming_segments'])
+        self.naming_spinners = []
+        for idx in range(4):
+            row = BoxLayout(size_hint_y=None, height=40, spacing=6)
+            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='11sp',
+                                 color=THEME['text_dim'], size_hint_x=0.18))
+            cur_val = cur_segments[idx] if idx < len(cur_segments) else "空值"
+            sp = Spinner(
+                text=cur_val,
+                values=NAMING_SEGMENT_OPTIONS,
+                size_hint_x=0.82, font_size='11sp',
+            )
+            sp.bind(text=lambda inst, val, i=idx: self._on_naming_segment_change(i, val))
+            self.naming_spinners.append(sp)
+            row.add_widget(sp)
+            naming_card.add_widget(row)
 
-        preview = self._get_preview()
-        self.preview_label = Label(text=f"预览：{preview}", font_size='11sp',
-                                   color=THEME['text_dim'], size_hint_y=None, height=20)
-        naming_card.add_widget(self.preview_label)
+        preview = self._get_naming_preview()
+        self.naming_preview_label = Label(text="预览：%s" % preview, font_size='11sp',
+                                          color=THEME['text_dim'], size_hint_y=None, height=22)
+        naming_card.add_widget(self.naming_preview_label)
 
         save_naming_btn = Button(text="保存命名规则", font_size='13sp', size_hint_y=None, height=40,
                                 background_color=THEME['accent'], background_normal='')
@@ -917,7 +1040,7 @@ class SettingsScreen(Screen):
 
         content.add_widget(naming_card)
 
-        # === 水印设置 ===
+        # === 水印设置（3段下拉自选模式 X-X-X）===
         watermark_card = CardWidget(size_hint_y=None)
         watermark_card.bind(minimum_height=watermark_card.setter('height'))
 
@@ -927,45 +1050,56 @@ class SettingsScreen(Screen):
         toggle_box = BoxLayout(size_hint_y=None, height=36, spacing=8)
         toggle_box.add_widget(Label(text="启用水印", font_size='13sp', color=THEME['text'], size_hint_x=0.6))
         self.wm_check = CheckBox(active=self.config.get('watermark_enabled', True), size_hint_x=0.4)
-        self.wm_check.bind(active=self._on_wm_toggle)
         toggle_box.add_widget(self.wm_check)
         watermark_card.add_widget(toggle_box)
 
-        # 水印文字
-        watermark_card.add_widget(Label(text="水印文字模板：", font_size='12sp', color=THEME['text'],
-                                        size_hint_y=None, height=20))
-        self.wm_text_input = TextInput(
-            text=self.config.get('watermark_text', DEFAULT_CONFIG['watermark_text']),
-            multiline=False, font_size='13sp', size_hint_y=None, height=40,
-        )
-        watermark_card.add_widget(self.wm_text_input)
+        watermark_card.add_widget(Label(text="水印格式：X-X-X（每段自选）",
+                                        font_size='10sp', color=THEME['text_dim'],
+                                        size_hint_y=None, height=18))
 
-        watermark_card.add_widget(Label(text="可用变量：{date} {address} {borrower} {property_type}",
-                                        font_size='10sp', color=THEME['text_dim'], size_hint_y=None, height=16))
+        # 水印段选择（3段）
+        cur_wm_segments = self.config.get('watermark_segments', DEFAULT_CONFIG['watermark_segments'])
+        self.wm_spinners = []
+        for idx in range(3):
+            row = BoxLayout(size_hint_y=None, height=40, spacing=6)
+            row.add_widget(Label(text="第%d段" % (idx + 1), font_size='11sp',
+                                 color=THEME['text_dim'], size_hint_x=0.18))
+            cur_val = cur_wm_segments[idx] if idx < len(cur_wm_segments) else "空值"
+            sp = Spinner(
+                text=cur_val,
+                values=WATERMARK_SEGMENT_OPTIONS,
+                size_hint_x=0.82, font_size='11sp',
+            )
+            sp.bind(text=lambda inst, val, i=idx: self._on_wm_segment_change(i, val))
+            self.wm_spinners.append(sp)
+            row.add_widget(sp)
+            watermark_card.add_widget(row)
 
         # 水印位置
-        pos_box = BoxLayout(size_hint_y=None, height=36, spacing=8)
-        pos_box.add_widget(Label(text="位置：", font_size='13sp', color=THEME['text'], size_hint_x=0.3))
+        pos_box = BoxLayout(size_hint_y=None, height=40, spacing=8)
+        pos_box.add_widget(Label(text="位置：", font_size='12sp', color=THEME['text'], size_hint_x=0.3))
+        cur_pos = self.config.get('watermark_position', DEFAULT_CONFIG['watermark_position'])
+        cur_pos_label = WATERMARK_POSITION_LABELS.get(cur_pos, '右下')
         self.pos_spinner = Spinner(
-            text=self.config.get('watermark_position', 'bottom-right'),
-            values=['top-left', 'top-right', 'bottom-left', 'bottom-right'],
+            text=cur_pos_label,
+            values=list(WATERMARK_POSITION_LABELS.values()),
             size_hint_x=0.7, font_size='12sp',
         )
         pos_box.add_widget(self.pos_spinner)
         watermark_card.add_widget(pos_box)
 
-        # 字号
-        font_size_box = BoxLayout(size_hint_y=None, height=36, spacing=8)
-        font_size_box.add_widget(Label(text="字号：", font_size='13sp', color=THEME['text'], size_hint_x=0.3))
-        self.font_slider = Slider(
-            min=12, max=60, value=self.config.get('watermark_font_size', 28),
-            size_hint_x=0.5,
+        # 字号（大/中/小）
+        font_size_box = BoxLayout(size_hint_y=None, height=40, spacing=8)
+        font_size_box.add_widget(Label(text="字号：", font_size='12sp', color=THEME['text'], size_hint_x=0.3))
+        cur_fs = self.config.get('watermark_font_size', DEFAULT_CONFIG['watermark_font_size'])
+        if cur_fs not in WATERMARK_FONT_SIZE_OPTIONS:
+            cur_fs = '中'
+        self.font_spinner = Spinner(
+            text=cur_fs,
+            values=WATERMARK_FONT_SIZE_OPTIONS,
+            size_hint_x=0.7, font_size='12sp',
         )
-        self.font_slider.bind(value=self._on_font_change)
-        font_size_box.add_widget(self.font_slider)
-        self.font_val_label = Label(text=str(int(self.font_slider.value)), font_size='12sp',
-                                    color=THEME['text'], size_hint_x=0.2)
-        font_size_box.add_widget(self.font_val_label)
+        font_size_box.add_widget(self.font_spinner)
         watermark_card.add_widget(font_size_box)
 
         save_wm_btn = Button(text="保存水印设置", font_size='13sp', size_hint_y=None, height=40,
@@ -988,34 +1122,38 @@ class SettingsScreen(Screen):
         main.add_widget(scroll)
         self.add_widget(main)
 
-    def _get_preview(self):
-        template = self.template_input.text or DEFAULT_CONFIG['naming_template']
-        preview = template
-        preview = preview.replace('{date}', get_date_str())
-        preview = preview.replace('{borrower}', '张三')
-        preview = preview.replace('{address}', 'XX路XX号')
-        preview = preview.replace('{property_type}', '住宅')
-        preview = preview.replace('{unit}', '301')
-        preview = preview.replace('{seq}', '01')
-        preview = preview.replace('{type}', '远景')
-        return clean_filename(preview) + '.jpg'
+    def _on_naming_segment_change(self, idx, val):
+        """命名段下拉变化时刷新预览"""
+        self.naming_preview_label.text = "预览：%s" % self._get_naming_preview()
 
-    def _on_font_change(self, instance, value):
-        self.font_val_label.text = str(int(value))
+    def _get_naming_preview(self):
+        """根据当前 4 个命名段下拉生成预览文件名"""
+        segments = [sp.text for sp in self.naming_spinners]
+        return PhotoProcessor.generate_filename(
+            segments, borrower="张三",
+            address_general="XX区", address_precise="XX路1号",
+            property_type="住宅", seq=1, date_str=get_date_str(), photo_type="远景",
+        )
 
-    def _on_wm_toggle(self, instance, value):
+    def _on_wm_segment_change(self, idx, val):
+        """水印段下拉变化时刷新预览"""
+        # 水印预览暂不单独显示，保存时生效
         pass
 
     def _save_naming(self, instance):
-        self.config.set('naming_template', self.template_input.text)
-        self.preview_label.text = f"预览：{self._get_preview()}"
+        segments = [sp.text for sp in self.naming_spinners]
+        self.config.set('naming_segments', segments)
+        self.naming_preview_label.text = "预览：%s" % self._get_naming_preview()
         self._show_toast("命名规则已保存")
 
     def _save_watermark(self, instance):
+        segments = [sp.text for sp in self.wm_spinners]
         self.config.set('watermark_enabled', self.wm_check.active)
-        self.config.set('watermark_text', self.wm_text_input.text)
-        self.config.set('watermark_position', self.pos_spinner.text)
-        self.config.set('watermark_font_size', int(self.font_slider.value))
+        self.config.set('watermark_segments', segments)
+        pos_label = self.pos_spinner.text
+        self.config.set('watermark_position',
+                        WATERMARK_POSITION_LABEL_TO_KEY.get(pos_label, 'bottom-right'))
+        self.config.set('watermark_font_size', self.font_spinner.text)
         self._show_toast("水印设置已保存")
 
     def _show_toast(self, msg):
@@ -1033,7 +1171,7 @@ class SettingsScreen(Screen):
 # ============================================================
 
 class RowWidget(BoxLayout):
-    def __init__(self, row_index, borrower, address, property_type, unit,
+    def __init__(self, row_index, borrower, address_general, address_precise, property_type,
                  progress_key, progress_mgr, photo_callback, view_photos_callback, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'horizontal'
@@ -1044,9 +1182,9 @@ class RowWidget(BoxLayout):
 
         self.row_index = row_index
         self.borrower = borrower
-        self.address = address
+        self.address_general = address_general
+        self.address_precise = address_precise
         self.property_type = property_type
-        self.unit = unit
         self.progress_key = progress_key
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
@@ -1063,9 +1201,9 @@ class RowWidget(BoxLayout):
         info = BoxLayout(spacing=4, size_hint_x=0.6)
         info.padding = [4, 0, 0, 0]
 
-        # 借款人名称
+        # 客户名
         name_box = BoxLayout(orientation='vertical')
-        name_box.add_widget(Label(text="借款人", font_size='9sp', color=THEME['text_dim'],
+        name_box.add_widget(Label(text="客户名", font_size='9sp', color=THEME['text_dim'],
                                   size_hint_y=0.3, halign='left', text_size=(None, None)))
         name_box.add_widget(Label(
             text=borrower[:12] + ("…" if len(borrower) > 12 else ""),
@@ -1075,15 +1213,18 @@ class RowWidget(BoxLayout):
         ))
         info.add_widget(name_box)
 
-        # 抵押物性质 + 房号
+        # 抵押物地址 + 性质
         prop_box = BoxLayout(orientation='vertical')
-        prop_box.add_widget(Label(text="性质", font_size='9sp', color=THEME['text_dim'],
+        prop_box.add_widget(Label(text="地址/性质", font_size='9sp', color=THEME['text_dim'],
                                   size_hint_y=0.3, halign='left', text_size=(None, None)))
-        prop_label = property_type[:6] + ("…" if len(property_type) > 6 else "")
-        if unit:
-            prop_label += " " + unit[:8]
+        addr_short = (address_general + address_precise)[:10]
+        if len((address_general + address_precise)) > 10:
+            addr_short += "…"
+        prop_label = addr_short
+        if property_type:
+            prop_label += " " + property_type[:6]
         prop_box.add_widget(Label(
-            text=prop_label, font_size='12sp', color=THEME['text'], size_hint_y=0.7,
+            text=prop_label, font_size='11sp', color=THEME['text'], size_hint_y=0.7,
             halign='left', text_size=(None, None),
         ))
         info.add_widget(prop_box)
@@ -1102,7 +1243,7 @@ class RowWidget(BoxLayout):
         btn_area.add_widget(self.photo_btn)
 
         self.view_btn = Button(
-            text=f"📂{self.photo_count}" if self.photo_count > 0 else "📂",
+            text="📂%d" % self.photo_count if self.photo_count > 0 else "📂",
             font_size='13sp', size_hint_x=0.35,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
             background_normal='',
@@ -1122,7 +1263,8 @@ class RowWidget(BoxLayout):
         self.bg_rect.size = self.size
 
     def _on_photo(self, instance):
-        self.photo_callback(self.row_index, self.borrower, self.address, self.property_type, self.unit)
+        self.photo_callback(self.row_index, self.borrower, self.address_general,
+                           self.address_precise, self.property_type)
 
     def _on_view_photos(self, instance):
         self.view_photos_callback(self.row_index)
@@ -1131,7 +1273,7 @@ class RowWidget(BoxLayout):
         self.done = True
         self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
         self.photo_btn.background_color = THEME['success']
-        self.view_btn.text = f"📂{self.photo_count}"
+        self.view_btn.text = "📂%d" % self.photo_count
         for child in self.children:
             if isinstance(child, BoxLayout):
                 for c in child.children:
@@ -1152,16 +1294,16 @@ class MainScreen(Screen):
         self.config = app_config
         self.excel_path = ""
         self.headers = []
-        self.rows = []  # [borrower, address, property_type, unit]
+        self.rows = []  # [borrower, address_general, address_precise, property_type]
         self.progress_mgr = ProgressManager()
         self.camera_mgr = CameraManager()
         self.report_generator = ReportGenerator()
         self.row_widgets = []
         self._current_row = 0
         self._current_borrower = ""
-        self._current_address = ""
+        self._current_addr_general = ""
+        self._current_addr_precise = ""
         self._current_property_type = ""
-        self._current_unit = ""
         self._current_photo_type = ""
         self._current_key = ""
 
@@ -1172,7 +1314,7 @@ class MainScreen(Screen):
     def _build_ui(self, parent):
         # 顶部标题栏
         title_bar = BoxLayout(size_hint_y=None, height=48, spacing=6, padding=[6, 0, 6, 0])
-        title_bar.add_widget(Label(text="信贷外勤拍照", font_size='17sp', bold=True, color=THEME['text'],
+        title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='17sp', bold=True, color=THEME['text'],
                                    size_hint_x=0.6, halign='left', text_size=(None, None)))
 
         settings_btn = Button(text="⚙", font_size='18sp', size_hint_x=0.15,
@@ -1271,14 +1413,16 @@ class MainScreen(Screen):
 
         for i, row in enumerate(self.rows):
             borrower = row[0] if len(row) > 0 else ""
-            address = row[1] if len(row) > 1 else ""
-            property_type = row[2] if len(row) > 2 else ""
-            unit = row[3] if len(row) > 3 else ""
-            pk = self.progress_mgr._make_key(borrower, address)
+            address_general = row[1] if len(row) > 1 else ""
+            address_precise = row[2] if len(row) > 2 else ""
+            property_type = row[3] if len(row) > 3 else ""
+            full_addr = (address_general + address_precise).strip()
+            pk = self.progress_mgr._make_key(borrower, full_addr)
 
             rw = RowWidget(
-                row_index=i, borrower=borrower, address=address,
-                property_type=property_type, unit=unit,
+                row_index=i, borrower=borrower,
+                address_general=address_general, address_precise=address_precise,
+                property_type=property_type,
                 progress_key=pk, progress_mgr=self.progress_mgr,
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
@@ -1290,7 +1434,12 @@ class MainScreen(Screen):
 
     def _update_progress(self):
         total = len(self.rows)
-        keys = [(r[0] if len(r) > 0 else "", r[1] if len(r) > 1 else "") for r in self.rows]
+        keys = []
+        for r in self.rows:
+            b = r[0] if len(r) > 0 else ""
+            ag = r[1] if len(r) > 1 else ""
+            ap = r[2] if len(r) > 2 else ""
+            keys.append((b, (ag + ap).strip()))
         done = self.progress_mgr.get_done_count(keys)
         self.progress_label.text = "%d/%d" % (done, total)
         if total > 0:
@@ -1314,13 +1463,13 @@ class MainScreen(Screen):
     def _go_settings(self, instance):
         self.manager.current = 'settings'
 
-    def _on_photo_request(self, row_index, borrower, address, property_type, unit):
+    def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
         self._current_row = row_index
         self._current_borrower = borrower
-        self._current_address = address
+        self._current_addr_general = address_general
+        self._current_addr_precise = address_precise
         self._current_property_type = property_type
-        self._current_unit = unit
-        self._current_key = self.progress_mgr._make_key(borrower, address)
+        self._current_key = self.progress_mgr._make_key(borrower, (address_general + address_precise).strip())
         popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
         popup.open()
 
@@ -1338,39 +1487,74 @@ class MainScreen(Screen):
 
         row_index = self._current_row
         borrower = self._current_borrower
-        address = self._current_address
+        addr_general = self._current_addr_general
+        addr_precise = self._current_addr_precise
         property_type = self._current_property_type
-        unit = self._current_unit
         photo_type = self._current_photo_type
         key = self._current_key
 
         seq = self.progress_mgr.get_next_photo_index(key) + 1
         date_str = get_date_str()
         datetime_str = get_datetime_str()
-        location = self.camera_mgr.get_location_name()
+        full_addr = (addr_general + addr_precise).strip()
 
-        # 添加水印
-        PhotoProcessor.add_watermark(photo_path, self.config.data,
-                                     date_str=datetime_str, address=location + " " + address,
-                                     borrower=borrower, property_type=property_type)
+        # 水印/重命名/保存都是耗时 IO，放后台线程避免 ANR 闪退
+        self.status_label.text = "处理中…"
+        self.status_label.color = THEME['warning']
 
-        # 生成文件名
-        naming_template = self.config.get('naming_template', DEFAULT_CONFIG['naming_template'])
-        filename = PhotoProcessor.generate_filename(
-            naming_template, borrower, address, property_type, unit, seq, date_str, photo_type
-        )
-        new_path = os.path.join(APP_DIR, filename)
-        if photo_path != new_path:
-            if os.path.exists(new_path):
-                name, ext = os.path.splitext(filename)
-                new_path = os.path.join(APP_DIR, "%s_%d%s" % (name, row_index, ext))
-            os.rename(photo_path, new_path)
+        config_data = self.config.data
+        naming_segments = self.config.get('naming_segments', DEFAULT_CONFIG['naming_segments'])
+        lat, lng = self.camera_mgr.gps.get_coords()
 
-        PhotoProcessor.save_to_gallery(new_path)
-        self.progress_mgr.mark_photo(key, new_path, photo_type)
-        Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
+        def _process():
+            try:
+                # 逆地理编码：GPS 坐标 -> 地名（后台线程，不阻塞 UI）
+                # 水印「地址名」段使用 GPS 定位地名，无 GPS 时回退到 Excel 地址
+                place_name = self.camera_mgr.get_location_name(lat, lng, fallback=full_addr)
+
+                # 添加水印（段选择模式）
+                PhotoProcessor.add_watermark(
+                    photo_path, config_data,
+                    time_str=datetime_str, address=place_name,
+                    lat=lat, lng=lng,
+                )
+
+                # 生成文件名（段选择模式）
+                filename = PhotoProcessor.generate_filename(
+                    naming_segments, borrower, addr_general, addr_precise,
+                    property_type, seq, date_str, photo_type,
+                )
+                new_path = os.path.join(APP_DIR, filename)
+                if photo_path != new_path:
+                    if os.path.exists(new_path):
+                        name, ext = os.path.splitext(filename)
+                        # 避免重名：追加序号
+                        suffix = 2
+                        while os.path.exists(new_path):
+                            new_path = os.path.join(APP_DIR, "%s-%02d%s" % (name, suffix, ext))
+                            suffix += 1
+                    os.rename(photo_path, new_path)
+
+                PhotoProcessor.save_to_gallery(new_path)
+                self.progress_mgr.mark_photo(key, new_path, photo_type)
+                Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename), 0)
+            except Exception as e:
+                Logger.error("MainScreen._on_photo_done: %s" % e)
+                err_msg = str(e)
+                Clock.schedule_once(lambda dt: self._on_photo_failed(err_msg), 0)
+
+        threading.Thread(target=_process, daemon=True).start()
+
+    @mainthread
+    def _on_photo_saved(self, row_index, filename):
+        self._refresh_row_done(row_index)
         self.status_label.text = "✓ " + filename
         self.status_label.color = THEME['success']
+
+    @mainthread
+    def _on_photo_failed(self, err_msg):
+        self.status_label.text = "保存失败: %s" % err_msg[:30]
+        self.status_label.color = THEME['danger']
 
     def _refresh_row_done(self, row_index):
         if row_index < len(self.row_widgets):
@@ -1449,7 +1633,7 @@ class MainScreen(Screen):
 
 class LoanPhotoApp(App):
     def build(self):
-        self.title = "信贷外勤拍照"
+        self.title = "资产盘点专项拍照工具"
         Window.clearcolor = THEME['bg']
 
         self.config = AppConfig()
