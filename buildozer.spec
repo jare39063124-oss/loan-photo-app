@@ -14,7 +14,7 @@ requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
 android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,READ_MEDIA_IMAGES
 android.api = 33
 android.minapi = 21
-android.ndk = 25.2.9519653
+android.ndk = 28c
 android.build_tools_version = 33.0.0
 android.arch = arm64-v8a
 

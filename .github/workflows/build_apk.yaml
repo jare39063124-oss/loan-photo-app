@@ -8,10 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    env:
-      ANDROID_HOME: /home/runner/android-sdk
-      ANDROID_SDK_ROOT: /home/runner/android-sdk
-      ANDROID_NDK_HOME: /home/runner/android-sdk/ndk/25.2.9519653
 
     steps:
     - uses: actions/checkout@v4
@@ -37,50 +33,10 @@ jobs:
     - name: Install Python packages
       run: |
         pip install --upgrade pip setuptools wheel
-        pip install buildozer==1.5.0 kivy[base]==2.3.0 openpyxl plyer pillow cython
+        pip install buildozer cython
 
-    - name: Setup Android SDK
-      run: |
-        set -e
-        mkdir -p $ANDROID_HOME/cmdline-tools
-        cd /tmp
-        wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
-        unzip -q cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools/
-        mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
-        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME --licenses
-        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME \
-          "platform-tools" "platforms;android-33" "build-tools;33.0.0"
-
-    - name: Setup NDK
-      run: |
-        set -e
-        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME "ndk;25.2.9519653"
-        ls $ANDROID_HOME/ndk/
-
-    - name: Check ENV before build
-      run: |
-        echo "=== Python ==="
-        python --version
-        echo "=== Java ==="
-        java -version 2>&1
-        echo "=== SDK ==="
-        ls $ANDROID_HOME/platforms/
-        echo "=== NDK ==="
-        ls $ANDROID_HOME/ndk/
-        echo "=== Buildozer ==="
-        buildozer --version 2>&1 || true
-        echo "=== Spec version ==="
-        grep android.ndk buildozer.spec
-
-    - name: Build APK
-      run: buildozer android debug 2>&1 | tee buildozer.log; exit ${PIPESTATUS[0]}
-
-    - name: Upload build log
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: buildozer-log
-        path: buildozer.log
+    - name: Build debug APK
+      run: buildozer -v android debug
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
