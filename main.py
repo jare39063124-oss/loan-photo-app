@@ -888,6 +888,15 @@ class CameraManager:
 
     def _request_camera_permission(self):
         try:
+            from android.permissions import check_permission
+            cam_ok = check_permission('android.permission.CAMERA')
+            loc_ok = check_permission('android.permission.ACCESS_FINE_LOCATION')
+            if cam_ok and loc_ok:
+                self._launch_camera_intent()
+                return
+        except:
+            pass
+        try:
             request_permissions(
                 [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION],
                 self._on_permission_result
