@@ -1,18 +1,64 @@
 """
-银行外勤拍照工具 App - v3.1
+银行外勤拍照工具 App - v3.2
 功能：
 - 欢迎页 + 设置页
-- 可自定义命名规则模板
+- 可自定义命名规则模板（支持 {unit} 房号变量）
 - 水印设置（开关/文字/位置/字号）
 - 四类拍照引导（远景/近景/内部/瑕疵）
-- Excel A=借款人名称 B=抵押物地址 C=抵押物性质
+- Excel A=借款人名称 B=抵押物地址 C=抵押物性质 D=房号（可选）
+- 进度持久化（跨Excel文件可识别已拍条目）
+- 照片路径验证（缩略图不会引用失效路径）
+- 崩溃日志收集
 """
 
 import os
 import json
+import sys
+import traceback
 from datetime import datetime
 from collections import defaultdict
 import threading
+import hashlib
+
+# ============================================================
+# 崩溃日志捕获
+# ============================================================
+CRASH_LOG_FILE = None
+
+def setup_crash_handler():
+    global CRASH_LOG_FILE
+    try:
+        if platform == 'android':
+            from android.storage import getExternalStorageDirectory
+            log_dir = os.path.join(getExternalStorageDirectory(), 'loan_photos')
+        else:
+            log_dir = os.path.join(os.path.expanduser('~'), 'loan_photos')
+        os.makedirs(log_dir, exist_ok=True)
+        CRASH_LOG_FILE = os.path.join(log_dir, 'crash_log.txt')
+    except:
+        CRASH_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'crash_log.txt')
+
+    def global_excepthook(exc_type, exc_value, exc_tb):
+        msg = "="*50 + "\n"
+        msg += "CRASH at %s\n" % datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg += "Type: %s\n" % exc_type.__name__
+        msg += "Error: %s\n" % str(exc_value)
+        msg += "Traceback:\n"
+        msg += "".join(traceback.format_tb(exc_tb))
+        msg += "\n"
+        try:
+            with open(CRASH_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(msg)
+        except:
+            pass
+        # Also let original handler run
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = global_excepthook
+    # Also capture Python thread exceptions
+    threading.excepthook = lambda args: global_excepthook(args.exc_type, args.exc_value, args.exc_tb)
+
+setup_crash_handler()
 
 os.environ['KIVY_LOG_LEVEL'] = 'warning'
 
@@ -71,7 +117,7 @@ FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', '
 
 # === 默认配置 ===
 DEFAULT_CONFIG = {
-    'naming_template': '{date}-{borrower}-{property_type}-{seq:02d}',
+    'naming_template': '{date}-{borrower}-{unit}-{seq:02d}',
     'watermark_enabled': True,
     'watermark_text': '{date} {address}',
     'watermark_position': 'bottom-right',
@@ -172,10 +218,16 @@ class AppConfig:
 # ============================================================
 
 class ProgressManager:
+    """拍照进度管理 - 用借款人+地址作为持久化key，跨Excel文件可识别"""
     def __init__(self, filepath=None):
         self.filepath = filepath or PROGRESS_FILE
         self.data = {}
         self.load()
+
+    def _make_key(self, borrower, address=""):
+        """基于借款人+地址生成持久化key"""
+        raw = (borrower + "|" + address).strip("|")
+        return hashlib.md5(raw.encode('utf-8')).hexdigest()[:16]
 
     def load(self):
         if os.path.exists(self.filepath):
@@ -192,58 +244,63 @@ class ProgressManager:
         except Exception as e:
             Logger.error(f"ProgressManager.save: {e}")
 
-    def _ensure_row(self, row_index):
-        key = str(row_index)
+    def mark_photo(self, key, photo_path, photo_type=""):
+        """key = _make_key(borrower, address)"""
         if key not in self.data:
             self.data[key] = {"photos": [], "types": {}, "timestamp": ""}
-
-    def mark_photo(self, row_index, photo_path, photo_type=""):
-        key = str(row_index)
-        self._ensure_row(row_index)
-        self.data[key]["photos"].append(photo_path)
+        # 验证并保存完整路径
+        self.data[key]["photos"].append(os.path.abspath(photo_path))
         if photo_type:
             self.data[key]["types"][photo_type] = True
         self.data[key]["timestamp"] = get_full_datetime_str()
         self.save()
 
-    def delete_photo(self, row_index, photo_index):
-        key = str(row_index)
+    def delete_photo(self, key, photo_index):
         if key in self.data and photo_index < len(self.data[key]["photos"]):
             self.data[key]["photos"].pop(photo_index)
             if not self.data[key]["photos"]:
                 del self.data[key]
             self.save()
 
-    def delete_all_photos(self, row_index):
-        key = str(row_index)
+    def delete_all_photos(self, key):
         if key in self.data:
             del self.data[key]
             self.save()
 
-    def is_photographed(self, row_index):
-        key = str(row_index)
+    def is_photographed(self, key):
         return key in self.data and len(self.data[key].get("photos", [])) > 0
 
-    def get_photos(self, row_index):
-        key = str(row_index)
-        return self.data.get(key, {}).get("photos", [])
+    def get_photos(self, key):
+        """返回存在的照片路径列表（过滤掉已删除的）"""
+        if key not in self.data:
+            return []
+        valid = []
+        for p in self.data[key].get("photos", []):
+            if os.path.exists(p):
+                valid.append(p)
+        # 清理失效路径
+        if len(valid) != len(self.data[key].get("photos", [])):
+            self.data[key]["photos"] = valid
+            self.save()
+        return valid
 
-    def get_photo_count(self, row_index):
-        return len(self.get_photos(row_index))
+    def get_photo_count(self, key):
+        return len(self.get_photos(key))
 
-    def get_done_count(self, total):
-        return sum(1 for i in range(total) if self.is_photographed(i))
+    def get_done_count(self, keys):
+        """keys = [(borrower, address), ...]"""
+        return sum(1 for b, a in keys if self.is_photographed(self._make_key(b, a)))
 
-    def get_next_photo_index(self, row_index):
-        key = str(row_index)
-        return len(self.data[key]["photos"]) if key in self.data else 0
+    def get_next_photo_index(self, key):
+        if key in self.data:
+            return len(self.data[key]["photos"])
+        return 0
 
-    def get_photo_types(self, row_index):
-        key = str(row_index)
+    def get_photo_types(self, key):
         return self.data.get(key, {}).get("types", {})
 
-    def get_photo_type_summary(self, row_index):
-        types = self.get_photo_types(row_index)
+    def get_photo_type_summary(self, key):
+        types = self.get_photo_types(key)
         done = sum(1 for t in PHOTO_TYPE_LABELS if types.get(t, False))
         return f"{done}/4"
 
@@ -252,24 +309,27 @@ class ProgressManager:
 # ============================================================
 
 class ExcelReader:
-    """读取Excel，A=借款人名称 B=抵押物地址 C=抵押物性质"""
+    """读取Excel，A=借款人名称 B=抵押物地址 C=抵押物性质 D=房号（可选）
+    返回 rows 每项: [borrower, address, property_type, unit]
+    """
     def __init__(self, file_path):
         self.file_path = file_path
         self.headers = []
-        self.rows = []  # [borrower, address, property_type]
+        self.rows = []
 
     def load(self):
         wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
         ws = wb.active
         for i, row in enumerate(ws.iter_rows(values_only=True)):
-            cells = [str(cell).strip() if cell else "" for cell in row[:3]]
+            cells = [str(cell).strip() if cell else "" for cell in row[:4]]
             if i == 0:
                 self.headers = cells
             else:
                 self.rows.append(cells)
         wb.close()
+        # 自动判断表头
         if not self.headers:
-            self.headers = ["借款人名称", "抵押物地址", "抵押物性质"]
+            self.headers = ["借款人名称", "抵押物地址", "抵押物性质", "房号"]
         return self.headers, self.rows
 
 # ============================================================
@@ -424,9 +484,9 @@ class PhotoProcessor:
         return ImageFont.load_default()
 
     @staticmethod
-    def generate_filename(naming_template, borrower="", address="", property_type="", seq=0, date_str="", photo_type=""):
+    def generate_filename(naming_template, borrower="", address="", property_type="", unit="", seq=0, date_str="", photo_type=""):
         """根据模板生成文件名
-        模板变量: {date} {borrower} {address} {property_type} {seq} {type}
+        模板变量: {date} {borrower} {address} {property_type} {unit} {seq} {type}
         """
         if not date_str:
             date_str = get_date_str()
@@ -434,12 +494,14 @@ class PhotoProcessor:
         borrower = clean_filename(borrower)
         address = clean_filename(address)
         property_type = clean_filename(property_type)
+        unit = clean_filename(unit)
 
         filename = naming_template
         filename = filename.replace('{date}', date_str)
         filename = filename.replace('{borrower}', borrower if borrower else '未知')
         filename = filename.replace('{address}', address if address else '')
         filename = filename.replace('{property_type}', property_type if property_type else '')
+        filename = filename.replace('{unit}', unit if unit else '')
         filename = filename.replace('{seq}', f"{seq:02d}" if seq > 0 else "01")
         filename = filename.replace('{type}', photo_type if photo_type else '')
 
@@ -828,10 +890,11 @@ class SettingsScreen(Screen):
                   "{borrower} - 借款人名称\n"
                   "{address} - 抵押物地址\n"
                   "{property_type} - 抵押物性质\n"
+                  "{unit} - 房号/单元号\n"
                   "{seq} - 序号（01开始）\n"
                   "{type} - 拍照类型"),
             font_size='11sp', color=THEME['text_dim'],
-            size_hint_y=None, height=100, halign='left', text_size=(Window.width * 0.75, None),
+            size_hint_y=None, height=110, halign='left', text_size=(Window.width * 0.75, None),
         ))
 
         naming_card.add_widget(Label(text="命名模板：", font_size='12sp',
@@ -932,6 +995,7 @@ class SettingsScreen(Screen):
         preview = preview.replace('{borrower}', '张三')
         preview = preview.replace('{address}', 'XX路XX号')
         preview = preview.replace('{property_type}', '住宅')
+        preview = preview.replace('{unit}', '301')
         preview = preview.replace('{seq}', '01')
         preview = preview.replace('{type}', '远景')
         return clean_filename(preview) + '.jpg'
@@ -969,8 +1033,8 @@ class SettingsScreen(Screen):
 # ============================================================
 
 class RowWidget(BoxLayout):
-    def __init__(self, row_index, borrower, address, property_type,
-                 progress_mgr, photo_callback, view_photos_callback, **kwargs):
+    def __init__(self, row_index, borrower, address, property_type, unit,
+                 progress_key, progress_mgr, photo_callback, view_photos_callback, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'horizontal'
         self.size_hint_y = None
@@ -982,13 +1046,14 @@ class RowWidget(BoxLayout):
         self.borrower = borrower
         self.address = address
         self.property_type = property_type
+        self.unit = unit
+        self.progress_key = progress_key
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
         self.progress_mgr = progress_mgr
-        self.done = progress_mgr.is_photographed(row_index)
-        self.photo_count = progress_mgr.get_photo_count(row_index)
+        self.done = progress_mgr.is_photographed(progress_key)
+        self.photo_count = progress_mgr.get_photo_count(progress_key)
 
-        # 背景卡片
         with self.canvas.before:
             Color(*THEME['card'])
             self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[4])
@@ -1010,13 +1075,15 @@ class RowWidget(BoxLayout):
         ))
         info.add_widget(name_box)
 
-        # 抵押物性质
+        # 抵押物性质 + 房号
         prop_box = BoxLayout(orientation='vertical')
         prop_box.add_widget(Label(text="性质", font_size='9sp', color=THEME['text_dim'],
                                   size_hint_y=0.3, halign='left', text_size=(None, None)))
+        prop_label = property_type[:6] + ("…" if len(property_type) > 6 else "")
+        if unit:
+            prop_label += " " + unit[:8]
         prop_box.add_widget(Label(
-            text=property_type[:8] + ("…" if len(property_type) > 8 else ""),
-            font_size='12sp', color=THEME['text'], size_hint_y=0.7,
+            text=prop_label, font_size='12sp', color=THEME['text'], size_hint_y=0.7,
             halign='left', text_size=(None, None),
         ))
         info.add_widget(prop_box)
@@ -1043,7 +1110,7 @@ class RowWidget(BoxLayout):
         self.view_btn.bind(on_release=self._on_view_photos)
         btn_area.add_widget(self.view_btn)
 
-        summary = progress_mgr.get_photo_type_summary(row_index)
+        summary = progress_mgr.get_photo_type_summary(progress_key)
         status = Label(text=f"✓{summary}" if self.done else "待拍", font_size='11sp',
                       color=THEME['success'] if self.done else THEME['text_dim'], size_hint_x=0.3)
         btn_area.add_widget(status)
@@ -1055,22 +1122,21 @@ class RowWidget(BoxLayout):
         self.bg_rect.size = self.size
 
     def _on_photo(self, instance):
-        self.photo_callback(self.row_index, self.borrower, self.address, self.property_type)
+        self.photo_callback(self.row_index, self.borrower, self.address, self.property_type, self.unit)
 
     def _on_view_photos(self, instance):
         self.view_photos_callback(self.row_index)
 
     def mark_done(self):
         self.done = True
-        self.photo_count = self.progress_mgr.get_photo_count(self.row_index)
+        self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
         self.photo_btn.background_color = THEME['success']
         self.view_btn.text = f"📂{self.photo_count}"
-        # 更新状态标签
         for child in self.children:
             if isinstance(child, BoxLayout):
                 for c in child.children:
                     if isinstance(c, Label) and ("✓" in c.text or "待拍" in c.text or "/" in c.text):
-                        c.text = f"✓{self.progress_mgr.get_photo_type_summary(self.row_index)}"
+                        c.text = f"✓{self.progress_mgr.get_photo_type_summary(self.progress_key)}"
                         c.color = THEME['success']
                         break
 
@@ -1086,7 +1152,7 @@ class MainScreen(Screen):
         self.config = app_config
         self.excel_path = ""
         self.headers = []
-        self.rows = []  # [borrower, address, property_type]
+        self.rows = []  # [borrower, address, property_type, unit]
         self.progress_mgr = ProgressManager()
         self.camera_mgr = CameraManager()
         self.report_generator = ReportGenerator()
@@ -1095,7 +1161,9 @@ class MainScreen(Screen):
         self._current_borrower = ""
         self._current_address = ""
         self._current_property_type = ""
+        self._current_unit = ""
         self._current_photo_type = ""
+        self._current_key = ""
 
         main = BoxLayout(orientation='vertical')
         self._build_ui(main)
@@ -1205,11 +1273,13 @@ class MainScreen(Screen):
             borrower = row[0] if len(row) > 0 else ""
             address = row[1] if len(row) > 1 else ""
             property_type = row[2] if len(row) > 2 else ""
+            unit = row[3] if len(row) > 3 else ""
+            pk = self.progress_mgr._make_key(borrower, address)
 
             rw = RowWidget(
                 row_index=i, borrower=borrower, address=address,
-                property_type=property_type,
-                progress_mgr=self.progress_mgr,
+                property_type=property_type, unit=unit,
+                progress_key=pk, progress_mgr=self.progress_mgr,
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
             )
@@ -1220,10 +1290,11 @@ class MainScreen(Screen):
 
     def _update_progress(self):
         total = len(self.rows)
-        done = self.progress_mgr.get_done_count(total)
-        self.progress_label.text = f"{done}/{total}"
+        keys = [(r[0] if len(r) > 0 else "", r[1] if len(r) > 1 else "") for r in self.rows]
+        done = self.progress_mgr.get_done_count(keys)
+        self.progress_label.text = "%d/%d" % (done, total)
         if total > 0:
-            self.status_label.text = f"进度 {done}/{total}"
+            self.status_label.text = "进度 %d/%d" % (done, total)
             self.status_label.color = THEME['success'] if done == total else THEME['warning']
 
     def _on_search(self, instance, text=None):
@@ -1243,17 +1314,19 @@ class MainScreen(Screen):
     def _go_settings(self, instance):
         self.manager.current = 'settings'
 
-    def _on_photo_request(self, row_index, borrower, address, property_type):
+    def _on_photo_request(self, row_index, borrower, address, property_type, unit):
         self._current_row = row_index
         self._current_borrower = borrower
         self._current_address = address
         self._current_property_type = property_type
+        self._current_unit = unit
+        self._current_key = self.progress_mgr._make_key(borrower, address)
         popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
         popup.open()
 
     def _on_photo_type_selected(self, photo_type):
         self._current_photo_type = photo_type
-        self.status_label.text = f"拍照中 ({photo_type})…"
+        self.status_label.text = "拍照中 (%s)…" % photo_type
         self.status_label.color = THEME['warning']
         self.camera_mgr.take_photo(self._on_photo_done)
 
@@ -1267,9 +1340,11 @@ class MainScreen(Screen):
         borrower = self._current_borrower
         address = self._current_address
         property_type = self._current_property_type
+        unit = self._current_unit
         photo_type = self._current_photo_type
+        key = self._current_key
 
-        seq = self.progress_mgr.get_next_photo_index(row_index) + 1
+        seq = self.progress_mgr.get_next_photo_index(key) + 1
         date_str = get_date_str()
         datetime_str = get_datetime_str()
         location = self.camera_mgr.get_location_name()
@@ -1279,22 +1354,22 @@ class MainScreen(Screen):
                                      date_str=datetime_str, address=location + " " + address,
                                      borrower=borrower, property_type=property_type)
 
-        # 生成文件名（使用配置的模板）
+        # 生成文件名
         naming_template = self.config.get('naming_template', DEFAULT_CONFIG['naming_template'])
         filename = PhotoProcessor.generate_filename(
-            naming_template, borrower, address, property_type, seq, date_str, photo_type
+            naming_template, borrower, address, property_type, unit, seq, date_str, photo_type
         )
         new_path = os.path.join(APP_DIR, filename)
         if photo_path != new_path:
             if os.path.exists(new_path):
                 name, ext = os.path.splitext(filename)
-                new_path = os.path.join(APP_DIR, f"{name}_{row_index}{ext}")
+                new_path = os.path.join(APP_DIR, "%s_%d%s" % (name, row_index, ext))
             os.rename(photo_path, new_path)
 
         PhotoProcessor.save_to_gallery(new_path)
-        self.progress_mgr.mark_photo(row_index, new_path, photo_type)
+        self.progress_mgr.mark_photo(key, new_path, photo_type)
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
-        self.status_label.text = f"✓ {filename}"
+        self.status_label.text = "✓ " + filename
         self.status_label.color = THEME['success']
 
     def _refresh_row_done(self, row_index):
@@ -1303,7 +1378,13 @@ class MainScreen(Screen):
         self._update_progress()
 
     def _on_view_photos(self, row_index):
-        photos = self.progress_mgr.get_photos(row_index)
+        if row_index >= len(self.rows):
+            return
+        row = self.rows[row_index]
+        borrower = row[0] if len(row) > 0 else ""
+        address = row[1] if len(row) > 1 else ""
+        key = self.progress_mgr._make_key(borrower, address)
+        photos = self.progress_mgr.get_photos(key)
         if not photos:
             self.status_label.text = "暂无照片"
             self.status_label.color = THEME['warning']
@@ -1313,10 +1394,16 @@ class MainScreen(Screen):
         popup.open()
 
     def _on_delete_photo(self, row_index, photo_index):
+        if row_index >= len(self.rows):
+            return
+        row = self.rows[row_index]
+        borrower = row[0] if len(row) > 0 else ""
+        address = row[1] if len(row) > 1 else ""
+        key = self.progress_mgr._make_key(borrower, address)
         if photo_index == -1:
-            self.progress_mgr.delete_all_photos(row_index)
+            self.progress_mgr.delete_all_photos(key)
         else:
-            self.progress_mgr.delete_photo(row_index, photo_index)
+            self.progress_mgr.delete_photo(key, photo_index)
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
     def _generate_report(self, instance):
