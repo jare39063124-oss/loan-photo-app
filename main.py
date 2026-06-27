@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.3.2
+资产盘点专项拍照工具 App - v3.3.3
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -129,34 +129,43 @@ from kivy.metrics import dp, sp
 from kivy.storage.jsonstore import JsonStore
 from kivy.core.text import LabelBase
 from kivy.resources import resource_find, resource_add_path
+from kivy.lang import Builder
+from kivy.uix.spinner import SpinnerOption
 
 # ============================================================
-# 中文字体加载（注册为 'Roboto'，全局生效）
-# Kivy 默认 'Roboto' 字体不含 CJK → 中文豆腐块。
-# 策略：
-#   1. 把 assets/ 目录加入 Kivy resource 搜索路径
-#   2. 用 resource_find() 查找字体（兼容 APK 内 assets）
-#   3. fallback 到 Android 系统字体
-#   4. 注册名为 'Roboto'，所有 widget 默认即使用中文字体
+# 中文字体加载（彻底解决中文豆腐块问题）
+#
+# 根本原因历史：
+#   - 之前用的 NotoSansSC.ttf 只有 28KB，是损坏的占位文件，
+#     一个真正的 CJK 中文字体至少需要 4-16MB。
+#   - 现在使用 simhei.ttf（黑体，9.7MB），放在 main.py 同级目录，
+#     buildozer 通过 source.include_exts=ttf 自动打包进 APK，
+#     在 APK 内与 main.py 同目录，路径最简单最可靠。
+#
+# 三重保障：
+#   1. LabelBase.register('Roboto', ...) 替换 Kivy 默认字体
+#   2. KV 全局规则设置所有文本 widget 的 font_name，
+#      特别包含 SpinnerOption（下拉菜单选项）
+#   3. Android 系统字体 fallback（应对极端情况）
 # ============================================================
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _ASSETS_DIR = os.path.join(_APP_DIR, 'assets')
+resource_add_path(_APP_DIR)
 if os.path.isdir(_ASSETS_DIR):
     resource_add_path(_ASSETS_DIR)
 
-_FONT_NAME = 'Roboto'
 _FONT_PATH = None
-
-_font_candidates = [
-    'NotoSansSC.ttf',
-    'NotoSansSC-Regular.otf',
-]
-for _fn in _font_candidates:
-    _found = resource_find(_fn)
-    if _found and os.path.exists(_found):
-        _FONT_PATH = _found
+for _fn in ['simhei.ttf', 'NotoSansSC.ttf', 'NotoSansSC-Regular.otf']:
+    _p = os.path.join(_APP_DIR, _fn)
+    if os.path.exists(_p) and os.path.getsize(_p) > 100000:
+        _FONT_PATH = _p
         break
-
+if not _FONT_PATH:
+    for _fn in ['simhei.ttf']:
+        _found = resource_find(_fn)
+        if _found and os.path.exists(_found) and os.path.getsize(_found) > 100000:
+            _FONT_PATH = _found
+            break
 if not _FONT_PATH:
     for _sp in [
         '/system/fonts/NotoSansCJK-Regular.ttc',
@@ -164,6 +173,7 @@ if not _FONT_PATH:
         '/system/fonts/NotoSansCJKsc-Regular.otf',
         '/system/fonts/DroidSansFallback.ttf',
         '/system/fonts/SourceHanSansCN-Regular.otf',
+        '/system/fonts/msyh.ttc',
     ]:
         if os.path.exists(_sp):
             _FONT_PATH = _sp
@@ -172,14 +182,36 @@ if not _FONT_PATH:
 if _FONT_PATH:
     try:
         LabelBase.register('Roboto', _FONT_PATH)
-    except Exception:
+    except Exception as _e:
         _FONT_PATH = None
 
 CHINESE_FONT = 'Roboto'
 
+Builder.load_string('''
+<Label>:
+    font_name: 'Roboto'
+<Button>:
+    font_name: 'Roboto'
+<Spinner>:
+    font_name: 'Roboto'
+<TextInput>:
+    font_name: 'Roboto'
+<CheckBox>:
+    font_name: 'Roboto'
+<SpinnerOption>:
+    font_name: 'Roboto'
+<Switch>:
+    font_name: 'Roboto'
+<Slider>:
+    font_name: 'Roboto'
+<ProgressBar>:
+    font_name: 'Roboto'
+''')
+
 _diag_lines = ["=== Font diag ===", "__file__=%s" % __file__,
-               "assets_dir=%s exists=%s" % (_ASSETS_DIR, os.path.isdir(_ASSETS_DIR)),
-               "font_path=%s" % _FONT_PATH]
+               "app_dir=%s" % _APP_DIR,
+               "font_path=%s" % _FONT_PATH,
+               "font_size=%d" % (os.path.getsize(_FONT_PATH) if _FONT_PATH and os.path.exists(_FONT_PATH) else 0)]
 try:
     _diag_dir = _resolve_android_app_dir() if _EARLY_IS_ANDROID else os.path.expanduser('~')
     os.makedirs(_diag_dir, exist_ok=True)
@@ -226,7 +258,7 @@ except Exception as e:
 
 PROGRESS_FILE = os.path.join(APP_DIR, 'photo_progress.json')
 CONFIG_FILE = os.path.join(APP_DIR, 'app_config.json')
-FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
+FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'simhei.ttf')
 
 # === 默认配置 ===
 # Excel 格式：A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
@@ -936,7 +968,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.3.2", font_size='11sp',
+            text="v3.3.3", font_size='11sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(20),
         ))
