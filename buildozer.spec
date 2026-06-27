@@ -7,7 +7,7 @@ source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
 android.add_assets = assets/
-version = 3.3.1
+version = 3.3.2
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
 

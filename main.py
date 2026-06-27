@@ -127,6 +127,30 @@ from kivy.utils import platform
 from kivy.graphics import Color, Rectangle, Line, RoundedRectangle
 from kivy.metrics import dp, sp
 from kivy.storage.jsonstore import JsonStore
+from kivy.core.text import LabelBase
+
+# ============================================================
+# 注册中文字体（必须在创建任何 Label 之前完成）
+# Kivy 默认 'Roboto' 字体不含 CJK 字符 → 所有中文显示为「豆腐块」
+# 把 'Roboto' 与 'sans-serif' 都替换为 NotoSansSC，让 Label/Button/Spinner 等
+# 默认就能正确渲染中文。
+# 字体文件由 buildozer.spec 的 source.include_exts=ttf,otf 一起打包进 APK。
+# ============================================================
+_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
+if os.path.exists(_FONT_PATH):
+    LabelBase.register('Roboto', _FONT_PATH)
+    LabelBase.register('sans-serif', _FONT_PATH)
+else:
+    # Android 上某些 p4a 版本 __file__ 路径不同，尝试备用路径
+    for _alt in (
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC-Regular.otf'),
+        '/system/fonts/NotoSansCJK-Regular.ttc',
+    ):
+        if os.path.exists(_alt):
+            LabelBase.register('Roboto', _alt)
+            LabelBase.register('sans-serif', _alt)
+            _FONT_PATH = _alt
+            break
 
 import openpyxl
 from openpyxl import load_workbook
