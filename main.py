@@ -1,10 +1,10 @@
 """
-资产盘点专项拍照工具 App - v3.5.0
+资产盘点专项拍照工具 App - v3.6.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
 - 水印自选模式（3段下拉 X-X-X + 大中小字号 + 位置）
-- 四类拍照引导（远景/近景/内部/瑕疵）+ 连续拍照
+- 四类拍照引导（远景/近景/内部/瑕疵）+ 连续拍照（同类型手动按快门连拍）
 - Excel A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
 - 进度持久化（跨Excel文件可识别已拍条目）
 - 照片路径验证（缩略图不会引用失效路径）
@@ -896,11 +896,14 @@ class CameraManager:
         self.gps = GpsManager()
         self.geocoder = GeoCoder()
         self._camera_launched = False
+        self._media_uri = None
 
     def take_photo(self, callback):
         """启动相机拍照，拍完后callback(photo_path)被调用，失败传None。"""
         self.pending_callback = callback
         self._camera_launched = False
+        self._media_uri = None
+        self.photo_path = ""
         if IS_ANDROID:
             self._request_camera_permission()
         else:
@@ -932,8 +935,11 @@ class CameraManager:
                 self.pending_callback(None)
 
     def _launch_camera_intent(self):
-        """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机，
-        使用 FileProvider 提供输出文件 URI，on_activity_result 回调时检测文件是否存在。
+        """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机。
+        策略：
+        1) Android 10+ (API 29+) 使用 MediaStore 创建 content:// URI（无需 FileProvider）
+        2) 低版本尝试 FileProvider（多种类名）
+        3) 兜底：关闭 StrictMode，使用外部缓存目录 file:// URI
         """
         try:
             from jnius import autoclass
@@ -943,41 +949,120 @@ class CameraManager:
 
             activity = PythonActivity.mActivity
             package_name = activity.getPackageName()
-
-            self.photo_path = os.path.join(
-                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-            )
-            photo_file = File(self.photo_path)
+            resolver = activity.getContentResolver()
 
             intent = Intent(Intent.ACTION_IMAGE_CAPTURE)
 
-            FileProvider = None
-            for fp_cls_name in [
-                'androidx.core.content.FileProvider',
-                'android.support.v4.content.FileProvider',
-            ]:
+            # ---------- 策略1：Android 10+ 使用 MediaStore ----------
+            uri = None
+            if ANDROID_API >= 29:
                 try:
-                    FileProvider = autoclass(fp_cls_name)
-                    break
-                except:
-                    continue
+                    from jnius import cast
+                    ContentValues = autoclass('android.content.ContentValues')
+                    MediaStore_Images = autoclass('android.provider.MediaStore$Images$Media')
+                    cv = ContentValues()
+                    fname = f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                    cv.put(MediaStore_Images.DISPLAY_NAME, fname)
+                    cv.put(MediaStore_Images.MIME_TYPE, "image/jpeg")
+                    cv.put(MediaStore_Images.RELATIVE_PATH, "Pictures/AssetPhotos")
+                    media_uri = resolver.insert(MediaStore_Images.EXTERNAL_CONTENT_URI, cv)
+                    if media_uri is not None:
+                        uri = media_uri
+                        self.photo_path = None  # 标记为 MediaStore URI，稍后读取
+                        self._media_uri = uri
+                        Logger.info("Camera: Using MediaStore URI (API %d)", ANDROID_API)
+                except Exception as e:
+                    Logger.warning("Camera: MediaStore failed: %s", str(e)[:100])
 
-            if FileProvider is not None:
-                uri = FileProvider.getUriForFile(activity, package_name + ".fileprovider", photo_file)
-                intent.putExtra("output", uri)
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            else:
+            # ---------- 策略2：FileProvider ----------
+            if uri is None:
+                os.makedirs(APP_DIR, exist_ok=True)
+                # 优先使用外部缓存目录（权限更宽松）
+                cache_dir = None
+                try:
+                    cache_dir = activity.getExternalCacheDir()
+                except:
+                    pass
+                save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
+                self.photo_path = os.path.join(
+                    save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                )
+                photo_file = File(self.photo_path)
+                self._media_uri = None
+
+                provider_classes = [
+                    'androidx.core.content.FileProvider',
+                    'android.support.v4.content.FileProvider',
+                    'org.kivy.android.FileProvider',
+                    'org.kivy.android.GenericFileProvider',
+                ]
+                for fp_cls_name in provider_classes:
+                    try:
+                        FileProvider = autoclass(fp_cls_name)
+                        test_uri = FileProvider.getUriForFile(activity, package_name + ".fileprovider", photo_file)
+                        if test_uri is not None:
+                            uri = test_uri
+                            Logger.info("Camera: Using FileProvider %s", fp_cls_name)
+                            break
+                    except Exception as e:
+                        continue
+
+            # ---------- 策略3：关闭 StrictMode + file:// URI（兜底）----------
+            if uri is None:
+                os.makedirs(APP_DIR, exist_ok=True)
+                cache_dir = None
+                try:
+                    cache_dir = activity.getExternalCacheDir()
+                except:
+                    pass
+                save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
+                self.photo_path = os.path.join(
+                    save_dir, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                )
+                photo_file = File(self.photo_path)
+                self._media_uri = None
+                try:
+                    StrictMode = autoclass('android.os.StrictMode')
+                    VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
+                    policy = VmPolicyBuilder().build()
+                    StrictMode.setVmPolicy(policy)
+                    Logger.info("Camera: StrictMode disabled, using file:// URI fallback")
+                except Exception:
+                    pass
                 Uri = autoclass('android.net.Uri')
                 uri = Uri.fromFile(photo_file)
-                intent.putExtra("output", uri)
+
+            intent.putExtra("output", uri)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+            # 授予所有可能的相机应用 URI 临时权限
+            try:
+                List = autoclass('java.util.List')
+                from jnius import cast
+                resolves = activity.getPackageManager().queryIntentActivities(intent, 0)
+                for i in range(resolves.size()):
+                    resolve_info = resolves.get(i)
+                    pkg = resolve_info.activityInfo.packageName
+                    activity.grantUriPermission(pkg, uri,
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            except Exception as e:
+                Logger.warning("Camera: grantUriPermission failed: %s", str(e)[:80])
 
             self._camera_launched = True
             activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
+            Logger.info("Camera: Intent launched")
         except Exception as e:
             Logger.error("Camera launch failed: %s" % e)
             Logger.error(traceback.format_exc())
-            self._simulate_photo()
+            if IS_ANDROID:
+                if self.pending_callback:
+                    cb = self.pending_callback
+                    self.pending_callback = None
+                    Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+            else:
+                self._simulate_photo()
 
     def on_camera_result(self, result_code):
         """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。"""
@@ -985,12 +1070,54 @@ class CameraManager:
             return
         self._camera_launched = False
         if result_code == -1:  # RESULT_OK
-            if os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
+            # 处理 MediaStore URI：通过 content resolver 打开输入流，复制到应用目录
+            if self._media_uri is not None:
+                copied_path = None
+                try:
+                    from jnius import autoclass
+                    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                    activity = PythonActivity.mActivity
+                    resolver = activity.getContentResolver()
+                    istream = resolver.openInputStream(self._media_uri)
+                    os.makedirs(APP_DIR, exist_ok=True)
+                    dest_path = os.path.join(
+                        APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                    )
+                    # 用 Python 方式复制（通过 Java 字节数组中转）
+                    ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+                    baos = ByteArrayOutputStream()
+                    buf = bytearray(8192)
+                    while True:
+                        n = istream.read(buf)
+                        if n <= 0:
+                            break
+                        baos.write(buf, 0, n)
+                    istream.close()
+                    with open(dest_path, 'wb') as f:
+                        f.write(bytes(baos.toByteArray()))
+                    baos.close()
+                    self.photo_path = dest_path
+                    copied_path = dest_path
+                    Logger.info("Camera: MediaStore copied to %s (%d bytes)", dest_path, os.path.getsize(dest_path))
+                except Exception as e:
+                    Logger.error("Camera: MediaStore copy failed: %s", str(e)[:200])
+                    Logger.error(traceback.format_exc())
+                    self._media_uri = None
+                    if self.pending_callback:
+                        cb = self.pending_callback
+                        self.pending_callback = None
+                        cb(None)
+                    return
+                self._media_uri = None
+
+            if self.photo_path and os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
                     cb(self.photo_path)
                 return
+            else:
+                Logger.warning("Camera: photo file not found or empty: %s", self.photo_path)
         if self.pending_callback:
             cb = self.pending_callback
             self.pending_callback = None
@@ -1223,7 +1350,7 @@ class PhotoViewerPopup(Popup):
             del_btn = Button(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
-            del_btn.bind(on_release=lambda x, idx=i: self._delete_photo(idx))
+            del_btn.bind(on_release=lambda x, idx=i: self._confirm_delete(idx))
             info_box.add_widget(del_btn)
             item.add_widget(info_box)
             list_layout.add_widget(item)
@@ -1234,7 +1361,7 @@ class PhotoViewerPopup(Popup):
         del_all_btn = Button(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
-        del_all_btn.bind(on_release=self._delete_all)
+        del_all_btn.bind(on_release=self._confirm_delete_all)
         main_layout.add_widget(del_all_btn)
 
         close_btn = Button(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
@@ -1244,13 +1371,51 @@ class PhotoViewerPopup(Popup):
         main_layout.add_widget(close_btn)
         self.content = main_layout
 
-    def _delete_photo(self, index):
-        self.delete_callback(self.row_index, index)
-        self.dismiss()
+    def _confirm_delete(self, index):
+        """删除单张照片前弹出二次确认"""
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(Label(text=f"确定要删除这张照片吗？\n此操作不可撤销。",
+                                 font_size='16sp', color=THEME['text'], halign='center'))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        popup = Popup(title="确认删除", size_hint=(0.8, 0.35), auto_dismiss=True)
+        yes_btn = Button(text="确认删除", font_size='16sp', background_color=THEME['danger'],
+                         background_normal='', color=(1,1,1,1), bold=True)
+        no_btn = Button(text="取消", font_size='16sp', background_color=THEME['accent'],
+                        background_normal='', color=(1,1,1,1), bold=True)
+        def _do_delete(instance):
+            popup.dismiss()
+            self.delete_callback(self.row_index, index)
+            self.dismiss()
+        yes_btn.bind(on_release=_do_delete)
+        no_btn.bind(on_release=popup.dismiss)
+        btn_row.add_widget(yes_btn)
+        btn_row.add_widget(no_btn)
+        content.add_widget(btn_row)
+        popup.content = content
+        popup.open()
 
-    def _delete_all(self, instance):
-        self.delete_callback(self.row_index, -1)
-        self.dismiss()
+    def _confirm_delete_all(self, instance):
+        """删除全部照片前弹出二次确认"""
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(Label(text=f"确定要删除该客户的全部照片吗？\n此操作不可撤销！",
+                                 font_size='16sp', color=THEME['danger'], halign='center'))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        popup = Popup(title="⚠ 危险操作确认", size_hint=(0.85, 0.35), auto_dismiss=True)
+        yes_btn = Button(text="全部删除", font_size='16sp', background_color=THEME['danger'],
+                         background_normal='', color=(1,1,1,1), bold=True)
+        no_btn = Button(text="取消", font_size='16sp', background_color=THEME['accent'],
+                        background_normal='', color=(1,1,1,1), bold=True)
+        def _do_delete_all(instance):
+            popup.dismiss()
+            self.delete_callback(self.row_index, -1)
+            self.dismiss()
+        yes_btn.bind(on_release=_do_delete_all)
+        no_btn.bind(on_release=popup.dismiss)
+        btn_row.add_widget(yes_btn)
+        btn_row.add_widget(no_btn)
+        content.add_widget(btn_row)
+        popup.content = content
+        popup.open()
 
 
 # ============================================================
@@ -1456,7 +1621,7 @@ class SettingsScreen(Screen):
 
 class RowWidget(BoxLayout):
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
-                 progress_key, progress_mgr, photo_callback, view_photos_callback, reset_callback, **kwargs):
+                 progress_key, progress_mgr, photo_callback, view_photos_callback, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
         self.size_hint_y = None
@@ -1473,7 +1638,6 @@ class RowWidget(BoxLayout):
         self.progress_key = progress_key
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
-        self.reset_callback = reset_callback
         self.progress_mgr = progress_mgr
         self.done = progress_mgr.is_photographed(progress_key)
         self.photo_count = progress_mgr.get_photo_count(progress_key)
@@ -1520,12 +1684,12 @@ class RowWidget(BoxLayout):
         # 间隔
         self.add_widget(Label(size_hint_y=None, height=dp(4)))
 
-        # 按钮行
-        btn_row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        # 按钮行（拍照 + 查看已拍 + 类型计数）
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
 
         self.photo_btn = Button(
-            text="拍照", font_size='15sp',
-            size_hint_x=0.28,
+            text="拍照", font_size='17sp',
+            size_hint_x=0.32,
             background_color=THEME['success'] if self.done else THEME['accent'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -1535,7 +1699,7 @@ class RowWidget(BoxLayout):
 
         self.view_btn = Button(
             text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
-            font_size='14sp', size_hint_x=0.38,
+            font_size='16sp', size_hint_x=0.50,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -1543,19 +1707,9 @@ class RowWidget(BoxLayout):
         self.view_btn.bind(on_release=self._on_view_photos)
         btn_row.add_widget(self.view_btn)
 
-        self.reset_btn = Button(
-            text="清零", font_size='14sp', size_hint_x=0.22,
-            background_color=THEME['danger'] if self.photo_count > 0 else (0.35, 0.35, 0.35, 1),
-            background_normal='',
-            color=(1, 1, 1, 1), bold=True,
-            disabled=self.photo_count == 0,
-        )
-        self.reset_btn.bind(on_release=self._on_reset)
-        btn_row.add_widget(self.reset_btn)
-
-        self.type_status = Label(text="", font_size='12sp',
+        self.type_status = Label(text="", font_size='14sp',
                                 color=THEME['success'] if self.done else THEME['text_dim'],
-                                size_hint_x=0.12)
+                                size_hint_x=0.18, bold=True)
         btn_row.add_widget(self.type_status)
 
         self.add_widget(btn_row)
@@ -1574,7 +1728,7 @@ class RowWidget(BoxLayout):
         addr_h = self.addr_label.texture_size[1] if self.addr_label.texture_size else dp(20)
         self.name_label.height = max(dp(24), name_h + dp(4))
         self.addr_label.height = max(dp(20), addr_h + dp(4))
-        self.height = self.name_label.height + self.addr_label.height + dp(48) + dp(16) + dp(4)
+        self.height = self.name_label.height + self.addr_label.height + dp(52) + dp(16) + dp(4)
 
     def _update_bg(self, *args):
         self.bg_rect.pos = self.pos
@@ -1593,9 +1747,6 @@ class RowWidget(BoxLayout):
     def _on_view_photos(self, instance):
         self.view_photos_callback(self.row_index)
 
-    def _on_reset(self, instance):
-        self.reset_callback(self.row_index)
-
     def mark_done(self):
         self.done = True
         self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
@@ -1603,8 +1754,6 @@ class RowWidget(BoxLayout):
         self.name_label.color = THEME['success']
         self.view_btn.text = "查看已拍(%d)" % self.photo_count
         self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1)
-        self.reset_btn.disabled = self.photo_count == 0
-        self.reset_btn.background_color = THEME['danger'] if self.photo_count > 0 else (0.35, 0.35, 0.35, 1)
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
 
@@ -1866,7 +2015,6 @@ class MainScreen(Screen):
                 progress_key=pk, progress_mgr=self.progress_mgr,
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
-                reset_callback=self._on_reset_photos,
             )
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
@@ -1921,13 +2069,16 @@ class MainScreen(Screen):
         self._current_photo_type = photo_type
         self._continuous_shooting = True
         self._photos_in_session = 0
-        self.status_label.text = "正在启动相机 (%s)…" % photo_type
+        self.status_label.text = "正在启动相机（%s），按返回键可结束拍摄" % photo_type
         self.status_label.color = THEME['warning']
         Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.3)
 
     def _launch_next_photo(self):
+        """拍完一张后立即重新调起相机，继续拍摄同一类型，用户按快门拍下一张。"""
         if self._continuous_shooting:
-            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.5)
+            self.status_label.text = "准备下一张（%s）…按返回键结束" % self._current_photo_type
+            self.status_label.color = THEME['warning']
+            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.8)
 
     def _on_photo_done(self, photo_path):
         if photo_path is None:
@@ -1997,14 +2148,14 @@ class MainScreen(Screen):
     @mainthread
     def _on_photo_saved(self, row_index, filename):
         self._refresh_row_done(row_index)
-        self.status_label.text = "✓ %s（继续拍照或按返回键结束）" % filename[:30]
+        self.status_label.text = "✓ %s 已保存" % filename[:28]
         self.status_label.color = THEME['success']
         self._launch_next_photo()
 
     @mainthread
     def _on_photo_failed(self, err_msg):
         self._continuous_shooting = False
-        self.status_label.text = "保存失败: %s" % err_msg[:30]
+        self.status_label.text = "保存失败: %s" % err_msg[:40]
         self.status_label.color = THEME['danger']
 
     def _refresh_row_done(self, row_index):
@@ -2040,32 +2191,29 @@ class MainScreen(Screen):
         full_addr = (address_general + address_precise).strip()
         key = self.progress_mgr._make_key(borrower, full_addr)
         if photo_index == -1:
+            # 删除全部：先删文件，再清进度
+            photos = self.progress_mgr.get_photos(key)
+            for p in photos:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
             self.progress_mgr.delete_all_photos(key)
+            self.status_label.text = "已删除该客户全部照片"
+            self.status_label.color = THEME['warning']
         else:
+            # 删除单张
+            photos = self.progress_mgr.get_photos(key)
+            if photo_index < len(photos):
+                p = photos[photo_index]
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
             self.progress_mgr.delete_photo(key, photo_index)
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
-
-    def _on_reset_photos(self, row_index):
-        if row_index >= len(self.rows):
-            return
-        row = self.rows[row_index]
-        borrower = row[0] if len(row) > 0 else ""
-        address_general = row[1] if len(row) > 1 else ""
-        address_precise = row[2] if len(row) > 2 else ""
-        full_addr = (address_general + address_precise).strip()
-        key = self.progress_mgr._make_key(borrower, full_addr)
-        photos = self.progress_mgr.get_photos(key)
-        for p in photos:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except:
-                pass
-        self.progress_mgr.delete_all_photos(key)
-        self._continuous_shooting = False
-        Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
-        self.status_label.text = "已清零该客户照片"
-        self.status_label.color = THEME['warning']
 
     def _generate_report(self, instance):
         self.status_label.text = "报告功能暂未开放"
