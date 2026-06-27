@@ -543,6 +543,26 @@ class ProgressManager:
             return len(self.data[key]["photos"])
         return 0
 
+    def get_next_type_index(self, key, photo_type):
+        """返回该客户指定类型的下一个照片编号（01开始，跨会话连续）。
+        统计已有照片中文件名包含_{type}_NN模式的最大编号+1。
+        """
+        if key not in self.data:
+            return 1
+        max_idx = 0
+        type_tag = "_%s_" % photo_type
+        for p in self.data[key].get("photos", []):
+            basename = os.path.basename(p)
+            if type_tag in basename:
+                try:
+                    idx_str = basename.split(type_tag)[-1].split('.')[0].split('_')[0]
+                    idx = int(idx_str)
+                    if idx > max_idx:
+                        max_idx = idx
+                except:
+                    pass
+        return max_idx + 1
+
     def get_photo_types(self, key):
         return self.data.get(key, {}).get("types", {})
 
@@ -1953,13 +1973,13 @@ class MainScreen(Screen):
                     property_type, seq, date_str, photo_type,
                 )
                 name_base, ext = os.path.splitext(filename)
-                filename = "%s_%s_%02d%s" % (name_base, photo_type, self._photos_in_session, ext if ext else '.jpg')
+                filename = "%s_%s_%02d%s" % (name_base, photo_type, seq, ext if ext else '.jpg')
                 new_path = os.path.join(APP_DIR, filename)
                 if photo_path != new_path:
                     if os.path.exists(new_path):
                         suffix = 2
                         while os.path.exists(new_path):
-                            new_path = os.path.join(APP_DIR, "%s_%s_%02d_%d%s" % (name_base, photo_type, self._photos_in_session, suffix, ext if ext else '.jpg'))
+                            new_path = os.path.join(APP_DIR, "%s_%s_%02d_%d%s" % (name_base, photo_type, seq, suffix, ext if ext else '.jpg'))
                             suffix += 1
                     os.rename(photo_path, new_path)
 
