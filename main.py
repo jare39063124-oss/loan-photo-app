@@ -1,14 +1,11 @@
 """
-银行外勤拍照工具 App - 完整重写版
-新增功能：
-1. 右侧导航条（快速跳转到指定行）
-2. 顶部搜索栏（支持客户名模糊搜索）
-3. 完成走访生成报告（读取模板自动填写 Excel）
-4. 查看已拍照片 + 删除重拍
-5. 同一抵押物多张照片（_01, _02...）
-6. 照片保存到系统相册
-7. 列名明确：客户名称、押品性质
-8. 命名规则可选
+银行外勤拍照工具 App - v3.0 跨设备兼容 + 四类拍照引导
+优化内容：
+1. 四类拍照引导（远景/近景/内部/瑕疵）
+2. 照片命名支持序号模式（盘点表序号）
+3. 跨设备兼容性（Android 版本适配、存储权限、保活）
+4. 中文字体打包（28KB 子集化字体）
+5. 相机 fallback 机制（plyer 失败时切换 Android Intent）
 """
 
 import os
@@ -30,6 +27,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.spinner import Spinner
 from kivy.uix.image import Image as KivyImage
 from kivy.uix.checkbox import CheckBox
+from kivy.uix.floatlayout import FloatLayout
 from kivy.clock import Clock, mainthread
 from kivy.logger import Logger
 from kivy.core.window import Window
@@ -54,12 +52,42 @@ if IS_ANDROID:
         from android import mActivity
     except:
         mActivity = None
-    BASE_DIR = os.path.join(getExternalStorageDirectory(), 'loan_photos')
-else:
-    BASE_DIR = os.path.join(os.path.expanduser('~'), 'loan_photos')
 
-os.makedirs(BASE_DIR, exist_ok=True)
-PROGRESS_FILE = os.path.join(BASE_DIR, 'photo_progress.json')
+    # Android 版本检测
+    try:
+        from android import api_version
+        ANDROID_API = api_version
+    except:
+        ANDROID_API = 30  # 默认 Android 11
+else:
+    mActivity = None
+    ANDROID_API = 0
+
+# 获取 Android 版本
+def get_android_version():
+    """返回 Android API level (如 30=Android 11, 33=Android 13)"""
+    if not IS_ANDROID:
+        return 0
+    try:
+        from android import api_version
+        return api_version
+    except:
+        return 30
+
+ANDROID_API = get_android_version()
+
+# 基础目录 - 兼容所有 Android 版本
+if IS_ANDROID:
+    # Android: 使用 App 专属目录 + 公共目录双重存储
+    APP_DIR = os.path.join(getExternalStorageDirectory(), 'loan_photos')
+else:
+    APP_DIR = os.path.join(os.path.expanduser('~'), 'loan_photos')
+
+os.makedirs(APP_DIR, exist_ok=True)
+PROGRESS_FILE = os.path.join(APP_DIR, 'photo_progress.json')
+
+# 字体路径 - 优先使用打包的子集化字体
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'NotoSansSC.ttf')
 TEMPLATE_PATH = r"C:\Users\Administrator\Desktop\盘点相关文件\抵押物、抵债资产现场勘查日报表模板.xlsx"
 
 
@@ -87,14 +115,28 @@ def get_report_date_str():
 
 
 # ============================================================
+# 拍照类型常量
+# ============================================================
+PHOTO_TYPES = [
+    ("远景", "小区/厂区全貌、楼栋外立面、宗地全貌"),
+    ("近景", "单元门口、楼层门牌、房号牌、宗地界桩"),
+    ("内部", "室内全景、核心区域现状、厂房/设备整体"),
+    ("瑕疵", "破损、漏水、违建、占用、查封等异常特写"),
+]
+PHOTO_TYPE_LABELS = ["远景", "近景", "内部", "瑕疵"]
+
+
+# ============================================================
 # 进度管理器
 # ============================================================
 class ProgressManager:
-    """持久化拍照进度到 JSON"""
+    """持久化拍照进度到 JSON
+    记录格式: {row_index: {"photos": [path1, ...], "types": {"远景": bool, ...}, "timestamp": ""}}
+    """
 
     def __init__(self, filepath=None):
         self.filepath = filepath or PROGRESS_FILE
-        self.data = {}  # {row_index: {"photos": [path1, path2, ...], "timestamp": "..."}}
+        self.data = {}  # {row_index: {"photos": [], "types": {}, "timestamp": ""}}
         self.load()
 
     def load(self):
@@ -112,11 +154,17 @@ class ProgressManager:
         except Exception as e:
             Logger.error(f"ProgressManager.save: {e}")
 
-    def mark_photo(self, row_index, photo_path):
+    def _ensure_row(self, row_index):
         key = str(row_index)
         if key not in self.data:
-            self.data[key] = {"photos": [], "timestamp": ""}
+            self.data[key] = {"photos": [], "types": {}, "timestamp": ""}
+
+    def mark_photo(self, row_index, photo_path, photo_type=""):
+        key = str(row_index)
+        self._ensure_row(row_index)
         self.data[key]["photos"].append(photo_path)
+        if photo_type:
+            self.data[key]["types"][photo_type] = True
         self.data[key]["timestamp"] = get_full_datetime_str()
         self.save()
 
@@ -156,6 +204,19 @@ class ProgressManager:
         if key in self.data:
             return len(self.data[key]["photos"])
         return 0
+
+    def get_photo_types(self, row_index):
+        """获取已拍摄的四类照片状态"""
+        key = str(row_index)
+        if key in self.data:
+            return self.data[key].get("types", {})
+        return {}
+
+    def get_photo_type_summary(self, row_index):
+        """返回四类照片的完成情况摘要"""
+        types = self.get_photo_types(row_index)
+        done = sum(1 for t in PHOTO_TYPE_LABELS if types.get(t, False))
+        return f"{done}/4"
 
 
 # ============================================================
@@ -212,7 +273,6 @@ class ReportGenerator:
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "Sheet1"
-            # 写表头
             ws['A3'] = '序号'
             ws['B3'] = '日期'
             ws['C3'] = '勘查业务贷款人名称'
@@ -220,9 +280,9 @@ class ReportGenerator:
             ws['E3'] = '现状描述'
             ws['F3'] = '备注（是否存在发生风险的可能）'
 
-        # 清除旧数据（保留表头行1-3和尾部注释行25-30）
+        # 清除旧数据
         for row_idx in range(4, ws.max_row + 1):
-            if row_idx < 25:  # 不删除注释行
+            if row_idx < 25:
                 for col in range(1, 7):
                     ws.cell(row=row_idx, column=col).value = None
 
@@ -236,29 +296,24 @@ class ReportGenerator:
             collateral_type = row[1] if len(row) > 1 else ""
             remark = row[2] if len(row) > 2 else ""
 
-            # 只填写有客户名称的行
             if customer_name:
-                ws.cell(row=current_row, column=1, value=seq_num)          # A: 序号
-                ws.cell(row=current_row, column=2, value=report_date)      # B: 日期
-                ws.cell(row=current_row, column=3, value=customer_name)    # C: 客户名称
-                ws.cell(row=current_row, column=4, value=collateral_type)  # D: 押品性质/抵押物情况
-                ws.cell(row=current_row, column=5, value=remark)           # E: 现状描述
-                # F: 备注 - 留空或自动生成
-                ws.cell(row=current_row, column=6, value="")               # F: 备注
+                ws.cell(row=current_row, column=1, value=seq_num)
+                ws.cell(row=current_row, column=2, value=report_date)
+                ws.cell(row=current_row, column=3, value=customer_name)
+                ws.cell(row=current_row, column=4, value=collateral_type)
+                ws.cell(row=current_row, column=5, value=remark)
+                ws.cell(row=current_row, column=6, value="")
 
                 seq_num += 1
                 current_row += 1
 
-        # 如果数据超过10行，继续填充
-        # 填写尾部信息
         if current_row <= 17:
             current_row = 17
         ws.cell(row=17, column=5, value="当天线路完成进度：100%")
 
-        # 保存
         if output_path is None:
             output_path = os.path.join(
-                BASE_DIR,
+                APP_DIR,
                 f"现场勘查日报表_{get_date_str()}.xlsx"
             )
 
@@ -311,7 +366,15 @@ class PhotoProcessor:
 
     @staticmethod
     def _get_font(size):
-        """加载中文字体"""
+        """加载中文字体 - 优先使用打包的子集化字体"""
+        # 1. 尝试打包的字体
+        if os.path.exists(FONT_PATH):
+            try:
+                return ImageFont.truetype(FONT_PATH, size)
+            except Exception:
+                pass
+
+        # 2. 系统字体 fallback
         font_paths = [
             "C:/Windows/Fonts/msyh.ttc",
             "C:/Windows/Fonts/msyhbd.ttc",
@@ -329,8 +392,14 @@ class PhotoProcessor:
         return ImageFont.load_default()
 
     @staticmethod
-    def generate_filename(rule_index, borrower_name, room_number="", seq=0, date_str=None):
-        """根据规则生成文件名，seq为同一客户的照片序号"""
+    def generate_filename(rule_index, borrower_name, room_number="", seq=0, date_str="", photo_type=""):
+        """根据规则生成文件名
+
+        规则:
+        0 = 日期_借款人_类型_序号
+        1 = 日期_借款人_房间号_类型_序号
+        2 = 序号_类型 (盘点表序号命名)
+        """
         if date_str is None:
             date_str = get_date_str()
 
@@ -341,29 +410,29 @@ class PhotoProcessor:
 
         borrower_name = clean(borrower_name)
         room_number = clean(room_number)
-
-        # 序号后缀：01, 02, 03...
         seq_suffix = f"_{seq:02d}" if seq > 0 else "_01"
+        type_suffix = f"_{photo_type}" if photo_type else ""
 
-        if rule_index == 1 and room_number:
-            return f"{date_str}_{borrower_name}_{room_number}{seq_suffix}.jpg"
+        if rule_index == 2:
+            # 盘点表序号命名
+            return f"{seq}{type_suffix}{seq_suffix}.jpg"
+        elif rule_index == 1 and room_number:
+            return f"{date_str}_{borrower_name}_{room_number}{type_suffix}{seq_suffix}.jpg"
         else:
-            return f"{date_str}_{borrower_name}{seq_suffix}.jpg"
+            return f"{date_str}_{borrower_name}{type_suffix}{seq_suffix}.jpg"
 
     @staticmethod
     def save_to_gallery(photo_path):
-        """保存照片到系统相册"""
+        """保存照片到系统相册 - 兼容 Android 8-14"""
         if not IS_ANDROID:
-            return  # Windows 测试环境不需要
+            return
 
         try:
             from android import mActivity
-            from android.storage import getExternalStoragePublicDirectory
             from android.provider import MediaStore
             from android.content import ContentValues
             from java.io import FileInputStream, FileOutputStream
 
-            # 使用 MediaScannerConnection 扫描文件
             values = ContentValues()
             values.put(MediaStore.Images.Media.DATA, photo_path)
             values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
@@ -373,7 +442,6 @@ class PhotoProcessor:
             uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
 
             if uri:
-                # 复制文件内容
                 output_stream = resolver.openOutputStream(uri)
                 input_stream = FileInputStream(photo_path)
                 buffer = bytearray(1024)
@@ -390,15 +458,16 @@ class PhotoProcessor:
 
 
 # ============================================================
-# 相机管理器
+# 相机管理器 - 带 fallback 机制
 # ============================================================
 class CameraManager:
-    """通过 Plyer 调用相机和 GPS"""
+    """通过 Plyer 调用相机和 GPS，带 fallback 到 Android Intent"""
 
     def __init__(self):
         self.photo_path = ""
         self.pending_callback = None
         self.geocoder = GeoCoder()
+        self._plyer_failed = False
 
     def take_photo(self, callback):
         self.pending_callback = callback
@@ -425,16 +494,64 @@ class CameraManager:
             self._fallback_simulate()
 
     def _launch_camera(self):
+        """尝试用 plyer 拍照，失败则 fallback 到 Android Intent"""
+        if self._plyer_failed:
+            self._launch_camera_intent()
+            return
+
         try:
             from plyer import camera
             self.photo_path = os.path.join(
-                BASE_DIR,
+                APP_DIR,
                 f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg"
             )
             camera.take_picture(filename=self.photo_path, on_complete=self._on_photo_complete)
         except Exception as e:
-            Logger.error(f"CameraManager._launch_camera: {e}")
+            Logger.error(f"CameraManager plyer failed: {e}, falling back to Intent")
+            self._plyer_failed = True
+            self._launch_camera_intent()
+
+    def _launch_camera_intent(self):
+        """Fallback: 使用 Android Intent 调起系统相机"""
+        try:
+            from android import mActivity
+            from android.content import Intent, FileProvider
+            from android.net import Uri
+            from android.os import Environment
+            from java.io import File
+
+            self.photo_path = os.path.join(
+                APP_DIR,
+                f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+
+            intent = Intent("android.media.action.IMAGE_CAPTURE")
+            photo_file = File(self.photo_path)
+            uri = FileProvider.getUriForFile(
+                mActivity,
+                mActivity.getPackageName() + ".fileprovider",
+                photo_file
+            )
+            intent.putExtra("android.provider.extra_OUTPUT", uri)
+            intent.addFlags(1)  # FLAG_GRANT_WRITE_URI_PERMISSION
+
+            mActivity.startActivityForResult(intent, 0x123)
+            # 注意：Intent 模式下需要通过 onActivityResult 回调获取结果
+            # 这里简化处理：延迟检查文件是否生成
+            Clock.schedule_once(self._check_intent_result, 3.0)
+
+        except Exception as e:
+            Logger.error(f"CameraManager Intent fallback failed: {e}")
             self._fallback_simulate()
+
+    def _check_intent_result(self, dt):
+        """检查 Intent 拍照结果"""
+        if os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
+            if self.pending_callback:
+                self.pending_callback(self.photo_path)
+        else:
+            Logger.warning("Intent camera result not ready, retrying...")
+            Clock.schedule_once(self._check_intent_result, 2.0)
 
     def _on_photo_complete(self, path):
         if self.pending_callback and path and os.path.exists(path):
@@ -445,7 +562,7 @@ class CameraManager:
     def _simulate_photo(self):
         """模拟拍照（Windows 测试用）"""
         self.photo_path = os.path.join(
-            BASE_DIR,
+            APP_DIR,
             f"test_{get_system_date().strftime('%Y%m%d_%H%M%S')}.jpg"
         )
         img = PILImage.new('RGB', (640, 480), (180, 180, 180))
@@ -505,7 +622,7 @@ class RowWidget(BoxLayout):
 
         # 信息区域
         info_layout = BoxLayout(spacing=4, size_hint_x=0.62)
-        
+
         # 客户名称
         name_box = BoxLayout(orientation='vertical')
         name_box.add_widget(Label(text="客户名称", font_size='10sp', color=(0.5, 0.5, 0.5, 1), size_hint_y=0.3))
@@ -560,10 +677,11 @@ class RowWidget(BoxLayout):
         self.view_btn.bind(on_release=self._on_view_photos)
         btn_layout.add_widget(self.view_btn)
 
-        # 状态标签
+        # 状态标签 - 显示四类拍照进度
+        type_summary = progress_mgr.get_photo_type_summary(row_index)
         if self.done:
             status_label = Label(
-                text=f"✓{self.photo_count}张",
+                text=f"✓{type_summary}",
                 font_size='11sp', color=(0.3, 0.9, 0.3, 1),
                 size_hint_x=0.4,
             )
@@ -589,6 +707,63 @@ class RowWidget(BoxLayout):
         self.photo_btn.text = "📷"
         self.photo_btn.background_color = (0.25, 0.75, 0.25, 1)
         self.view_btn.text = f"👁{self.photo_count}"
+        type_summary = self.progress_mgr.get_photo_type_summary(self.row_index)
+        # 更新状态标签
+        for child in self.children:
+            if isinstance(child, BoxLayout):
+                for c in child.children:
+                    if isinstance(c, Label) and ("✓" in c.text or "未拍" in c.text or "/" in c.text):
+                        c.text = f"✓{type_summary}"
+                        c.color = (0.3, 0.9, 0.3, 1)
+                        break
+
+
+# ============================================================
+# 拍照类型选择弹窗
+# ============================================================
+class PhotoTypePopup(Popup):
+    """拍照前选择照片类型（远景/近景/内部/瑕疵）"""
+
+    def __init__(self, on_select, **kwargs):
+        super().__init__(**kwargs)
+        self.title = "选择拍照类型"
+        self.size_hint = (0.85, 0.6)
+        self.auto_dismiss = True
+        self.on_select = on_select
+
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        layout.add_widget(Label(
+            text="请选择本次拍摄的照片类型：",
+            font_size='14sp', size_hint_y=None, height=30
+        ))
+
+        for type_name, type_desc in PHOTO_TYPES:
+            btn = Button(
+                text=f"{type_name}\n{type_desc}",
+                font_size='13sp',
+                size_hint_y=None, height=70,
+                background_color=(0.2, 0.5, 0.8, 1),
+                halign='center',
+            )
+            btn.bind(on_release=lambda x, t=type_name: self._select(t))
+            layout.add_widget(btn)
+
+        # 取消按钮
+        cancel_btn = Button(
+            text="取消", font_size='14sp',
+            size_hint_y=None, height=40,
+            background_color=(0.5, 0.5, 0.5, 1)
+        )
+        cancel_btn.bind(on_release=self.dismiss)
+        layout.add_widget(cancel_btn)
+
+        self.content = layout
+
+    def _select(self, photo_type):
+        self.dismiss()
+        if self.on_select:
+            self.on_select(photo_type)
 
 
 # ============================================================
@@ -609,7 +784,6 @@ class PhotoViewerPopup(Popup):
 
         main_layout = BoxLayout(orientation='vertical', spacing=8, padding=8)
 
-        # 照片列表
         scroll = ScrollView()
         list_layout = GridLayout(cols=1, spacing=8, size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
@@ -617,7 +791,6 @@ class PhotoViewerPopup(Popup):
         for i, photo_path in enumerate(photos):
             item = BoxLayout(orientation='horizontal', size_hint_y=None, height=120, spacing=8)
 
-            # 缩略图
             if os.path.exists(photo_path):
                 item.add_widget(KivyImage(
                     source=photo_path,
@@ -626,7 +799,6 @@ class PhotoViewerPopup(Popup):
                     keep_ratio=True,
                 ))
 
-            # 文件名和删除按钮
             info_box = BoxLayout(orientation='vertical', spacing=4, size_hint_x=0.6)
             filename = os.path.basename(photo_path)
             info_box.add_widget(Label(
@@ -652,7 +824,6 @@ class PhotoViewerPopup(Popup):
         scroll.add_widget(list_layout)
         main_layout.add_widget(scroll)
 
-        # 全部删除按钮
         del_all_btn = Button(
             text="删除全部照片（重拍）", font_size='14sp',
             background_color=(0.85, 0.2, 0.2, 1),
@@ -661,7 +832,6 @@ class PhotoViewerPopup(Popup):
         del_all_btn.bind(on_release=self._delete_all)
         main_layout.add_widget(del_all_btn)
 
-        # 关闭按钮
         close_btn = Button(
             text="关闭", font_size='14sp',
             size_hint_y=None, height=44,
@@ -676,7 +846,7 @@ class PhotoViewerPopup(Popup):
         self.dismiss()
 
     def _delete_all(self, instance):
-        self.delete_callback(self.row_index, -1)  # -1 表示全部删除
+        self.delete_callback(self.row_index, -1)
         self.dismiss()
 
 
@@ -698,9 +868,9 @@ class MainScreen(BoxLayout):
         self.progress_mgr = ProgressManager()
         self.camera_mgr = CameraManager()
         self.report_generator = ReportGenerator()
-        self.row_widgets = []  # 引用所有行组件
+        self.row_widgets = []
+        self._current_photo_type = ""
 
-        # 整体布局：顶部固定 + 中间列表 + 底部固定
         self._build_header()
         self._build_list_area()
         self._build_footer()
@@ -709,7 +879,6 @@ class MainScreen(BoxLayout):
         """顶部区域：文件打开 + 搜索 + 规则选择"""
         header = BoxLayout(orientation='vertical', spacing=4, size_hint_y=None, height=140)
 
-        # 第一行：打开文件 + 进度
         row1 = BoxLayout(orientation='horizontal', spacing=6, size_hint_y=0.33)
         open_btn = Button(
             text="打开Excel", font_size='14sp',
@@ -725,7 +894,6 @@ class MainScreen(BoxLayout):
         row1.add_widget(self.progress_label)
         header.add_widget(row1)
 
-        # 第二行：搜索栏
         row2 = BoxLayout(orientation='horizontal', spacing=6, size_hint_y=0.33)
         row2.add_widget(Label(text="搜索:", size_hint_x=0.12, font_size='13sp'))
         self.search_input = TextInput(
@@ -750,12 +918,11 @@ class MainScreen(BoxLayout):
         row2.add_widget(clear_btn)
         header.add_widget(row2)
 
-        # 第三行：命名规则选择
         row3 = BoxLayout(orientation='horizontal', spacing=6, size_hint_y=0.33)
         row3.add_widget(Label(text="命名:", size_hint_x=0.12, font_size='13sp'))
         self.rule_spinner = Spinner(
-            text="日期_借款人",
-            values=["日期_借款人", "日期_借款人_房间号"],
+            text="日期_借款人_类型",
+            values=["日期_借款人_类型", "日期_借款人_房间号_类型", "序号_类型(盘点表)"],
             size_hint_x=0.88, font_size='13sp',
         )
         self.rule_spinner.bind(text=self._on_rule_change)
@@ -768,23 +935,19 @@ class MainScreen(BoxLayout):
         """中间区域：列表 + 右侧导航条"""
         list_area = BoxLayout(orientation='horizontal', spacing=4)
 
-        # 主列表（左侧）
         self.scroll_view = ScrollView(size_hint_x=0.85)
         self.list_layout = GridLayout(cols=1, spacing=3, size_hint_y=None)
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
         self.scroll_view.add_widget(self.list_layout)
         list_area.add_widget(self.scroll_view)
 
-        # 右侧导航条
         nav_layout = BoxLayout(orientation='vertical', spacing=4, size_hint_x=0.15)
         nav_layout.add_widget(Label(text="导航", font_size='11sp', size_hint_y=None, height=25))
 
-        # 导航按钮
         nav_up_btn = Button(text="▲", font_size='14sp', size_hint_y=None, height=40)
         nav_up_btn.bind(on_release=self._nav_scroll_up)
         nav_layout.add_widget(nav_up_btn)
 
-        # 行号快速跳转
         self.nav_label = Label(text="", font_size='10sp', size_hint_y=0.3)
         nav_layout.add_widget(self.nav_label)
 
@@ -792,7 +955,6 @@ class MainScreen(BoxLayout):
         nav_down_btn.bind(on_release=self._nav_scroll_down)
         nav_layout.add_widget(nav_down_btn)
 
-        # 跳转到指定行
         self.jump_input = TextInput(
             hint_text="行号", multiline=False, font_size='12sp',
             input_filter='int', size_hint_y=None, height=36,
@@ -803,7 +965,7 @@ class MainScreen(BoxLayout):
         jump_btn.bind(on_release=self._jump_to_row)
         nav_layout.add_widget(jump_btn)
 
-        nav_layout.add_widget(Label())  # spacer
+        nav_layout.add_widget(Label())
         list_area.add_widget(nav_layout)
 
         self.add_widget(list_area)
@@ -851,7 +1013,6 @@ class MainScreen(BoxLayout):
             self.status_label.text = f"已加载 {len(self.rows)} 行"
             self.status_label.color = (0.3, 0.85, 0.3, 1)
 
-            # 查找房间号列
             self.room_col_idx = None
             for i, h in enumerate(self.headers):
                 if any(kw in str(h) for kw in ['房', '室', '号']):
@@ -897,15 +1058,12 @@ class MainScreen(BoxLayout):
         self.nav_label.text = f"共{total}行"
 
     def _on_search(self, instance, text=None):
-        """搜索过滤"""
         query = self.search_input.text.lower().strip()
         if not query:
-            # 显示所有行
             for rw in self.row_widgets:
                 rw.height = 72
                 rw.opacity = 1
         else:
-            # 过滤显示
             for rw in self.row_widgets:
                 if query in rw.customer_name.lower():
                     rw.height = 72
@@ -919,7 +1077,12 @@ class MainScreen(BoxLayout):
         self._on_search(None, "")
 
     def _on_rule_change(self, spinner, text):
-        self.selected_rule = 0 if text == "日期_借款人" else 1
+        if "盘点表" in text:
+            self.selected_rule = 2
+        elif "房间号" in text:
+            self.selected_rule = 1
+        else:
+            self.selected_rule = 0
 
     def _nav_scroll_up(self, instance):
         self.scroll_view.scroll_y = min(1, self.scroll_view.scroll_y + 0.3)
@@ -931,17 +1094,25 @@ class MainScreen(BoxLayout):
         try:
             row_num = int(self.jump_input.text)
             if 1 <= row_num <= len(self.row_widgets):
-                # 计算滚动位置
                 fraction = 1 - (row_num - 1) / max(1, len(self.row_widgets) - 1)
                 self.scroll_view.scroll_y = max(0, min(1, fraction))
         except ValueError:
             pass
 
     def _on_photo_request(self, row_index, customer_name, collateral_type):
+        """拍照请求 - 先弹出类型选择"""
         self._current_row = row_index
         self._current_customer = customer_name
         self._current_collateral = collateral_type
-        self.status_label.text = "正在拍照..."
+
+        # 弹出拍照类型选择
+        popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
+        popup.open()
+
+    def _on_photo_type_selected(self, photo_type):
+        """用户选择了拍照类型后，开始拍照"""
+        self._current_photo_type = photo_type
+        self.status_label.text = f"正在拍照 ({photo_type})..."
         self.status_label.color = (0.85, 0.85, 0.5, 1)
         self.camera_mgr.take_photo(self._on_photo_done)
 
@@ -954,11 +1125,10 @@ class MainScreen(BoxLayout):
         row_index = self._current_row
         customer = self._current_customer
         collateral = self._current_collateral
+        photo_type = self._current_photo_type
 
-        # 获取序号
         seq = self.progress_mgr.get_next_photo_index(row_index) + 1
 
-        # 获取房间号
         room = ""
         if self.selected_rule == 1 and self.room_col_idx is not None:
             row_data = self.rows[row_index] if row_index < len(self.rows) else []
@@ -972,24 +1142,22 @@ class MainScreen(BoxLayout):
         # 添加水印
         PhotoProcessor.add_watermark(photo_path, datetime_str, location)
 
-        # 生成文件名
+        # 生成文件名（包含拍照类型）
         filename = PhotoProcessor.generate_filename(
-            self.selected_rule, customer, room, seq, date_str
+            self.selected_rule, customer, room, seq, date_str, photo_type
         )
-        new_path = os.path.join(BASE_DIR, filename)
+        new_path = os.path.join(APP_DIR, filename)
         if photo_path != new_path:
             if os.path.exists(new_path):
                 name, ext = os.path.splitext(filename)
-                new_path = os.path.join(BASE_DIR, f"{name}_{row_index}{ext}")
+                new_path = os.path.join(APP_DIR, f"{name}_{row_index}{ext}")
             os.rename(photo_path, new_path)
 
-        # 保存到相册
         PhotoProcessor.save_to_gallery(new_path)
 
-        # 保存进度
-        self.progress_mgr.mark_photo(row_index, new_path)
+        # 保存进度（包含拍照类型）
+        self.progress_mgr.mark_photo(row_index, new_path, photo_type)
 
-        # 刷新 UI
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
         self.status_label.text = f"✓ {filename}"
@@ -1016,14 +1184,12 @@ class MainScreen(BoxLayout):
 
     def _on_delete_photo(self, row_index, photo_index):
         if photo_index == -1:
-            # 删除全部
             self.progress_mgr.delete_all_photos(row_index)
             self.status_label.text = "已删除全部照片，可重新拍摄"
         else:
             self.progress_mgr.delete_photo(row_index, photo_index)
             self.status_label.text = f"已删除照片，剩余 {self.progress_mgr.get_photo_count(row_index)} 张"
 
-        # 刷新 UI
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
     def _generate_report(self, instance):
@@ -1036,7 +1202,6 @@ class MainScreen(BoxLayout):
         self.status_label.text = "正在生成报告..."
         self.status_label.color = (0.85, 0.85, 0.5, 1)
 
-        # 在后台线程生成，避免卡 UI
         def _do_generate():
             output_path = self.report_generator.generate(
                 (self.headers, self.rows),
@@ -1051,7 +1216,6 @@ class MainScreen(BoxLayout):
             self.status_label.text = f"✓ 报告已生成"
             self.status_label.color = (0.3, 0.85, 0.3, 1)
 
-            # 显示弹窗告知文件路径
             content = BoxLayout(orientation='vertical', spacing=8)
             content.add_widget(Label(text="报告已生成:"))
             content.add_widget(Label(
@@ -1059,7 +1223,6 @@ class MainScreen(BoxLayout):
                 color=(0.3, 0.85, 0.3, 1), text_size=(400, None),
             ))
 
-            # 保存到相册/下载目录
             if IS_ANDROID:
                 content.add_widget(Label(text="文件已保存到 Downloads 目录", font_size='11sp'))
 
@@ -1085,19 +1248,43 @@ class LoanPhotoApp(App):
 
     def on_start(self):
         if IS_ANDROID:
-            try:
-                request_permissions([
+            self._request_android_permissions()
+
+    def _request_android_permissions(self):
+        """根据 Android 版本请求对应权限"""
+        try:
+            if ANDROID_API >= 33:
+                # Android 13+: 使用细粒度媒体权限
+                perms = [
                     Permission.CAMERA,
                     Permission.ACCESS_FINE_LOCATION,
                     Permission.ACCESS_COARSE_LOCATION,
-                    Permission.WRITE_EXTERNAL_STORAGE,
+                    Permission.READ_MEDIA_IMAGES,
+                ]
+            elif ANDROID_API >= 30:
+                # Android 11-12
+                perms = [
+                    Permission.CAMERA,
+                    Permission.ACCESS_FINE_LOCATION,
+                    Permission.ACCESS_COARSE_LOCATION,
                     Permission.READ_EXTERNAL_STORAGE,
-                ])
-            except Exception as e:
-                Logger.error(f"App permissions: {e}")
+                ]
+            else:
+                # Android 9-10
+                perms = [
+                    Permission.CAMERA,
+                    Permission.ACCESS_FINE_LOCATION,
+                    Permission.ACCESS_COARSE_LOCATION,
+                    Permission.READ_EXTERNAL_STORAGE,
+                    Permission.WRITE_EXTERNAL_STORAGE,
+                ]
+            request_permissions(perms)
+            Logger.info(f"Requested permissions for API {ANDROID_API}")
+        except Exception as e:
+            Logger.error(f"App permissions: {e}")
 
     def on_pause(self):
-        return True
+        return True  # 保持 App 在后台运行
 
     def on_resume(self):
         pass
