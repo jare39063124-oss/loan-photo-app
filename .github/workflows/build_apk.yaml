@@ -35,59 +35,14 @@ jobs:
         pip install --upgrade pip setuptools wheel
         pip install buildozer cython
 
-    - name: Build APK with manifest patching (robust approach)
+    - name: Build APK
       run: |
+        set -x
         export PATH="$HOME/.buildozer/android/platform/apache-ant-1.9.4/bin:$PATH"
-
-        # Phase 1: Run buildozer to generate the Android project (it will fail at compile stage, but dist will be created)
-        echo "=== Phase 1: Generating Android project with buildozer ==="
-        buildozer android debug 2>&1 | tee /tmp/build1.log || true
-
-        # Find ALL AndroidManifest.xml files in the build directory and patch them
-        echo "=== Phase 2: Finding and patching ALL manifest files ==="
-        find .buildozer -name "AndroidManifest*.xml" 2>/dev/null | while read -r f; do
-          echo "Patching manifest: $f"
-          python3 patch_manifest.py "$f"
-        done
-
-        # Also ensure res/xml/file_paths.xml is copied to the correct location in the gradle project
-        echo "=== Phase 3: Ensuring file_paths.xml resource is in place ==="
-        GRADLE_RES_DIR=$(find .buildozer -path "*/src/main/res" -type d | head -1)
-        if [ -n "$GRADLE_RES_DIR" ]; then
-          echo "Found gradle res dir: $GRADLE_RES_DIR"
-          mkdir -p "$GRADLE_RES_DIR/xml"
-          if [ -f "res/xml/file_paths.xml" ]; then
-            cp -v res/xml/file_paths.xml "$GRADLE_RES_DIR/xml/"
-          fi
-          ls -la "$GRADLE_RES_DIR/xml/"
-        else
-          echo "WARNING: Could not find gradle res directory!"
-          # Try other possible locations
-          find .buildozer -name "res" -type d 2>/dev/null | head -5
-        fi
-
-        # Check if our provider was actually added
-        echo "=== Phase 4: Verifying manifest contains FileProvider ==="
-        MAIN_MANIFEST=$(find .buildozer -name "AndroidManifest.xml" -path "*/src/main/*" | head -1)
-        if [ -n "$MAIN_MANIFEST" ]; then
-          echo "Main manifest: $MAIN_MANIFEST"
-          if grep -q "FileProvider" "$MAIN_MANIFEST"; then
-            echo "✓ FileProvider found in manifest"
-            grep -A5 "FileProvider" "$MAIN_MANIFEST"
-          else
-            echo "✗ FileProvider NOT found in manifest!"
-            cat "$MAIN_MANIFEST"
-          fi
-          if grep -q "IMAGE_CAPTURE" "$MAIN_MANIFEST"; then
-            echo "✓ IMAGE_CAPTURE queries found in manifest"
-          else
-            echo "✗ IMAGE_CAPTURE queries NOT found in manifest!"
-          fi
-        fi
-
-        # Phase 5: Run buildozer again - it should use the cached dist and not regenerate manifest
-        echo "=== Phase 5: Final APK build ==="
-        buildozer android debug 2>&1 | tee /tmp/build2.log
+        buildozer android clean 2>&1 | tail -3 || true
+        buildozer android debug 2>&1 | tee /tmp/build.log
+        echo "=== Build exit: $? ==="
+        ls -la bin/ 2>/dev/null || echo "No bin/ directory"
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
