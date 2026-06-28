@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.12.0
+资产盘点专项拍照工具 App - v3.12.1
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1065,7 +1065,6 @@ class CameraManager:
                 Uri = autoclass('android.net.Uri')
                 Environment = autoclass('android.os.Environment')
                 Parcelable = autoclass('android.os.Parcelable')
-                ActivityNotFoundException = autoclass('android.content.ActivityNotFoundException')
             except Exception as e:
                 self._dbg(f"jnius类加载失败: {str(e)[:80]}", show_toast=True)
                 if self.pending_callback:
@@ -1235,11 +1234,13 @@ class CameraManager:
                         activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
                         launched = True
                         self._dbg("✓ 相机选择器已弹出！")
-                    except ActivityNotFoundException:
-                        launch_error = "系统未安装相机应用"
-                        self._dbg(launch_error)
                     except Exception as e:
-                        launch_error = f"选择器异常: {type(e).__name__}: {str(e)[:80]}"
+                        ename = type(e).__name__
+                        emsg = str(e)[:80]
+                        if 'ActivityNotFound' in ename or 'Notfound' in ename:
+                            launch_error = "系统未安装相机应用"
+                        else:
+                            launch_error = f"选择器异常: {ename}: {emsg}"
                         self._dbg(launch_error)
 
                 if not launched:
@@ -1248,10 +1249,12 @@ class CameraManager:
                         activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
                         launched = True
                         self._dbg("✓ 相机已启动！")
-                    except ActivityNotFoundException:
-                        launch_error = "未找到相机应用"
                     except Exception as e:
-                        launch_error = f"启动异常: {type(e).__name__}: {str(e)[:80]}"
+                        ename = type(e).__name__
+                        if 'ActivityNotFound' in ename or 'Notfound' in ename:
+                            launch_error = "未找到相机应用"
+                        else:
+                            launch_error = f"启动异常: {ename}: {str(e)[:80]}"
                         self._dbg(launch_error)
 
                 if launched:
