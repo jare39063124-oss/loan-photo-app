@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.11.0
+资产盘点专项拍照工具 App - v3.12.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1049,14 +1049,11 @@ class CameraManager:
 
     def _launch_camera_intent(self):
         """通过 Android Intent 调用系统相机。
-        v3.11.0 重大重构：
-        - 核心原则：永远不因为URI策略失败而放弃启动相机！
-        - 策略A：file:// URI + 禁用StrictMode（最兼容）
-        - 策略B：FileProvider content:// URI（官方推荐）
-        - 策略C：MediaStore content:// URI（Android 10+）
-        - 策略D：无EXTRA_OUTPUT直接启动相机（100%兼容兜底，从返回Intent取照片）
-        - on_camera_result增强：支持intent参数，多级获取照片（URI→缩略图）
-        - 缩略图保存修复：使用PNG格式避免CompressFormat反射问题
+        v3.12.0 彻底重写（基于Kivy官方2013示例 + 现代Android兼容）：
+        - 核心修复：所有Uri传给putExtra前必须cast为Parcelable（pyjnius重载解析问题）
+        - 核心原则：相机必须100%启动！URI策略失败永远不阻断相机启动
+        - 启动策略：Android 11+优先Intent.createChooser（豁免包可见性限制）
+        - 结果获取：多级回退 (MediaStore URI→Intent URI→ClipData→缩略图data extra)
         """
         def _do_launch():
             self._launch_attempts += 1
@@ -1067,6 +1064,7 @@ class CameraManager:
                 File = autoclass('java.io.File')
                 Uri = autoclass('android.net.Uri')
                 Environment = autoclass('android.os.Environment')
+                Parcelable = autoclass('android.os.Parcelable')
                 ActivityNotFoundException = autoclass('android.content.ActivityNotFoundException')
             except Exception as e:
                 self._dbg(f"jnius类加载失败: {str(e)[:80]}", show_toast=True)
@@ -1094,115 +1092,124 @@ class CameraManager:
                 package_name = activity.getPackageName()
                 self._dbg(f"Activity OK, pkg={package_name}, API={ANDROID_API}")
 
-                self._dbg("正在构建照片文件...")
+                self._dbg("正在准备照片存储路径...")
                 photo_fname = f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                pics_dir = activity.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-                if pics_dir is not None:
-                    save_dir = str(pics_dir.getAbsolutePath())
-                else:
-                    cache_dir = activity.getExternalCacheDir()
-                    save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
-                os.makedirs(save_dir, exist_ok=True)
-                self.photo_path = os.path.join(save_dir, photo_fname)
-                self._dbg(f"保存目录: ...{save_dir[-30:]}")
+                try:
+                    pics_dir = activity.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                    if pics_dir is not None:
+                        save_dir = str(pics_dir.getAbsolutePath())
+                    else:
+                        cache_dir = activity.getExternalCacheDir()
+                        save_dir = str(cache_dir.getAbsolutePath()) if cache_dir else APP_DIR
+                    os.makedirs(save_dir, exist_ok=True)
+                    self.photo_path = os.path.join(save_dir, photo_fname)
+                    self._dbg(f"保存目录: ...{save_dir[-30:]}")
+                except Exception as e:
+                    self._dbg(f"目录准备失败: {str(e)[:60]}，使用APP_DIR")
+                    os.makedirs(APP_DIR, exist_ok=True)
+                    self.photo_path = os.path.join(APP_DIR, photo_fname)
 
                 intent = Intent(ACTION_IMAGE_CAPTURE)
-                intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
 
                 uri = None
-                uri_type = "none"
+                uri_set_ok = False
                 self._media_uri = None
-                photo_file = None
+                self._dbg("尝试设置输出URI（用于高清照片）...")
 
+                # 策略1：file:// URI + 禁用StrictMode
                 try:
                     photo_file = File(self.photo_path)
                     if photo_file.exists():
                         photo_file.delete()
                     photo_file.createNewFile()
-                except Exception as e:
-                    self._dbg(f"创建照片文件失败: {str(e)[:100]}")
-
-                # 策略A：file:// URI（禁用StrictMode，所有Android版本）
-                if photo_file is not None:
-                    self._dbg("策略A：file:// URI（直接文件路径）")
+                    self._dbg("策略1: file:// URI")
                     try:
-                        try:
-                            StrictMode = autoclass('android.os.StrictMode')
-                            VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
-                            b = VmPolicyBuilder()
-                            b.penaltyLog()
-                            policy = b.build()
-                            StrictMode.setVmPolicy(policy)
-                            self._dbg("  StrictMode已禁用（允许file:// URI）")
-                        except Exception as se:
-                            self._dbg(f"  StrictMode禁用跳过: {str(se)[:60]}")
-                        try:
-                            uri = Uri.fromFile(photo_file)
-                            uri_type = "file://"
-                            self._dbg(f"  file:// URI创建成功")
-                        except Exception as e:
-                            self._dbg(f"  file:// URI失败: {str(e)[:100]}")
-                    except:
+                        StrictMode = autoclass('android.os.StrictMode')
+                        VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
+                        b = VmPolicyBuilder()
+                        b.penaltyLog()
+                        StrictMode.setVmPolicy(b.build())
+                        self._dbg("  StrictMode已禁用")
+                    except Exception:
                         pass
+                    raw_uri = Uri.fromFile(photo_file)
+                    parcel_uri = cast('android.os.Parcelable', raw_uri)
+                    intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                    intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                    intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                    uri = raw_uri
+                    uri_set_ok = True
+                    self._dbg("  file:// URI设置成功（已cast为Parcelable）")
+                except Exception as e:
+                    self._dbg(f"  file:// URI失败: {type(e).__name__}: {str(e)[:80]}")
+                    # 清理失败的intent extra，重新创建intent
+                    intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                # 策略B：FileProvider content:// URI
-                if uri is None and photo_file is not None:
-                    self._dbg("策略B：FileProvider content:// URI")
+                # 策略2：FileProvider content:// URI（如果file://失败）
+                if not uri_set_ok:
+                    self._dbg("策略2: FileProvider URI")
                     for fp_cls_name in ['androidx.core.content.FileProvider',
                                          'android.support.v4.content.FileProvider']:
                         try:
                             FileProvider = autoclass(fp_cls_name)
                             authority = package_name + ".fileprovider"
-                            test_uri = FileProvider.getUriForFile(activity, authority, photo_file)
-                            if test_uri is not None:
-                                uri = test_uri
-                                uri_type = f"FileProvider({fp_cls_name.split('.')[-1]})"
-                                self._dbg(f"  FileProvider URI成功: {uri_type}")
+                            photo_file2 = File(self.photo_path)
+                            raw_uri = FileProvider.getUriForFile(activity, authority, photo_file2)
+                            if raw_uri is not None:
+                                parcel_uri = cast('android.os.Parcelable', raw_uri)
+                                intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                                intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                                intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                                uri = raw_uri
+                                uri_set_ok = True
+                                self._dbg(f"  FileProvider URI成功: {fp_cls_name.split('.')[-1]}")
                                 break
                         except Exception as e:
-                            emsg = str(e)[:120]
-                            self._dbg(f"  {fp_cls_name.split('.')[-1]}失败: {emsg}")
+                            self._dbg(f"  {fp_cls_name.split('.')[-1]}失败: {str(e)[:80]}")
+                    if not uri_set_ok:
+                        intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                # 策略C：MediaStore content:// URI（Android 10+）
-                if uri is None and ANDROID_API >= 29:
-                    self._dbg("策略C：MediaStore content:// URI（Android 10+）")
+                # 策略3：MediaStore content:// URI
+                if not uri_set_ok and ANDROID_API >= 29:
+                    self._dbg("策略3: MediaStore URI")
                     try:
                         ContentValues = autoclass('android.content.ContentValues')
                         resolver = activity.getContentResolver()
                         cv = ContentValues()
                         cv.put("_display_name", photo_fname)
                         cv.put("mime_type", "image/jpeg")
-                        if ANDROID_API >= 29:
-                            cv.put("relative_path", "Pictures/LoanPhoto")
+                        cv.put("relative_path", "Pictures/LoanPhoto")
                         media_ext_uri = Uri.parse("content://media/external/images/media")
-                        media_uri = resolver.insert(media_ext_uri, cv)
-                        if media_uri is not None:
-                            uri = media_uri
+                        raw_uri = resolver.insert(media_ext_uri, cv)
+                        if raw_uri is not None:
+                            parcel_uri = cast('android.os.Parcelable', raw_uri)
+                            intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                            intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                            intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                            uri = raw_uri
+                            self._media_uri = raw_uri
+                            uri_set_ok = True
                             self.photo_path = None
-                            self._media_uri = uri
-                            uri_type = "MediaStore"
                             self._dbg("  MediaStore URI成功")
-                        else:
-                            self._dbg("  MediaStore返回null")
                     except Exception as e:
-                        emsg = str(e)[:200]
-                        self._dbg(f"  MediaStore失败: {emsg}")
+                        self._dbg(f"  MediaStore失败: {str(e)[:100]}")
+                    if not uri_set_ok:
+                        intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                if uri is not None:
-                    intent.putExtra(EXTRA_OUTPUT, uri)
-                    self._dbg(f"输出URI已设置(type={uri_type})，准备启动相机...")
-                else:
-                    self._dbg("策略D：无EXTRA_OUTPUT直接启动（从返回Intent获取照片）")
+                # 策略4：无EXTRA_OUTPUT（100%兜底，从返回Intent取照片/缩略图）
+                if not uri_set_ok:
+                    self._dbg("策略4: 无EXTRA_OUTPUT（从返回Intent获取照片）")
                     self.photo_path = None
                     self._media_uri = None
+                    intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                try:
-                    pm = activity.getPackageManager()
-                    resolves = pm.queryIntentActivities(intent, 0)
-                    if resolves is not None and resolves.size() > 0:
-                        self._dbg(f"找到{resolves.size()}个相机应用")
-                        if uri is not None:
+                # 尝试授予URI权限（如果有uri）
+                if uri is not None and uri_set_ok:
+                    try:
+                        pm = activity.getPackageManager()
+                        resolves = pm.queryIntentActivities(intent, 0)
+                        if resolves is not None and resolves.size() > 0:
+                            self._dbg(f"找到{resolves.size()}个相机应用，授予URI权限")
                             for i in range(resolves.size()):
                                 try:
                                     ri = resolves.get(i)
@@ -1211,79 +1218,51 @@ class CameraManager:
                                         FLAG_GRANT_WRITE_URI_PERMISSION | FLAG_GRANT_READ_URI_PERMISSION)
                                 except:
                                     pass
-                    else:
-                        self._dbg("未检测到相机应用列表（Android11+可见性限制），继续启动...")
-                except Exception as e:
-                    self._dbg(f"应用列表检查异常: {str(e)[:40]}")
+                    except Exception:
+                        pass
 
+                # ========== 启动相机（无论URI是否设置成功都必须执行！）==========
                 launched = False
                 launch_error = ""
 
-                # Android 11+ (API 30+) has package visibility restrictions.
-                # Intent.createChooser() is EXEMPT from these restrictions, so use it first.
-                use_chooser_first = (ANDROID_API >= 30)
+                # Android 11+ (API 30+): Intent.createChooser() 豁免包可见性限制
+                use_chooser = (ANDROID_API >= 30)
 
-                if use_chooser_first:
-                    self._dbg("使用选择器启动（Android 11+兼容模式）...")
+                if use_chooser:
+                    self._dbg("使用选择器启动相机...")
                     try:
                         chooser_intent = Intent.createChooser(intent, "选择相机应用")
-                        if uri is not None:
-                            chooser_intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                            chooser_intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
                         activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
                         launched = True
-                        self._camera_launched = True
                         self._dbg("✓ 相机选择器已弹出！")
-                    except ActivityNotFoundException as e:
+                    except ActivityNotFoundException:
                         launch_error = "系统未安装相机应用"
                         self._dbg(launch_error)
                     except Exception as e:
-                        launch_error = f"选择器启动异常: {type(e).__name__}: {str(e)[:100]}"
+                        launch_error = f"选择器异常: {type(e).__name__}: {str(e)[:80]}"
                         self._dbg(launch_error)
-                else:
-                    self._dbg("正在启动相机（请稍候）...")
+
+                if not launched:
+                    self._dbg("直接启动相机...")
                     try:
                         activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
                         launched = True
-                        self._camera_launched = True
-                        self._dbg("✓ 相机启动指令已发送！")
-                    except ActivityNotFoundException as e:
-                        launch_error = "系统未找到相机应用(ActivityNotFound)"
-                        self._dbg(launch_error)
+                        self._dbg("✓ 相机已启动！")
+                    except ActivityNotFoundException:
+                        launch_error = "未找到相机应用"
                     except Exception as e:
-                        launch_error = f"直接启动异常: {type(e).__name__}: {str(e)[:100]}"
+                        launch_error = f"启动异常: {type(e).__name__}: {str(e)[:80]}"
                         self._dbg(launch_error)
 
-                if not launched:
-                    if use_chooser_first:
-                        self._dbg("选择器启动失败，尝试直接启动...")
-                    else:
-                        self._dbg("直接启动失败，尝试通过选择器启动...")
-                    try:
-                        chooser_intent = Intent.createChooser(intent, "选择相机应用")
-                        if uri is not None:
-                            chooser_intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                            chooser_intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
-                        activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
-                        launched = True
-                        self._camera_launched = True
-                        self._dbg("✓ 相机选择器已弹出！")
-                    except ActivityNotFoundException as e:
-                        launch_error = "系统未安装相机应用"
-                        self._dbg(launch_error, show_toast=True)
-                    except Exception as e:
-                        launch_error = f"选择器也失败: {type(e).__name__}: {str(e)[:100]}"
-                        self._dbg(launch_error, show_toast=True)
-
-                if not launched:
-                    self._dbg(f"相机启动失败！请截图联系作者", show_toast=True)
-                    self._dbg(f"错误详情: {launch_error}")
+                if launched:
+                    self._camera_launched = True
+                else:
+                    self._dbg(f"相机启动失败: {launch_error}", show_toast=True)
                     self._camera_launched = False
                     if self.pending_callback:
                         cb = self.pending_callback
                         self.pending_callback = None
                         Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
-                    return
 
             except Exception as e:
                 err_msg = f"相机启动异常: {type(e).__name__}: {str(e)[:100]}"
