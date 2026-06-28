@@ -6,7 +6,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf,xml
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
-version = 3.12.1
+version = 3.13.0
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
 

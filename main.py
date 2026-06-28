@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.12.1
+资产盘点专项拍照工具 App - v3.13.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1259,6 +1259,7 @@ class CameraManager:
 
                 if launched:
                     self._camera_launched = True
+                    self._toast("拍完照请点击✓保存按钮！")
                 else:
                     self._dbg(f"相机启动失败: {launch_error}", show_toast=True)
                     self._camera_launched = False
@@ -1288,167 +1289,230 @@ class CameraManager:
             _do_launch()
 
     def on_camera_result(self, result_code, intent=None):
-        """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。"""
+        """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。
+        v3.13.0: 不管result_code，先检查照片文件是否已写入EXTRA_OUTPUT路径。
+        某些相机应用(如小米)即使返回RESULT_CANCELED照片也可能已写入文件。
+        """
         self._dbg(f"收到相机结果: result_code={result_code}, launched={self._camera_launched}")
         if not self._camera_launched:
             return
         self._camera_launched = False
-        if result_code == -1:  # RESULT_OK
-            if self._media_uri is not None:
-                self._dbg("处理MediaStore返回的照片...")
-                try:
-                    from jnius import autoclass
-                    PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                    activity = PythonActivity.mActivity
-                    resolver = activity.getContentResolver()
-                    istream = resolver.openInputStream(self._media_uri)
-                    os.makedirs(APP_DIR, exist_ok=True)
-                    dest_path = os.path.join(
-                        APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                    )
-                    ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
-                    baos = ByteArrayOutputStream()
-                    buf = bytearray(8192)
-                    while True:
-                        n = istream.read(buf)
-                        if n <= 0:
-                            break
-                        baos.write(buf, 0, n)
-                    istream.close()
-                    with open(dest_path, 'wb') as f:
-                        f.write(bytes(baos.toByteArray()))
-                    baos.close()
-                    self.photo_path = dest_path
-                    self._dbg(f"MediaStore照片已保存: {os.path.getsize(dest_path)} bytes")
-                except Exception as e:
-                    self._dbg(f"MediaStore复制失败: {str(e)[:100]}")
-                    self._media_uri = None
 
-            if self.photo_path and os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
-                self._dbg(f"拍照成功！", show_toast=True)
+        # ========== 第1优先级：检查EXTRA_OUTPUT路径文件是否已写入 ==========
+        if self.photo_path and os.path.exists(self.photo_path):
+            fsize = os.path.getsize(self.photo_path)
+            if fsize > 0:
+                self._dbg(f"✓ 照片文件已存在({fsize} bytes)，拍照成功！", show_toast=True)
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
                     Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                 return
+            else:
+                self._dbg(f"照片文件存在但大小为0，可能是占位文件")
+        else:
+            if self.photo_path:
+                self._dbg(f"照片文件不存在: {self.photo_path}")
 
-            if intent is not None:
-                self._dbg("尝试从返回Intent获取照片...")
-                try:
-                    from jnius import autoclass, cast
-                    data_uri = intent.getData()
-                    if data_uri is not None:
-                        self._dbg(f"Intent返回URI: {str(data_uri.toString())[:80]}")
+        # ========== 第2优先级：检查MediaStore URI ==========
+        if self._media_uri is not None:
+            self._dbg("处理MediaStore返回的照片...")
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                activity = PythonActivity.mActivity
+                resolver = activity.getContentResolver()
+                istream = resolver.openInputStream(self._media_uri)
+                os.makedirs(APP_DIR, exist_ok=True)
+                dest_path = os.path.join(
+                    APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                )
+                ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+                baos = ByteArrayOutputStream()
+                buf = bytearray(8192)
+                while True:
+                    n = istream.read(buf)
+                    if n <= 0:
+                        break
+                    baos.write(buf, 0, n)
+                istream.close()
+                with open(dest_path, 'wb') as f:
+                    f.write(bytes(baos.toByteArray()))
+                baos.close()
+                self.photo_path = dest_path
+                fsize = os.path.getsize(dest_path)
+                self._dbg(f"MediaStore照片已保存: {fsize} bytes")
+                if fsize > 0:
+                    if self.pending_callback:
+                        cb = self.pending_callback
+                        self.pending_callback = None
+                        Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
+                    return
+            except Exception as e:
+                self._dbg(f"MediaStore复制失败: {str(e)[:100]}")
+                self._media_uri = None
+
+        # ========== 第3优先级：从返回Intent获取照片（不管result_code）==========
+        if intent is not None:
+            self._dbg(f"尝试从返回Intent获取照片(result_code={result_code})...")
+            try:
+                from jnius import autoclass, cast
+                data_uri = intent.getData()
+                if data_uri is not None:
+                    self._dbg(f"Intent返回URI: {str(data_uri.toString())[:80]}")
+                    try:
+                        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                        activity = PythonActivity.mActivity
+                        resolver = activity.getContentResolver()
+                        istream = resolver.openInputStream(data_uri)
+                        os.makedirs(APP_DIR, exist_ok=True)
+                        dest_path = os.path.join(
+                            APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                        )
+                        ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+                        baos = ByteArrayOutputStream()
+                        buf = bytearray(8192)
+                        while True:
+                            n = istream.read(buf)
+                            if n <= 0:
+                                break
+                            baos.write(buf, 0, n)
+                        istream.close()
+                        with open(dest_path, 'wb') as f:
+                            f.write(bytes(baos.toByteArray()))
+                        baos.close()
+                        self.photo_path = dest_path
+                        fsize = os.path.getsize(dest_path)
+                        self._dbg(f"从Intent URI保存成功: {fsize} bytes")
+                        if fsize > 0:
+                            if self.pending_callback:
+                                cb = self.pending_callback
+                                self.pending_callback = None
+                                Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
+                            return
+                    except Exception as e:
+                        self._dbg(f"从URI读取失败: {str(e)[:80]}")
+                else:
+                    extras = intent.getExtras()
+                    if extras is not None and extras.containsKey("data"):
+                        self._dbg("Intent返回缩略图(data extra) - 分辨率较低")
                         try:
-                            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                            activity = PythonActivity.mActivity
-                            resolver = activity.getContentResolver()
-                            istream = resolver.openInputStream(data_uri)
-                            os.makedirs(APP_DIR, exist_ok=True)
-                            dest_path = os.path.join(
-                                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                            )
-                            ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
-                            baos = ByteArrayOutputStream()
-                            buf = bytearray(8192)
-                            while True:
-                                n = istream.read(buf)
-                                if n <= 0:
-                                    break
-                                baos.write(buf, 0, n)
-                            istream.close()
-                            with open(dest_path, 'wb') as f:
-                                f.write(bytes(baos.toByteArray()))
-                            baos.close()
-                            self.photo_path = dest_path
-                            fsize = os.path.getsize(dest_path)
-                            self._dbg(f"从Intent URI保存成功: {fsize} bytes")
-                            if fsize > 0:
-                                if self.pending_callback:
-                                    cb = self.pending_callback
-                                    self.pending_callback = None
-                                    Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                                return
-                        except Exception as e:
-                            self._dbg(f"从URI读取失败: {str(e)[:80]}")
-                    else:
-                        extras = intent.getExtras()
-                        if extras is not None and extras.containsKey("data"):
-                            self._dbg("Intent返回缩略图(data extra) - 分辨率较低")
-                            try:
-                                bitmap = cast('android.graphics.Bitmap', extras.get("data"))
-                                if bitmap is not None:
-                                    os.makedirs(APP_DIR, exist_ok=True)
-                                    dest_path = os.path.join(
-                                        APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.png"
-                                    )
-                                    FileOutputStream = autoclass('java.io.FileOutputStream')
-                                    fos = FileOutputStream(dest_path)
-                                    try:
-                                        CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
-                                        bitmap.compress(CompressFormat.PNG, 100, fos)
-                                    except Exception as ce:
-                                        self._dbg(f"  CompressFormat反射失败: {str(ce)[:60]}，尝试备选方案")
-                                        bitmap.compress(autoclass('android.graphics.Bitmap').CompressFormat.PNG, 100, fos)
-                                    fos.flush()
-                                    fos.close()
-                                    self.photo_path = dest_path
-                                    self._dbg(f"缩略图已保存: {os.path.getsize(dest_path)} bytes", show_toast=True)
+                            bitmap = cast('android.graphics.Bitmap', extras.get("data"))
+                            if bitmap is not None:
+                                os.makedirs(APP_DIR, exist_ok=True)
+                                dest_path = os.path.join(
+                                    APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.png"
+                                )
+                                FileOutputStream = autoclass('java.io.FileOutputStream')
+                                fos = FileOutputStream(dest_path)
+                                try:
+                                    CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
+                                    bitmap.compress(CompressFormat.PNG, 100, fos)
+                                except Exception as ce:
+                                    self._dbg(f"  CompressFormat反射失败: {str(ce)[:60]}，尝试备选方案")
+                                    bitmap.compress(autoclass('android.graphics.Bitmap').CompressFormat.PNG, 100, fos)
+                                fos.flush()
+                                fos.close()
+                                self.photo_path = dest_path
+                                fsize = os.path.getsize(dest_path)
+                                self._dbg(f"缩略图已保存: {fsize} bytes", show_toast=True)
+                                if fsize > 0:
                                     if self.pending_callback:
                                         cb = self.pending_callback
                                         self.pending_callback = None
                                         Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                                     return
+                        except Exception as e:
+                            self._dbg(f"缩略图保存失败: {str(e)[:80]}")
+                    else:
+                        clip_data = intent.getClipData()
+                        if clip_data is not None and clip_data.getItemCount() > 0:
+                            self._dbg(f"Intent返回ClipData({clip_data.getItemCount()}项)")
+                            try:
+                                item = clip_data.getItemAt(0)
+                                clip_uri = item.getUri()
+                                if clip_uri is not None:
+                                    from jnius import autoclass
+                                    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                                    activity = PythonActivity.mActivity
+                                    resolver = activity.getContentResolver()
+                                    istream = resolver.openInputStream(clip_uri)
+                                    os.makedirs(APP_DIR, exist_ok=True)
+                                    dest_path = os.path.join(
+                                        APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                                    )
+                                    ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
+                                    baos = ByteArrayOutputStream()
+                                    buf = bytearray(8192)
+                                    while True:
+                                        n = istream.read(buf)
+                                        if n <= 0:
+                                            break
+                                        baos.write(buf, 0, n)
+                                    istream.close()
+                                    with open(dest_path, 'wb') as f:
+                                        f.write(bytes(baos.toByteArray()))
+                                    baos.close()
+                                    self.photo_path = dest_path
+                                    fsize = os.path.getsize(dest_path)
+                                    self._dbg(f"ClipData URI保存成功: {fsize} bytes")
+                                    if fsize > 0:
+                                        if self.pending_callback:
+                                            cb = self.pending_callback
+                                            self.pending_callback = None
+                                            Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
+                                        return
                             except Exception as e:
-                                self._dbg(f"缩略图保存失败: {str(e)[:80]}")
+                                self._dbg(f"ClipData读取失败: {str(e)[:80]}")
                         else:
-                            clip_data = intent.getClipData()
-                            if clip_data is not None and clip_data.getItemCount() > 0:
-                                self._dbg(f"Intent返回ClipData({clip_data.getItemCount()}项)")
-                                try:
-                                    item = clip_data.getItemAt(0)
-                                    clip_uri = item.getUri()
-                                    if clip_uri is not None:
-                                        from jnius import autoclass
-                                        PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                                        activity = PythonActivity.mActivity
-                                        resolver = activity.getContentResolver()
-                                        istream = resolver.openInputStream(clip_uri)
-                                        os.makedirs(APP_DIR, exist_ok=True)
-                                        dest_path = os.path.join(
-                                            APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                                        )
-                                        ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
-                                        baos = ByteArrayOutputStream()
-                                        buf = bytearray(8192)
-                                        while True:
-                                            n = istream.read(buf)
-                                            if n <= 0:
-                                                break
-                                            baos.write(buf, 0, n)
-                                        istream.close()
-                                        with open(dest_path, 'wb') as f:
-                                            f.write(bytes(baos.toByteArray()))
-                                        baos.close()
-                                        self.photo_path = dest_path
-                                        fsize = os.path.getsize(dest_path)
-                                        self._dbg(f"ClipData URI保存成功: {fsize} bytes")
-                                        if fsize > 0:
-                                            if self.pending_callback:
-                                                cb = self.pending_callback
-                                                self.pending_callback = None
-                                                Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                                            return
-                                except Exception as e:
-                                    self._dbg(f"ClipData读取失败: {str(e)[:80]}")
-                            else:
-                                self._dbg("Intent无data/extras/clipData，无法获取照片")
-                except Exception as e:
-                    self._dbg(f"处理Intent返回失败: {str(e)[:100]}")
+                            self._dbg("Intent无data/extras/clipData")
+            except Exception as e:
+                self._dbg(f"处理Intent返回失败: {str(e)[:100]}")
 
-            self._dbg(f"照片文件不存在或为空，无法获取照片", show_toast=True)
+        # ========== 第4优先级：扫描DCIM/Camera目录获取最新照片 ==========
+        if IS_ANDROID and result_code == 0:
+            self._dbg("尝试扫描DCIM/Camera目录获取最新照片...")
+            try:
+                dcim_dir = os.path.join('/storage/emulated/0', 'DCIM', 'Camera')
+                if not os.path.isdir(dcim_dir):
+                    dcim_dir = os.path.join('/sdcard', 'DCIM', 'Camera')
+                if os.path.isdir(dcim_dir):
+                    files = [os.path.join(dcim_dir, f) for f in os.listdir(dcim_dir)
+                             if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    if files:
+                        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                        latest = files[0]
+                        fsize = os.path.getsize(latest)
+                        mtime = os.path.getmtime(latest)
+                        import time
+                        age = time.time() - mtime
+                        self._dbg(f"DCIM最新照片: {os.path.basename(latest)} ({fsize} bytes, {age:.0f}秒前)")
+                        if fsize > 0 and age < 120:  # 2分钟内的照片
+                            os.makedirs(APP_DIR, exist_ok=True)
+                            dest_path = os.path.join(
+                                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                            )
+                            import shutil
+                            shutil.copy2(latest, dest_path)
+                            self.photo_path = dest_path
+                            self._dbg(f"✓ 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
+                            if self.pending_callback:
+                                cb = self.pending_callback
+                                self.pending_callback = None
+                                Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
+                            return
+                        else:
+                            self._dbg(f"DCIM照片太旧({age:.0f}秒前)，可能不是本次拍摄")
+                else:
+                    self._dbg(f"DCIM/Camera目录不存在: {dcim_dir}")
+            except Exception as e:
+                self._dbg(f"DCIM扫描失败: {str(e)[:80]}")
+
+        # ========== 所有方式都失败 ==========
+        if result_code == 0:
+            self._dbg("拍照已取消（未检测到照片文件）", show_toast=True)
         else:
-            self._dbg("用户取消了拍照")
+            self._dbg(f"拍照失败(result_code={result_code})，未检测到照片", show_toast=True)
         self._media_uri = None
         if self.pending_callback:
             cb = self.pending_callback
