@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.13.0
+资产盘点专项拍照工具 App - v3.14.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1113,94 +1113,104 @@ class CameraManager:
                 uri = None
                 uri_set_ok = False
                 self._media_uri = None
-                self._dbg("尝试设置输出URI（用于高清照片）...")
 
-                # 策略1：file:// URI + 禁用StrictMode
-                try:
-                    photo_file = File(self.photo_path)
-                    if photo_file.exists():
-                        photo_file.delete()
-                    photo_file.createNewFile()
-                    self._dbg("策略1: file:// URI")
+                # ========== API 30+：file:// URI不工作（照片大小为0），直接使用无EXTRA_OUTPUT ==========
+                # 相机自行保存到DCIM/Camera，拍完后通过DCIM扫描获取照片
+                if ANDROID_API >= 30:
+                    self._dbg("API 30+：不使用EXTRA_OUTPUT（file:// URI在Android 16不工作）")
+                    self._dbg("相机将自行保存照片，拍完照后通过DCIM扫描获取")
+                    self.photo_path = None
+                    self._media_uri = None
+                    # intent保持干净（无EXTRA_OUTPUT），策略4直接生效
+                else:
+                    # API < 30：尝试file:// URI策略
+                    self._dbg("尝试设置输出URI（用于高清照片）...")
+
+                    # 策略1：file:// URI + 禁用StrictMode
                     try:
-                        StrictMode = autoclass('android.os.StrictMode')
-                        VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
-                        b = VmPolicyBuilder()
-                        b.penaltyLog()
-                        StrictMode.setVmPolicy(b.build())
-                        self._dbg("  StrictMode已禁用")
-                    except Exception:
-                        pass
-                    raw_uri = Uri.fromFile(photo_file)
-                    parcel_uri = cast('android.os.Parcelable', raw_uri)
-                    intent.putExtra(EXTRA_OUTPUT, parcel_uri)
-                    intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                    intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
-                    uri = raw_uri
-                    uri_set_ok = True
-                    self._dbg("  file:// URI设置成功（已cast为Parcelable）")
-                except Exception as e:
-                    self._dbg(f"  file:// URI失败: {type(e).__name__}: {str(e)[:80]}")
-                    # 清理失败的intent extra，重新创建intent
-                    intent = Intent(ACTION_IMAGE_CAPTURE)
-
-                # 策略2：FileProvider content:// URI（如果file://失败）
-                if not uri_set_ok:
-                    self._dbg("策略2: FileProvider URI")
-                    for fp_cls_name in ['androidx.core.content.FileProvider',
-                                         'android.support.v4.content.FileProvider']:
+                        photo_file = File(self.photo_path)
+                        if photo_file.exists():
+                            photo_file.delete()
+                        photo_file.createNewFile()
+                        self._dbg("策略1: file:// URI")
                         try:
-                            FileProvider = autoclass(fp_cls_name)
-                            authority = package_name + ".fileprovider"
-                            photo_file2 = File(self.photo_path)
-                            raw_uri = FileProvider.getUriForFile(activity, authority, photo_file2)
+                            StrictMode = autoclass('android.os.StrictMode')
+                            VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
+                            b = VmPolicyBuilder()
+                            b.penaltyLog()
+                            StrictMode.setVmPolicy(b.build())
+                            self._dbg("  StrictMode已禁用")
+                        except Exception:
+                            pass
+                        raw_uri = Uri.fromFile(photo_file)
+                        parcel_uri = cast('android.os.Parcelable', raw_uri)
+                        intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                        intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                        intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                        uri = raw_uri
+                        uri_set_ok = True
+                        self._dbg("  file:// URI设置成功（已cast为Parcelable）")
+                    except Exception as e:
+                        self._dbg(f"  file:// URI失败: {type(e).__name__}: {str(e)[:80]}")
+                        intent = Intent(ACTION_IMAGE_CAPTURE)
+
+                    # 策略2：FileProvider content:// URI
+                    if not uri_set_ok:
+                        self._dbg("策略2: FileProvider URI")
+                        for fp_cls_name in ['androidx.core.content.FileProvider',
+                                             'android.support.v4.content.FileProvider']:
+                            try:
+                                FileProvider = autoclass(fp_cls_name)
+                                authority = package_name + ".fileprovider"
+                                photo_file2 = File(self.photo_path)
+                                raw_uri = FileProvider.getUriForFile(activity, authority, photo_file2)
+                                if raw_uri is not None:
+                                    parcel_uri = cast('android.os.Parcelable', raw_uri)
+                                    intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                                    intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                                    intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                                    uri = raw_uri
+                                    uri_set_ok = True
+                                    self._dbg(f"  FileProvider URI成功: {fp_cls_name.split('.')[-1]}")
+                                    break
+                            except Exception as e:
+                                self._dbg(f"  {fp_cls_name.split('.')[-1]}失败: {str(e)[:80]}")
+                        if not uri_set_ok:
+                            intent = Intent(ACTION_IMAGE_CAPTURE)
+
+                    # 策略3：MediaStore content:// URI
+                    if not uri_set_ok and ANDROID_API >= 29:
+                        self._dbg("策略3: MediaStore URI")
+                        try:
+                            ContentValues = autoclass('android.content.ContentValues')
+                            resolver = activity.getContentResolver()
+                            cv = ContentValues()
+                            cv.put("_display_name", photo_fname)
+                            cv.put("mime_type", "image/jpeg")
+                            cv.put("relative_path", "Pictures/LoanPhoto")
+                            media_ext_uri = Uri.parse("content://media/external/images/media")
+                            raw_uri = resolver.insert(media_ext_uri, cv)
                             if raw_uri is not None:
                                 parcel_uri = cast('android.os.Parcelable', raw_uri)
                                 intent.putExtra(EXTRA_OUTPUT, parcel_uri)
                                 intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
                                 intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
                                 uri = raw_uri
+                                self._media_uri = raw_uri
                                 uri_set_ok = True
-                                self._dbg(f"  FileProvider URI成功: {fp_cls_name.split('.')[-1]}")
-                                break
+                                self.photo_path = None
+                                self._dbg("  MediaStore URI成功")
                         except Exception as e:
-                            self._dbg(f"  {fp_cls_name.split('.')[-1]}失败: {str(e)[:80]}")
-                    if not uri_set_ok:
-                        intent = Intent(ACTION_IMAGE_CAPTURE)
+                            self._dbg(f"  MediaStore失败: {str(e)[:100]}")
+                        if not uri_set_ok:
+                            intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                # 策略3：MediaStore content:// URI
-                if not uri_set_ok and ANDROID_API >= 29:
-                    self._dbg("策略3: MediaStore URI")
-                    try:
-                        ContentValues = autoclass('android.content.ContentValues')
-                        resolver = activity.getContentResolver()
-                        cv = ContentValues()
-                        cv.put("_display_name", photo_fname)
-                        cv.put("mime_type", "image/jpeg")
-                        cv.put("relative_path", "Pictures/LoanPhoto")
-                        media_ext_uri = Uri.parse("content://media/external/images/media")
-                        raw_uri = resolver.insert(media_ext_uri, cv)
-                        if raw_uri is not None:
-                            parcel_uri = cast('android.os.Parcelable', raw_uri)
-                            intent.putExtra(EXTRA_OUTPUT, parcel_uri)
-                            intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                            intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
-                            uri = raw_uri
-                            self._media_uri = raw_uri
-                            uri_set_ok = True
-                            self.photo_path = None
-                            self._dbg("  MediaStore URI成功")
-                    except Exception as e:
-                        self._dbg(f"  MediaStore失败: {str(e)[:100]}")
+                    # 策略4：无EXTRA_OUTPUT（兜底）
                     if not uri_set_ok:
+                        self._dbg("策略4: 无EXTRA_OUTPUT（从返回Intent获取照片）")
+                        self.photo_path = None
+                        self._media_uri = None
                         intent = Intent(ACTION_IMAGE_CAPTURE)
-
-                # 策略4：无EXTRA_OUTPUT（100%兜底，从返回Intent取照片/缩略图）
-                if not uri_set_ok:
-                    self._dbg("策略4: 无EXTRA_OUTPUT（从返回Intent获取照片）")
-                    self.photo_path = None
-                    self._media_uri = None
-                    intent = Intent(ACTION_IMAGE_CAPTURE)
 
                 # 尝试授予URI权限（如果有uri）
                 if uri is not None and uri_set_ok:
@@ -1309,7 +1319,12 @@ class CameraManager:
                     Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                 return
             else:
-                self._dbg(f"照片文件存在但大小为0，可能是占位文件")
+                self._dbg(f"照片文件存在但大小为0（占位文件），删除并继续查找")
+                try:
+                    os.remove(self.photo_path)
+                except:
+                    pass
+                self.photo_path = None
         else:
             if self.photo_path:
                 self._dbg(f"照片文件不存在: {self.photo_path}")
@@ -1352,7 +1367,52 @@ class CameraManager:
                 self._dbg(f"MediaStore复制失败: {str(e)[:100]}")
                 self._media_uri = None
 
-        # ========== 第3优先级：从返回Intent获取照片（不管result_code）==========
+        # ========== 第3优先级：扫描DCIM/Camera目录获取最新照片 ==========
+        # 在Intent处理之前执行DCIM扫描（Intent处理可能导致崩溃）
+        if IS_ANDROID:
+            self._dbg("扫描DCIM/Camera目录获取最新照片...")
+            try:
+                import time
+                import shutil
+                dcim_dirs = [
+                    '/storage/emulated/0/DCIM/Camera',
+                    '/storage/emulated/0/DCIM/相机',
+                    '/sdcard/DCIM/Camera',
+                    '/storage/emulated/0/Pictures',
+                ]
+                for dcim_dir in dcim_dirs:
+                    if not os.path.isdir(dcim_dir):
+                        continue
+                    files = [os.path.join(dcim_dir, f) for f in os.listdir(dcim_dir)
+                             if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    if not files:
+                        continue
+                    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                    latest = files[0]
+                    fsize = os.path.getsize(latest)
+                    mtime = os.path.getmtime(latest)
+                    age = time.time() - mtime
+                    self._dbg(f"DCIM最新: {os.path.basename(latest)} ({fsize}bytes, {age:.0f}秒前, {dcim_dir})")
+                    if fsize > 10000 and age < 120:  # >10KB 且2分钟内
+                        os.makedirs(APP_DIR, exist_ok=True)
+                        dest_path = os.path.join(
+                            APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                        )
+                        shutil.copy2(latest, dest_path)
+                        self.photo_path = dest_path
+                        self._dbg(f"✓ 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
+                        if self.pending_callback:
+                            cb = self.pending_callback
+                            self.pending_callback = None
+                            Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
+                        return
+                    else:
+                        self._dbg(f"  照片太旧({age:.0f}秒前)或太小({fsize}bytes)，跳过")
+                self._dbg("DCIM扫描完成，未找到符合条件的照片")
+            except Exception as e:
+                self._dbg(f"DCIM扫描失败: {str(e)[:80]}")
+
+        # ========== 第4优先级：从返回Intent获取照片 ==========
         if intent is not None:
             self._dbg(f"尝试从返回Intent获取照片(result_code={result_code})...")
             try:
@@ -1468,45 +1528,6 @@ class CameraManager:
                             self._dbg("Intent无data/extras/clipData")
             except Exception as e:
                 self._dbg(f"处理Intent返回失败: {str(e)[:100]}")
-
-        # ========== 第4优先级：扫描DCIM/Camera目录获取最新照片 ==========
-        if IS_ANDROID and result_code == 0:
-            self._dbg("尝试扫描DCIM/Camera目录获取最新照片...")
-            try:
-                dcim_dir = os.path.join('/storage/emulated/0', 'DCIM', 'Camera')
-                if not os.path.isdir(dcim_dir):
-                    dcim_dir = os.path.join('/sdcard', 'DCIM', 'Camera')
-                if os.path.isdir(dcim_dir):
-                    files = [os.path.join(dcim_dir, f) for f in os.listdir(dcim_dir)
-                             if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-                    if files:
-                        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-                        latest = files[0]
-                        fsize = os.path.getsize(latest)
-                        mtime = os.path.getmtime(latest)
-                        import time
-                        age = time.time() - mtime
-                        self._dbg(f"DCIM最新照片: {os.path.basename(latest)} ({fsize} bytes, {age:.0f}秒前)")
-                        if fsize > 0 and age < 120:  # 2分钟内的照片
-                            os.makedirs(APP_DIR, exist_ok=True)
-                            dest_path = os.path.join(
-                                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-                            )
-                            import shutil
-                            shutil.copy2(latest, dest_path)
-                            self.photo_path = dest_path
-                            self._dbg(f"✓ 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
-                            if self.pending_callback:
-                                cb = self.pending_callback
-                                self.pending_callback = None
-                                Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                            return
-                        else:
-                            self._dbg(f"DCIM照片太旧({age:.0f}秒前)，可能不是本次拍摄")
-                else:
-                    self._dbg(f"DCIM/Camera目录不存在: {dcim_dir}")
-            except Exception as e:
-                self._dbg(f"DCIM扫描失败: {str(e)[:80]}")
 
         # ========== 所有方式都失败 ==========
         if result_code == 0:
@@ -2338,7 +2359,17 @@ class MainScreen(Screen):
     def on_activity_result(self, request_code, result_code, intent):
         """处理Android Activity结果回调（文件选择器+相机）。"""
         if request_code == self.camera_mgr.CAMERA_REQUEST_CODE:
-            self.camera_mgr.on_camera_result(result_code, intent)
+            try:
+                self.camera_mgr.on_camera_result(result_code, intent)
+            except Exception as e:
+                Logger.error("on_camera_result crash: %s" % e)
+                Logger.error(traceback.format_exc())
+                self.camera_mgr._dbg(f"❌ 处理结果时崩溃: {type(e).__name__}: {str(e)[:100]}", show_toast=True)
+                self.camera_mgr._camera_launched = False
+                if self.camera_mgr.pending_callback:
+                    cb = self.camera_mgr.pending_callback
+                    self.camera_mgr.pending_callback = None
+                    Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
             return
 
         if request_code == getattr(self, '_android_file_picker_code', -1):
