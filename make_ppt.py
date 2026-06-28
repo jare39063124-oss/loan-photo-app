@@ -120,7 +120,7 @@ def create_presentation():
     prs.slide_width = SLIDE_WIDTH
     prs.slide_height = SLIDE_HEIGHT
     
-    total_slides = 14
+    total_slides = 15
     
     blank_layout = prs.slide_layouts[6]
     
@@ -142,7 +142,7 @@ def create_presentation():
                 "资产盘点专项拍照工具", font_size=44, bold=True, color=WHITE)
     
     add_textbox(slide, Inches(1), Inches(3.3), Inches(11), Inches(0.7),
-                "使用说明书 v3.7.0", font_size=28, color=ACCENT_BLUE)
+                "使用说明书 v3.9.0", font_size=28, color=ACCENT_BLUE)
     
     add_textbox(slide, Inches(1), Inches(5.5), Inches(11), Inches(0.5),
                 "2026年6月", font_size=18, color=LIGHT_GRAY)
@@ -157,14 +157,15 @@ def create_presentation():
     chapters = [
         "第一章  应用概述",
         "第二章  首次使用",
-        "第三章  Excel导入",
-        "第四章  客户列表",
-        "第五章  拍照功能",
-        "第六章  照片查看与管理",
-        "第七章  设置页面",
-        "第八章  水印说明",
-        "第九章  文件命名规则",
-        "第十章  常见问题",
+        "第三章  Excel格式规范",
+        "第四章  Excel导入",
+        "第五章  客户列表",
+        "第六章  拍照功能",
+        "第七章  照片查看与管理",
+        "第八章  设置页面",
+        "第九章  水印说明",
+        "第十章  文件命名规则",
+        "第十一章  常见问题",
     ]
     
     txBox = slide.shapes.add_textbox(Inches(1), Inches(1.6), Inches(11), Inches(5.2))
@@ -216,7 +217,7 @@ def create_presentation():
     features = [
         "Excel批量导入客户地址信息",
         "按客户分类管理资产照片",
-        "支持远景/近景/内部/瑕疵四种拍照类型",
+        "支持远景/近景/内部/瑕疵/其他五种拍照类型",
         "自动添加水印（时间、地址、GPS定位）",
         "自定义文件命名规则",
         "手动快门连续拍摄，按返回键结束",
@@ -339,26 +340,30 @@ def create_presentation():
     for col in cols:
         add_paragraph(tf, "  - " + col, font_size=15, color=LIGHT_GRAY, space_before=Pt(4))
     
-    add_textbox(slide, Inches(0.5), Inches(3.6), Inches(6.5), Inches(0.5),
-                "操作步骤", font_size=22, bold=True, color=ACCENT_BLUE)
+    add_textbox(slide, Inches(0.5), Inches(3.5), Inches(6.5), Inches(0.5),
+                "注意事项", font_size=22, bold=True, color=RGBColor(0xCC,0x55,0x33))
     
-    txBox2 = slide.shapes.add_textbox(Inches(0.5), Inches(4.15), Inches(6.5), Inches(2.8))
-    tf2 = txBox2.text_frame
-    tf2.word_wrap = True
-    steps = [
-        "1. 点击主界面「导入Excel」按钮",
-        "2. 在文件浏览器中选择准备好的.xlsx文件",
-        "3. 应用自动解析文件内容",
-        "4. 导入成功后显示客户数量提示",
-        "5. 客户列表自动刷新显示新导入的数据",
+    notes = [
+        "仅支持 .xlsx 格式（Excel 2007及以上版本），不支持 .xls 老格式",
+        "第一行为表头行（A1:D1），数据从第二行开始",
+        "列顺序必须为：A客户名、B地址概、C地址精确、D性质",
+        "客户名不能为空，同一客户名+地址视为同一客户",
+        "B列和C列将拼接为完整地址用于水印显示",
+        "文件名不要包含特殊字符（/ \\ : * ? \" < > |）",
     ]
-    p2 = tf2.paragraphs[0]
-    p2.text = steps[0]
-    p2.font.size = Pt(15)
-    p2.font.color.rgb = WHITE
-    p2.font.name = '微软雅黑'
-    for step in steps[1:]:
-        add_paragraph(tf2, step, font_size=15, color=LIGHT_GRAY, space_before=Pt(6))
+    txBox_notes = slide.shapes.add_textbox(Inches(0.5), Inches(4.0), Inches(6.5), Inches(3.2))
+    tfn = txBox_notes.text_frame
+    tfn.word_wrap = True
+    for i, note in enumerate(notes):
+        if i == 0:
+            pn = tfn.paragraphs[0]
+        else:
+            pn = tfn.add_paragraph()
+        pn.text = "  • " + note
+        pn.font.size = Pt(13)
+        pn.font.color.rgb = RGBColor(0xCC,0x99,0x55)
+        pn.font.name = '微软雅黑'
+        pn.space_before = Pt(3)
     
     screen_left = Inches(7.5)
     screen_top = Inches(1.4)
@@ -412,7 +417,7 @@ def create_presentation():
         ("性质标签：", "用不同颜色标签区分房产性质"),
         ("拍照按钮：", "点击进入该客户的拍照页面，选择类型后启动相机"),
         ("查看已拍：", "查看该客户已拍摄的照片，支持删除（需二次确认）"),
-        ("进度统计：", "实时显示每个客户的拍照进度（远景/近景/内部/瑕疵）"),
+        ("进度统计：", "实时显示每个客户的拍照进度（远景/近景/内部/瑕疵/其他）"),
     ]
     
     p = tf.paragraphs[0]
@@ -473,7 +478,7 @@ def create_presentation():
     p.font.bold = True
     p.font.color.rgb = WHITE
     p.font.name = '微软雅黑'
-    add_paragraph(tf, "   点击拍照按钮后，弹出类型选择窗口：远景、近景、内部、瑕疵", font_size=15, color=LIGHT_GRAY, space_before=Pt(3))
+    add_paragraph(tf, "   点击拍照按钮后，弹出类型选择窗口：远景、近景、内部、瑕疵、其他", font_size=15, color=LIGHT_GRAY, space_before=Pt(3))
     
     add_paragraph(tf, "2. 手动快门连续拍摄", font_size=16, bold=True, color=WHITE, space_before=Pt(12))
     add_paragraph(tf, "   选择类型后启动系统相机，每按一次快门拍摄一张。拍完后相机", font_size=15, color=LIGHT_GRAY, space_before=Pt(3))
@@ -501,11 +506,13 @@ def create_presentation():
     add_screen_element(slide, screen_left + Inches(0.3), screen_top + Inches(1.1), screen_w - Inches(0.6), Inches(0.4),
                        "请选择拍照类型：", font_size=9, bg_color=SCREEN_BG)
     
-    types = ["远景", "近景", "内部", "瑕疵"]
+    types = ["远景", "近景", "内部", "瑕疵", "其他"]
     for i, t in enumerate(types):
-        ty_x = screen_left + Inches(0.3) + (screen_w - Inches(0.9)) / 4 * i + Inches(0.05)
-        ty_w = (screen_w - Inches(0.9)) / 4 - Inches(0.1)
-        add_screen_element(slide, ty_x, screen_top + Inches(1.65), ty_w, Inches(0.55),
+        col = i % 3
+        row = i // 3
+        ty_x = screen_left + Inches(0.3) + (screen_w - Inches(0.9)) / 3 * col + Inches(0.05)
+        ty_w = (screen_w - Inches(0.9)) / 3 - Inches(0.1)
+        add_screen_element(slide, ty_x, screen_top + Inches(1.65) + Inches(0.65) * row, ty_w, Inches(0.5),
                            t, bg_color=ACCENT_BLUE if i == 0 else DARK_GRAY, font_size=11)
     
     add_screen_element(slide, screen_left + Inches(0.3), screen_top + Inches(2.5), screen_w - Inches(0.6), Inches(2.2),
@@ -534,7 +541,7 @@ def create_presentation():
     p.font.bold = True
     p.font.color.rgb = WHITE
     p.font.name = '微软雅黑'
-    add_paragraph(tf, "点击「查看已拍」按钮，进入照片浏览页面，按类型（远景/近景/内部/瑕疵）分类展示该客户所有已拍照片，以缩略图网格形式排列。", font_size=15, color=LIGHT_GRAY, space_before=Pt(5))
+    add_paragraph(tf, "点击「查看已拍」按钮，进入照片浏览页面，按类型（远景/近景/内部/瑕疵/其他）分类展示该客户所有已拍照片，以缩略图网格形式排列。", font_size=15, color=LIGHT_GRAY, space_before=Pt(5))
     
     add_paragraph(tf, "删除单张照片", font_size=18, bold=True, color=WHITE, space_before=Pt(14))
     add_paragraph(tf, "点击单张照片下方的「删除」按钮，弹出确认对话框，需二次确认后方可删除，防止误操作。", font_size=15, color=LIGHT_GRAY, space_before=Pt(5))
@@ -552,7 +559,7 @@ def create_presentation():
                        " <- 返回   张三 - 已拍照片", bg_color=ACCENT_BLUE, font_size=8)
     
     add_screen_element(slide, screen_left + Inches(0.2), screen_top + Inches(1.0), screen_w - Inches(0.4), Inches(0.32),
-                       " [远景(3)] [近景(2)] [内部(0)] [瑕疵(1)]", bg_color=DARK_GRAY, font_size=7)
+                       " [远景(3)] [近景(2)] [内部(0)] [瑕疵(1)] [其他(0)]", bg_color=DARK_GRAY, font_size=7)
     
     thumb_y = screen_top + Inches(1.45)
     thumb_w = (screen_w - Inches(0.6)) / 3
@@ -731,7 +738,7 @@ def create_presentation():
         add_paragraph(tf, "  - " + f, font_size=15, color=LIGHT_GRAY, space_before=Pt(4))
     
     add_paragraph(tf, "自动追加后缀", font_size=18, bold=True, color=WHITE, space_before=Pt(12))
-    add_paragraph(tf, "在4段组合的文件名之后，系统会自动追加：拍照类型（远景/近景/内部/瑕疵）和照片编号（01/02/...），用「-」连接。", font_size=15, color=LIGHT_GRAY, space_before=Pt(6))
+    add_paragraph(tf, "在4段组合的文件名之后，系统会自动追加：拍照类型（远景/近景/内部/瑕疵/其他）和照片编号（01/02/...），用「-」连接。", font_size=15, color=LIGHT_GRAY, space_before=Pt(6))
     
     add_paragraph(tf, "命名示例", font_size=18, bold=True, color=WHITE, space_before=Pt(12))
     add_paragraph(tf, "  20260628-张三-沈阳市和平区XX街123号1430-远景-01.jpg", font_size=14, color=ACCENT_BLUE, space_before=Pt(5))
@@ -754,7 +761,7 @@ def create_presentation():
                            pt, bg_color=c, font_size=7)
     
     add_screen_element(slide, screen_left + Inches(0.3), screen_top + Inches(2.3), screen_w - Inches(0.6), Inches(0.45),
-                       "+ 类型（远景/近景/内部/瑕疵）", bg_color=RGBColor(0x66,0x55,0x33), font_size=9)
+                       "+ 类型（远景/近景/内部/瑕疵/其他）", bg_color=RGBColor(0x66,0x55,0x33), font_size=9)
     add_screen_element(slide, screen_left + Inches(0.3), screen_top + Inches(2.95), screen_w - Inches(0.6), Inches(0.45),
                        "+ 编号（01/02/03...）", bg_color=RGBColor(0x33,0x55,0x33), font_size=9)
     
@@ -845,7 +852,7 @@ def create_presentation():
     add_paragraph(ctf, "电话：15940454123", font_size=16, color=WHITE, space_before=Pt(6))
     
     add_textbox(slide, Inches(1), Inches(7.0), Inches(11), Inches(0.4),
-                "资产盘点专项拍照工具 v3.7.0", font_size=12, color=LIGHT_GRAY, align=PP_ALIGN.CENTER)
+                "资产盘点专项拍照工具 v3.9.0", font_size=12, color=LIGHT_GRAY, align=PP_ALIGN.CENTER)
     
     add_page_number(slide, 13, total_slides)
     
@@ -853,7 +860,7 @@ def create_presentation():
     # 实际上PPT页码需重新生成，这里更新page 12的显示
     # 由于python-pptx不易修改已添加元素，重新生成更稳妥，但为效率我们只更新output
     
-    output_path = r"C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.7.0.pptx"
+    output_path = r"C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.9.0.pptx"
     prs.save(output_path)
     print(f"PPT已成功生成：{output_path}")
     return output_path
