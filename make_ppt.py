@@ -332,8 +332,8 @@ def create_presentation():
     
     cols = [
         "A列：客户名",
-        "B列：地址概（如：沈阳市和平区）",
-        "C列：地址精确（详细门牌号）",
+        "B列：地址概（街道+楼栋号，如：沈阳市和平区人民大街123号）",
+        "C列：地址精确（单元/房间号，如：1-23-4）",
         "D列：性质（如：住宅/商铺/抵押）",
     ]
     for col in cols:
@@ -372,14 +372,14 @@ def create_presentation():
     excel_x = screen_left + Inches(0.3)
     excel_y = screen_top + Inches(1.1)
     col_w = (screen_w - Inches(0.6)) / 4
-    headers = ["A客户名", "B地址概", "C地址精确", "D性质"]
+    headers = ["A客户名", "B地址概(街道+楼栋)", "C地址精确(单元房号)", "D性质"]
     for i, h in enumerate(headers):
         add_screen_element(slide, excel_x + col_w * i, excel_y, col_w, Inches(0.32),
-                           h, bg_color=RGBColor(0x44,0x44,0x55), font_size=7)
+                           h, bg_color=RGBColor(0x44,0x44,0x55), font_size=6)
     rows = [
-        ["张三", "和平区", "XX街123号", "住宅"],
-        ["李四", "沈河区", "YY路45号", "商铺"],
-        ["王五", "铁西区", "ZZ道67号", "抵押"],
+        ["张三", "和平区XX街123号", "1-23-4", "住宅"],
+        ["李四", "沈河区YY路45号", "2-15-1", "商铺"],
+        ["王五", "铁西区ZZ道67号", "3-8-2", "抵押"],
     ]
     for r_idx, row in enumerate(rows):
         for c_idx, val in enumerate(row):
@@ -445,7 +445,7 @@ def create_presentation():
         add_screen_element(slide, screen_left + Inches(0.3), list_y + Inches(1.0)*i + Inches(0.05), Inches(1.0), Inches(0.32),
                            ["张三", "李四", "王五"][i], bg_color=bg, text_color=WHITE, font_size=9)
         add_screen_element(slide, screen_left + Inches(1.35), list_y + Inches(1.0)*i + Inches(0.05), Inches(1.8), Inches(0.32),
-                           ["和平区XX街", "沈河区YY路", "铁西区ZZ道"][i], bg_color=bg, text_color=LIGHT_GRAY, font_size=7)
+                           ["XX街123号1-23-4", "YY路45号2-15-1", "ZZ道67号3-8-2"][i], bg_color=bg, text_color=LIGHT_GRAY, font_size=6)
         add_screen_element(slide, screen_left + Inches(3.2), list_y + Inches(1.0)*i + Inches(0.05), Inches(1.1), Inches(0.28),
                            ["远2近1内0瑕0", "远1近0内1瑕0", "远0近0内0瑕0"][i], bg_color=bg, text_color=RGBColor(0x88,0xCC,0x88), font_size=6)
         add_screen_element(slide, screen_left + Inches(0.3), list_y + Inches(1.0)*i + Inches(0.5), Inches(1.5), Inches(0.3),
@@ -721,8 +721,9 @@ def create_presentation():
         "拍摄日期（格式：20260628）",
         "拍摄时间（格式：202606281430）",
         "客户名",
-        "地址全（地址概+地址精确）",
-        "地址概 / 地址精确",
+        "地址全（地址概+地址精确，B列+C列拼接）",
+        "地址概（B列：街道+楼栋号）",
+        "地址精确（C列：单元/房间号）",
         "地址+时间（地址全+HHMM，无分隔符）",
         "空值（该段省略）",
     ]
