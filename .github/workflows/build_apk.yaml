@@ -28,15 +28,37 @@ jobs:
           autoconf automake libtool libffi-dev libssl-dev cmake \
           libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
           libportmidi-dev libswscale-dev libavformat-dev libavcodec-dev \
-          libmtdev-dev xclip xsel
+          libmtdev-dev xclip xsel patchelf cpio
 
     - name: Install Python packages
       run: |
         pip install --upgrade pip setuptools wheel
         pip install buildozer cython
 
-    - name: Build debug APK
-      run: buildozer -v android debug
+    - name: Build APK with manifest patching
+      run: |
+        # Phase 1: Let buildozer set up the environment and generate the Android project
+        # We run buildozer with a custom p4a command to stop after project generation
+        export PATH="$HOME/.buildozer/android/platform/apache-ant-1.9.4/bin:$PATH"
+        buildozer android debug || true
+        
+        # Find the generated AndroidManifest.xml in the gradle project
+        MANIFEST=$(find .buildozer -name "AndroidManifest.xml" -path "*/src/main/*" | head -1)
+        echo "Found manifest at: $MANIFEST"
+        
+        if [ -n "$MANIFEST" ]; then
+          python3 patch_manifest.py "$MANIFEST"
+        else
+          echo "WARNING: Could not find AndroidManifest.xml, trying templates..."
+          # Try patching template manifests
+          find .buildozer -name "AndroidManifest*.xml" | while read -r f; do
+            echo "Patching template: $f"
+            python3 patch_manifest.py "$f"
+          done
+        fi
+        
+        # Phase 2: Build again (buildozer will use cached dist and rebuild with patched manifest)
+        buildozer android debug
 
     - name: Upload APK
       uses: actions/upload-artifact@v4

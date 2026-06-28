@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.6.0
+资产盘点专项拍照工具 App - v3.7.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -361,7 +361,7 @@ FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.a
 # === 默认配置 ===
 # Excel 格式：A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
 DEFAULT_CONFIG = {
-    'naming_segments': ['拍摄时间', '客户名', '抵押物地址（全）', '空值'],
+    'naming_segments': ['拍摄日期', '客户名', '地址+时间', '空值'],
     'watermark_enabled': True,
     'watermark_segments': ['拍摄时间', '地址名', '经纬度'],
     'watermark_position': 'bottom-right',
@@ -369,13 +369,15 @@ DEFAULT_CONFIG = {
     'watermark_opacity': 170,
 }
 
-# === 命名段选项（4段，用-连接成 X-X-X-X）===
+# === 命名段选项（用-连接成 X-X-X-X）===
 NAMING_SEGMENT_OPTIONS = [
+    "拍摄日期",
     "拍摄时间",
     "客户名",
     "抵押物地址（全）",
     "抵押物地址（概）",
     "抵押物地址（精确门牌号）",
+    "地址+时间",
     "空值",
 ]
 
@@ -433,6 +435,9 @@ def get_system_date():
 
 def get_date_str():
     return get_system_date().strftime("%Y%m%d")
+
+def get_time_str():
+    return get_system_date().strftime("%H%M")
 
 def get_date_display():
     return get_system_date().strftime("%Y年%m月%d日")
@@ -802,19 +807,24 @@ class PhotoProcessor:
 
     @staticmethod
     def generate_filename(segments, borrower="", address_general="", address_precise="",
-                         property_type="", seq=0, date_str="", photo_type=""):
+                         property_type="", seq=0, date_str="", photo_type="", time_str=""):
         """根据段选择生成文件名（X-X-X-X 格式，空值段自动跳过）
-        segments: ["拍摄时间"/"客户名"/"抵押物地址（全）"/.../"空值", ...]
+        segments: ["拍摄日期"/"拍摄时间"/"客户名"/"抵押物地址（全）"/.../"地址+时间"/"空值", ...]
         抵押物地址（全） = 抵押物地址（概） + 抵押物地址（精确门牌号）
+        地址+时间 = 抵押物地址（全） + 时间HHMM（无分隔符）
         """
         if not date_str:
             date_str = get_date_str()
+        if not time_str:
+            time_str = get_time_str()
 
         parts = []
         for seg in segments:
             val = ""
-            if seg == "拍摄时间":
+            if seg == "拍摄日期":
                 val = date_str
+            elif seg == "拍摄时间":
+                val = date_str + time_str
             elif seg == "客户名":
                 val = borrower if borrower else "未知"
             elif seg == "抵押物地址（全）":
@@ -823,6 +833,9 @@ class PhotoProcessor:
                 val = address_general
             elif seg == "抵押物地址（精确门牌号）":
                 val = address_precise
+            elif seg == "地址+时间":
+                full_addr = (address_general + address_precise).strip()
+                val = full_addr + time_str if full_addr else time_str
             elif seg == "空值":
                 val = ""
             val = clean_filename(val)
@@ -833,6 +846,8 @@ class PhotoProcessor:
         filename = clean_filename(filename)
         if not filename:
             filename = "photo_%s" % date_str
+        if photo_type:
+            filename = "%s-%s-%02d" % (filename, photo_type, seq)
         if not filename.endswith('.jpg'):
             filename += '.jpg'
         return filename
@@ -1083,28 +1098,25 @@ class CameraManager:
                 intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
 
-                # 检查是否有相机应用能处理此 intent
-                pm = activity.getPackageManager()
-                resolves = pm.queryIntentActivities(intent, 0)
-                if resolves is None or resolves.size() == 0:
-                    Logger.error("Camera: No camera app found that can handle IMAGE_CAPTURE")
-                    if self.pending_callback:
-                        cb = self.pending_callback
-                        self.pending_callback = None
-                        Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
-                    return
-                Logger.info("Camera: Found %d camera app(s)", resolves.size())
-
-                # 授予所有匹配的相机应用 URI 临时权限
+                # 检查是否有相机应用能处理此 intent（Android 11+无<queries>标签时可能返回空，但startActivity仍可能成功）
                 try:
-                    from jnius import cast
-                    for i in range(resolves.size()):
-                        resolve_info = resolves.get(i)
-                        pkg = resolve_info.activityInfo.packageName
-                        activity.grantUriPermission(pkg, uri,
-                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    pm = activity.getPackageManager()
+                    resolves = pm.queryIntentActivities(intent, 0)
+                    if resolves is not None and resolves.size() > 0:
+                        Logger.info("Camera: Found %d camera app(s)", resolves.size())
+                        # 授予所有匹配的相机应用 URI 临时权限
+                        for i in range(resolves.size()):
+                            resolve_info = resolves.get(i)
+                            pkg = resolve_info.activityInfo.packageName
+                            try:
+                                activity.grantUriPermission(pkg, uri,
+                                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            except:
+                                pass
+                    else:
+                        Logger.warning("Camera: queryIntentActivities returned 0 results (may be Android 11+ package visibility). Trying to launch anyway...")
                 except Exception as e:
-                    Logger.warning("Camera: grantUriPermission failed: %s", str(e)[:80])
+                    Logger.warning("Camera: intent resolution check failed: %s", str(e)[:80])
 
                 self._camera_launched = True
                 activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
@@ -1113,6 +1125,7 @@ class CameraManager:
             except Exception as e:
                 Logger.error("Camera launch failed: %s" % e)
                 Logger.error(traceback.format_exc())
+                self._camera_launched = False
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
@@ -1637,8 +1650,9 @@ class SettingsScreen(Screen):
         segments = [sp.text for sp in self.naming_spinners]
         return PhotoProcessor.generate_filename(
             segments, borrower="张三",
-            address_general="XX区", address_precise="XX路1号",
-            property_type="住宅", seq=1, date_str=get_date_str(), photo_type="远景",
+            address_general="沈阳市和平区", address_precise="XX街123号",
+            property_type="住宅", seq=1, date_str="20260628", photo_type="远景",
+            time_str="1430",
         )
 
     def _on_wm_segment_change(self, idx, val):
@@ -2135,7 +2149,7 @@ class MainScreen(Screen):
         if self._continuous_shooting:
             self.status_label.text = "准备下一张（%s）…按返回键结束" % self._current_photo_type
             self.status_label.color = THEME['warning']
-            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.8)
+            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.3)
 
     def _on_photo_done(self, photo_path):
         if photo_path is None:
@@ -2157,6 +2171,7 @@ class MainScreen(Screen):
         seq = self.progress_mgr.get_next_photo_index(key) + 1
 
         date_str = get_date_str()
+        time_str = get_time_str()
         datetime_str = get_datetime_str()
 
         self.status_label.text = "处理中 (%s-%02d)…" % (photo_type, self._photos_in_session)
@@ -2178,16 +2193,15 @@ class MainScreen(Screen):
 
                 filename = PhotoProcessor.generate_filename(
                     naming_segments, borrower, addr_general, addr_precise,
-                    property_type, seq, date_str, photo_type,
+                    property_type, seq, date_str, photo_type, time_str,
                 )
-                name_base, ext = os.path.splitext(filename)
-                filename = "%s_%s_%02d%s" % (name_base, photo_type, seq, ext if ext else '.jpg')
                 new_path = os.path.join(APP_DIR, filename)
                 if photo_path != new_path:
                     if os.path.exists(new_path):
+                        name_base, ext = os.path.splitext(filename)
                         suffix = 2
                         while os.path.exists(new_path):
-                            new_path = os.path.join(APP_DIR, "%s_%s_%02d_%d%s" % (name_base, photo_type, seq, suffix, ext if ext else '.jpg'))
+                            new_path = os.path.join(APP_DIR, "%s-%d%s" % (name_base, suffix, ext if ext else '.jpg'))
                             suffix += 1
                     os.rename(photo_path, new_path)
 
