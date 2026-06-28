@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.9.0
+资产盘点专项拍照工具 App - v3.10.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1048,6 +1048,12 @@ class CameraManager:
 
     def _launch_camera_intent(self):
         """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机。
+        v3.10.0 修复：
+        - 底部日志面板高度增大到200dp，显示更多行
+        - 新增「📋 完整日志」按钮，打开全屏日志记事本查看历史记录
+        - 支持一键复制日志到剪贴板，方便反馈问题
+        - 修复非相机状态消息覆盖调试日志导致一闪而过的问题
+        - 所有操作消息追加到日志面板+Toast双重提示
         v3.9.0 修复：
         - FileProvider优先（Android官方推荐，HyperOS/MIUI兼容最好）
         - 移除FLAG_ACTIVITY_NEW_TASK（与startActivityForResult冲突）
@@ -1431,7 +1437,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.5.0", font_size='12sp',
+            text="v3.10.0", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -2039,24 +2045,30 @@ class MainScreen(Screen):
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
-        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(180), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
+        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(200), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
 
-        btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
-        report_btn = Button(text="（已屏蔽）生成报告", font_size='13sp',
+        btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(4))
+        report_btn = Button(text="（已屏蔽）生成报告", font_size='12sp',
                            background_color=(0.35, 0.35, 0.35, 1), background_normal='',
-                           size_hint_x=0.55, color=(0.7, 0.7, 0.7, 1))
+                           size_hint_x=0.35, color=(0.7, 0.7, 0.7, 1))
         report_btn.disabled = True
         btn_row.add_widget(report_btn)
 
-        clear_log_btn = Button(text="清空日志", font_size='12sp',
+        log_btn = Button(text="📋 完整日志", font_size='12sp',
+                             background_color=THEME['accent'], background_normal='',
+                             size_hint_x=0.35, color=(1,1,1,1))
+        log_btn.bind(on_release=self._show_full_log)
+        btn_row.add_widget(log_btn)
+
+        clear_log_btn = Button(text="清空", font_size='12sp',
                               background_color=(0.4, 0.4, 0.45, 1), background_normal='',
-                              size_hint_x=0.45, color=(1,1,1,1))
+                              size_hint_x=0.30, color=(1,1,1,1))
         clear_log_btn.bind(on_release=self._clear_debug_log)
         btn_row.add_widget(clear_log_btn)
         footer.add_widget(btn_row)
 
         log_scroll = ScrollView(do_scroll_x=False, do_scroll_y=True, size_hint_y=1)
-        self.status_label = Label(text="请点击「打开Excel」选择文件", font_size='12sp',
+        self.status_label = Label(text="请点击「打开Excel」选择文件\n底部日志区域：相机调试信息会显示在这里", font_size='11sp',
                                   color=THEME['warning'],
                                   halign='left', valign='top',
                                   size_hint_y=None, markup=False)
@@ -2133,8 +2145,7 @@ class MainScreen(Screen):
             activity.startActivityForResult(intent, self._android_file_picker_code)
         except Exception as e:
             Logger.error("Android file picker error: %s" % e)
-            self.status_label.text = "无法打开文件选择器"
-            self.status_label.color = THEME['danger']
+            self._show_msg("无法打开文件选择器", THEME['danger'])
 
     def on_activity_result(self, request_code, result_code, intent):
         """处理Android Activity结果回调（文件选择器+相机）。"""
@@ -2167,8 +2178,7 @@ class MainScreen(Screen):
                 Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
             except Exception as e:
                 Logger.error("on_activity_result (file): %s" % e)
-                self.status_label.text = "文件选择失败: %s" % str(e)[:40]
-                self.status_label.color = THEME['danger']
+                self._show_msg(f"文件选择失败: {str(e)[:40]}", THEME['danger'])
 
     def _on_file_selected(self, selection):
         if not selection:
@@ -2177,8 +2187,7 @@ class MainScreen(Screen):
         if path and os.path.exists(path):
             self._load_excel_path(path)
         elif path:
-            self.status_label.text = "文件不存在：%s" % path[:40]
-            self.status_label.color = THEME['danger']
+            self._show_msg(f"文件不存在：{path[:40]}", THEME['danger'])
 
     def _show_path_input_dialog(self):
         content = BoxLayout(orientation='vertical', spacing=8, padding=8)
@@ -2196,22 +2205,32 @@ class MainScreen(Screen):
         content.add_widget(load_btn)
         popup.open()
 
+    def _show_msg(self, msg, color=None, toast=True):
+        """在日志区域追加一条消息，同时可选显示Toast。用于非相机状态提示。"""
+        ts = get_system_date().strftime('%H:%M:%S')
+        line = f"[{ts}] {msg}"
+        self.camera_mgr._log_lines.append(line)
+        if len(self.camera_mgr._log_lines) > self.camera_mgr._max_log_lines:
+            self.camera_mgr._log_lines = self.camera_mgr._log_lines[-self.camera_mgr._max_log_lines:]
+        log_text = '\n'.join(self.camera_mgr._log_lines[-12:])
+        self.status_label.text = log_text
+        self.status_label.color = color if color else THEME['text_dim']
+        if toast and IS_ANDROID:
+            self.camera_mgr._toast(msg)
+
     def _load_excel_path(self, path):
         if not path or not os.path.exists(path):
-            self.status_label.text = "文件不存在！"
-            self.status_label.color = THEME['danger']
+            self._show_msg("文件不存在或路径无效", THEME['danger'])
             return
         self.excel_path = path
         try:
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
-            self.status_label.text = "✓ 已加载 %d 条记录" % len(self.rows)
-            self.status_label.color = THEME['success']
+            self._show_msg(f"✓ 已加载 {len(self.rows)} 条客户记录", THEME['success'])
             self._refresh_list()
         except Exception as e:
             err_msg = str(e)
-            self.status_label.text = "加载失败: %s" % err_msg[:80]
-            self.status_label.color = THEME['danger']
+            self._show_msg(f"加载失败: {err_msg[:60]}", THEME['danger'])
             Logger.error("Excel load failed: %s" % traceback.format_exc())
 
     def _refresh_list(self):
@@ -2252,9 +2271,6 @@ class MainScreen(Screen):
             keys.append((b, (ag + ap).strip()))
         done = self.progress_mgr.get_done_count(keys)
         self.progress_label.text = "%d/%d" % (done, total)
-        if total > 0:
-            self.status_label.text = "进度 %d/%d" % (done, total)
-            self.status_label.color = THEME['success'] if done == total else THEME['warning']
 
     def _on_search(self, instance, text=None):
         query = self.search_input.text.lower().strip()
@@ -2276,9 +2292,83 @@ class MainScreen(Screen):
         self._on_search(None, "")
 
     def _clear_debug_log(self, instance):
-        self.status_label.text = "日志已清空"
-        self.status_label.color = THEME['text_dim']
         self.camera_mgr._log_lines = []
+        try:
+            if self.camera_mgr._debug_log_path and os.path.exists(self.camera_mgr._debug_log_path):
+                os.remove(self.camera_mgr._debug_log_path)
+        except:
+            pass
+        self.status_label.text = "日志已清空\n底部日志区域：相机调试信息会显示在这里"
+        self.status_label.color = THEME['text_dim']
+
+    def _show_full_log(self, instance):
+        """打开全屏日志记事本，显示完整的调试日志内容"""
+        log_path = self.camera_mgr._debug_log_path if self.camera_mgr._debug_log_path else os.path.join(APP_DIR, "camera_debug.log")
+        log_content = ""
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    log_content = f.read()
+            except Exception as e:
+                log_content = f"读取日志文件失败: {e}"
+        else:
+            log_content = "暂无日志记录\n\n拍照操作后会在这里记录详细调试信息。"
+
+        if not log_content.strip():
+            log_content = "暂无日志记录\n\n拍照操作后会在这里记录详细调试信息。"
+
+        from kivy.uix.popup import Popup
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.button import Button
+        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.label import Label
+
+        content = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
+        scroll = ScrollView(do_scroll_x=False, do_scroll_y=True)
+        log_label = Label(
+            text=log_content,
+            font_size='11sp',
+            color=THEME['warning'],
+            halign='left', valign='top',
+            size_hint_y=None,
+            markup=False,
+            text_size=(None, None)
+        )
+        log_label.bind(texture_size=lambda i, v: setattr(i, 'height', v[1] + dp(10)))
+        log_label.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        scroll.add_widget(log_label)
+        content.add_widget(scroll)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        close_btn = Button(text="关闭", font_size='15sp', size_hint_x=0.5,
+                          background_color=(0.4, 0.4, 0.45, 1), background_normal='', color=(1,1,1,1))
+        copy_btn = Button(text="复制日志", font_size='15sp', size_hint_x=0.5,
+                         background_color=THEME['accent'], background_normal='', color=(1,1,1,1))
+        btn_row.add_widget(close_btn)
+        btn_row.add_widget(copy_btn)
+        content.add_widget(btn_row)
+
+        popup = Popup(title='📋 调试日志（拍照问题请截图此页）',
+                      content=content,
+                      size_hint=(0.95, 0.9))
+
+        def _close(instance):
+            popup.dismiss()
+        close_btn.bind(on_release=_close)
+
+        def _copy(instance):
+            try:
+                from kivy.core.clipboard import Clipboard
+                Clipboard.copy(log_content)
+                copy_btn.text = "已复制！"
+                copy_btn.background_color = THEME['success']
+                Clock.schedule_once(lambda dt: setattr(copy_btn, 'text', '复制日志'), 1.5)
+                Clock.schedule_once(lambda dt: setattr(copy_btn, 'background_color', THEME['accent']), 1.5)
+            except Exception as e:
+                copy_btn.text = "复制失败"
+
+        copy_btn.bind(on_release=_copy)
+        popup.open()
 
     def _update_log_label_size(self, instance, value):
         instance.height = max(dp(80), value[1] + dp(8))
@@ -2302,8 +2392,7 @@ class MainScreen(Screen):
         self._current_photo_type = photo_type
         self._continuous_shooting = True
         self._photos_in_session = 0
-        self.status_label.text = "正在启动相机（%s），按返回键可结束拍摄" % photo_type
-        self.status_label.color = THEME['warning']
+        self.camera_mgr._dbg(f"选择拍照类型: {photo_type}")
         Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.3)
 
     def _camera_status_update(self, msg):
@@ -2326,15 +2415,13 @@ class MainScreen(Screen):
     def _launch_next_photo(self):
         """拍完一张后立即重新调起相机，继续拍摄同一类型，用户按快门拍下一张。"""
         if self._continuous_shooting:
-            self.status_label.text = "准备下一张（%s）…按返回键结束" % self._current_photo_type
-            self.status_label.color = THEME['warning']
-            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.3)
+            self.camera_mgr._dbg(f"准备拍摄下一张（{self._current_photo_type}）…")
+            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.5)
 
     def _on_photo_done(self, photo_path):
         if photo_path is None:
             self._continuous_shooting = False
-            self.status_label.text = "拍照已取消"
-            self.status_label.color = THEME['text_dim']
+            self.camera_mgr._dbg("拍照已取消")
             self._refresh_row_done(self._current_row)
             return
 
@@ -2353,8 +2440,7 @@ class MainScreen(Screen):
         time_str = get_time_str()
         datetime_str = get_datetime_str()
 
-        self.status_label.text = "处理中 (%s-%02d)…" % (photo_type, self._photos_in_session)
-        self.status_label.color = THEME['warning']
+        self.camera_mgr._dbg("照片处理中...")
 
         config_data = self.config.data
         naming_segments = self.config.get('naming_segments', DEFAULT_CONFIG['naming_segments'])
@@ -2398,15 +2484,13 @@ class MainScreen(Screen):
     @mainthread
     def _on_photo_saved(self, row_index, filename):
         self._refresh_row_done(row_index)
-        self.status_label.text = "✓ %s 已保存" % filename[:28]
-        self.status_label.color = THEME['success']
+        self.camera_mgr._dbg(f"✓ 已保存: {filename}", show_toast=True)
         self._launch_next_photo()
 
     @mainthread
     def _on_photo_failed(self, err_msg):
         self._continuous_shooting = False
-        self.status_label.text = "保存失败: %s" % err_msg[:40]
-        self.status_label.color = THEME['danger']
+        self.camera_mgr._dbg(f"保存失败: {err_msg[:60]}", show_toast=True)
 
     def _refresh_row_done(self, row_index):
         if 0 <= row_index < len(self.row_widgets):
@@ -2424,8 +2508,7 @@ class MainScreen(Screen):
         key = self.progress_mgr._make_key(borrower, full_addr)
         photos = self.progress_mgr.get_photos(key)
         if not photos:
-            self.status_label.text = "暂无照片"
-            self.status_label.color = THEME['warning']
+            self._show_msg("该客户暂无照片", THEME['warning'])
             return
         popup = PhotoViewerPopup(row_index=row_index, photos=photos,
                                  delete_callback=self._on_delete_photo)
@@ -2450,8 +2533,7 @@ class MainScreen(Screen):
                 except:
                     pass
             self.progress_mgr.delete_all_photos(key)
-            self.status_label.text = "已删除该客户全部照片"
-            self.status_label.color = THEME['warning']
+            self._show_msg("已删除该客户全部照片", THEME['warning'])
         else:
             # 删除单张
             photos = self.progress_mgr.get_photos(key)
@@ -2463,11 +2545,11 @@ class MainScreen(Screen):
                 except:
                     pass
             self.progress_mgr.delete_photo(key, photo_index)
+            self._show_msg("照片已删除", THEME['warning'])
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
     def _generate_report(self, instance):
-        self.status_label.text = "报告功能暂未开放"
-        self.status_label.color = THEME['text_dim']
+        self._show_msg("报告功能暂未开放", toast=True)
 
 
 # ============================================================
@@ -2503,8 +2585,7 @@ class LoanPhotoApp(App):
                 main_screen = self.sm.get_screen('main')
                 if getattr(main_screen, '_continuous_shooting', False):
                     main_screen._continuous_shooting = False
-                    main_screen.status_label.text = "已结束连续拍照"
-                    main_screen.status_label.color = THEME['text_dim']
+                    main_screen.camera_mgr._dbg("已结束连续拍照", show_toast=True)
                     return True
                 self.sm.current = 'welcome'
                 return True
