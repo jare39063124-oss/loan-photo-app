@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.7.1
+资产盘点专项拍照工具 App - v3.7.2
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -932,11 +932,33 @@ class CameraManager:
     def __init__(self):
         self.photo_path = ""
         self.pending_callback = None
+        self.status_callback = None
         self.gps = GpsManager()
         self.geocoder = GeoCoder()
         self._camera_launched = False
         self._media_uri = None
         self._launch_attempts = 0
+        self._debug_log_path = ""
+
+    def _dbg(self, msg):
+        """Write debug message to log file and update UI status."""
+        ts = get_system_date().strftime('%H:%M:%S')
+        line = f"[{ts}] {msg}"
+        Logger.info("CAMDBG: %s", msg)
+        try:
+            if not self._debug_log_path:
+                self._debug_log_path = os.path.join(APP_DIR, "camera_debug.log")
+            os.makedirs(APP_DIR, exist_ok=True)
+            with open(self._debug_log_path, 'a', encoding='utf-8') as f:
+                f.write(line + "\n")
+        except:
+            pass
+        if self.status_callback:
+            try:
+                self.status_callback(line)
+            except:
+                pass
+        self._toast(msg)
 
     def _toast(self, msg):
         """Show a native Android Toast message."""
@@ -954,43 +976,64 @@ class CameraManager:
         except Exception as e:
             Logger.warning("Toast failed: %s", str(e)[:80])
 
-    def take_photo(self, callback):
-        """启动相机拍照，拍完后callback(photo_path)被调用，失败传None。"""
+    def take_photo(self, callback, status_callback=None):
+        """启动相机拍照，拍完后callback(photo_path)被调用，失败传None。
+        status_callback(msg) 用于实时更新UI状态。"""
         self.pending_callback = callback
+        self.status_callback = status_callback
         self._camera_launched = False
         self._media_uri = None
         self.photo_path = ""
+        self._dbg("开始拍照流程...")
         if IS_ANDROID:
-            self._request_camera_permission()
+            self._check_and_request_permission()
         else:
+            self._dbg("桌面测试模式")
             self._simulate_photo()
 
-    def _request_camera_permission(self):
+    def _check_and_request_permission(self):
+        """检查相机权限，有则直接启动相机；无则尝试请求，失败也直接启动（让系统处理）。"""
+        self._dbg("检查相机权限...")
+        has_perm = False
         try:
             from android.permissions import check_permission
-            cam_ok = check_permission('android.permission.CAMERA')
-            if cam_ok:
-                self._launch_camera_intent()
-                return
-        except:
-            pass
+            has_perm = check_permission('android.permission.CAMERA')
+            self._dbg(f"权限检查结果: {has_perm}")
+        except Exception as e:
+            self._dbg(f"check_permission导入失败: {str(e)[:60]}，直接尝试启动")
+            has_perm = False
+
+        if has_perm:
+            self._dbg("已有相机权限，启动相机")
+            self._launch_camera_intent()
+            return
+
+        self._dbg("请求相机权限...")
         try:
             request_permissions(
                 [Permission.CAMERA],
                 self._on_permission_result
             )
-        except:
+            self._dbg("权限请求已发送（等待用户授权弹窗）")
+            Clock.schedule_once(self._permission_timeout, 5)
+        except Exception as e:
+            self._dbg(f"request_permissions失败: {str(e)[:80]}，直接启动")
+            self._launch_camera_intent()
+
+    def _permission_timeout(self, dt):
+        """5秒后如果还没启动相机，说明权限弹窗可能没出现，直接尝试启动。"""
+        if not self._camera_launched and self.pending_callback:
+            self._dbg("权限请求超时（5秒未响应），直接尝试启动相机")
             self._launch_camera_intent()
 
     def _on_permission_result(self, permissions, grants):
+        self._dbg(f"权限回调: perms={permissions}, grants={grants}")
         if any(grants):
+            self._dbg("用户已授权，启动相机")
             self._launch_camera_intent()
         else:
-            self._toast("相机权限被拒绝，无法拍照")
-            if self.pending_callback:
-                cb = self.pending_callback
-                self.pending_callback = None
-                cb(None)
+            self._dbg("相机权限被拒绝，尝试直接启动")
+            self._launch_camera_intent()
 
     def _launch_camera_intent(self):
         """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机。
@@ -1013,8 +1056,7 @@ class CameraManager:
 
                 activity = PythonActivity.mActivity
                 if activity is None:
-                    Logger.error("Camera: activity is None")
-                    self._toast("错误：无法获取Activity")
+                    self._dbg("错误：无法获取Activity")
                     if self.pending_callback:
                         cb = self.pending_callback
                         self.pending_callback = None
@@ -1023,7 +1065,7 @@ class CameraManager:
                 package_name = activity.getPackageName()
                 resolver = activity.getContentResolver()
 
-                self._toast("正在启动相机...")
+                self._dbg("正在启动相机Intent...")
 
                 photo_fname = f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
                 cache_dir = activity.getExternalCacheDir()
@@ -1038,14 +1080,12 @@ class CameraManager:
                 uri = None
                 uri_type = "none"
 
-                # ---------- 策略1：file:// URI（小米/HyperOS最可靠，优先使用）----------
                 try:
                     photo_file = File(self.photo_path)
                     if photo_file.exists():
                         photo_file.delete()
                     photo_file.createNewFile()
                     self._media_uri = None
-
                     try:
                         StrictMode = autoclass('android.os.StrictMode')
                         VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
@@ -1055,14 +1095,12 @@ class CameraManager:
                         StrictMode.setVmPolicy(policy)
                     except:
                         pass
-
                     uri = Uri.fromFile(photo_file)
                     uri_type = "file"
-                    Logger.info("Camera: Strategy 1 - file:// URI: %s", self.photo_path)
+                    self._dbg("URI策略: file:// (app cache)")
                 except Exception as e:
-                    Logger.warning("Camera: file:// URI failed: %s", str(e)[:100])
+                    self._dbg(f"file:// URI失败: {str(e)[:80]}")
 
-                # ---------- 策略2：MediaStore（Android 10+）----------
                 if uri is None and ANDROID_API >= 29:
                     try:
                         ContentValues = autoclass('android.content.ContentValues')
@@ -1076,13 +1114,12 @@ class CameraManager:
                             self.photo_path = None
                             self._media_uri = uri
                             uri_type = "MediaStore"
-                            Logger.info("Camera: Strategy 2 - MediaStore URI")
+                            self._dbg("URI策略: MediaStore content://")
                         else:
-                            Logger.warning("Camera: MediaStore insert returned null")
+                            self._dbg("MediaStore返回null")
                     except Exception as e:
-                        Logger.warning("Camera: MediaStore failed: %s", str(e)[:100])
+                        self._dbg(f"MediaStore失败: {str(e)[:80]}")
 
-                # ---------- 策略3：FileProvider ----------
                 if uri is None:
                     try:
                         photo_file = File(self.photo_path)
@@ -1090,30 +1127,22 @@ class CameraManager:
                             photo_file.delete()
                         photo_file.createNewFile()
                         self._media_uri = None
-
-                        provider_classes = [
-                            'androidx.core.content.FileProvider',
-                            'android.support.v4.content.FileProvider',
-                        ]
-                        for fp_cls_name in provider_classes:
+                        for fp_cls_name in ['androidx.core.content.FileProvider', 'android.support.v4.content.FileProvider']:
                             try:
                                 FileProvider = autoclass(fp_cls_name)
-                                test_uri = FileProvider.getUriForFile(
-                                    activity, package_name + ".fileprovider", photo_file
-                                )
+                                test_uri = FileProvider.getUriForFile(activity, package_name + ".fileprovider", photo_file)
                                 if test_uri is not None:
                                     uri = test_uri
                                     uri_type = "FileProvider"
-                                    Logger.info("Camera: Strategy 3 - FileProvider (%s)", fp_cls_name)
+                                    self._dbg(f"URI策略: FileProvider ({fp_cls_name})")
                                     break
                             except Exception as e:
-                                Logger.warning("Camera: FileProvider %s failed: %s", fp_cls_name, str(e)[:80])
+                                self._dbg(f"FileProvider {fp_cls_name}失败: {str(e)[:60]}")
                     except Exception as e:
-                        Logger.warning("Camera: FileProvider strategy failed: %s", str(e)[:100])
+                        self._dbg(f"FileProvider策略失败: {str(e)[:80]}")
 
                 if uri is None:
-                    Logger.error("Camera: All URI strategies failed!")
-                    self._toast("错误：无法创建照片文件")
+                    self._dbg("错误：所有URI策略均失败！")
                     if self.pending_callback:
                         cb = self.pending_callback
                         self.pending_callback = None
@@ -1121,76 +1150,64 @@ class CameraManager:
                     return
 
                 intent.putExtra("output", uri)
+                self._dbg(f"照片输出URI已设置(type={uri_type})")
 
-                # 授予URI权限给所有能处理此Intent的相机应用
                 try:
                     pm = activity.getPackageManager()
                     resolves = pm.queryIntentActivities(intent, 0)
                     if resolves is not None and resolves.size() > 0:
-                        Logger.info("Camera: Found %d camera app(s)", resolves.size())
-                        self._toast(f"找到{resolves.size()}个相机应用，启动中...")
+                        self._dbg(f"找到{resolves.size()}个相机应用")
                         for i in range(resolves.size()):
                             try:
-                                resolve_info = resolves.get(i)
-                                pkg = resolve_info.activityInfo.packageName
+                                ri = resolves.get(i)
+                                pkg = ri.activityInfo.packageName
                                 activity.grantUriPermission(pkg, uri,
                                     Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             except:
                                 pass
                     else:
-                        Logger.warning("Camera: queryIntentActivities returned 0, trying startActivity anyway...")
+                        self._dbg("queryIntentActivities返回0(Android11+可见性)，继续启动...")
                 except Exception as e:
-                    Logger.warning("Camera: resolve check failed: %s", str(e)[:80])
+                    self._dbg(f"resolve检查异常: {str(e)[:60]}")
 
                 self._camera_launched = True
+                launched = False
 
-                # 使用 createChooser 确保系统弹出相机选择器（解决HyperOS等定制ROM阻止隐式Intent的问题）
                 try:
                     chooser_intent = Intent.createChooser(intent, "选择相机应用")
                     chooser_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     chooser_intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                     activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
-                    Logger.info("Camera: Intent launched via createChooser, URI type: %s (attempt %d)", uri_type, self._launch_attempts)
+                    launched = True
+                    self._dbg("相机已启动(createChooser)")
                 except ActivityNotFoundException as e:
-                    Logger.error("Camera: ActivityNotFoundException: %s", str(e)[:200])
-                    self._toast("错误：未找到相机应用")
+                    self._dbg("错误：系统未找到相机应用(ActivityNotFound)")
                     self._camera_launched = False
+                except Exception as e:
+                    self._dbg(f"createChooser失败({str(e)[:60]})，尝试直接启动...")
+                    try:
+                        activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
+                        launched = True
+                        self._dbg("相机已启动(direct)")
+                    except ActivityNotFoundException as e2:
+                        self._dbg("错误：系统无相机应用")
+                        self._camera_launched = False
+                    except Exception as e2:
+                        self._dbg(f"startActivity失败: {str(e2)[:100]}")
+                        self._dbg(traceback.format_exc().split('\n')[-3] if traceback.format_exc() else "")
+                        self._camera_launched = False
+
+                if not launched:
                     if self.pending_callback:
                         cb = self.pending_callback
                         self.pending_callback = None
                         Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
                     return
-                except Exception as e:
-                    # createChooser 失败时，尝试直接启动
-                    Logger.warning("Camera: createChooser failed (%s), trying direct startActivity...", str(e)[:100])
-                    try:
-                        activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
-                        Logger.info("Camera: Intent launched directly, URI type: %s", uri_type)
-                    except ActivityNotFoundException as e2:
-                        Logger.error("Camera: No camera app found: %s", str(e2)[:200])
-                        self._toast("错误：系统无相机应用")
-                        self._camera_launched = False
-                        if self.pending_callback:
-                            cb = self.pending_callback
-                            self.pending_callback = None
-                            Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
-                        return
-                    except Exception as e2:
-                        Logger.error("Camera: startActivity failed: %s", str(e2)[:200])
-                        Logger.error(traceback.format_exc())
-                        self._toast(f"相机启动失败：{str(e2)[:60]}")
-                        self._camera_launched = False
-                        if self.pending_callback:
-                            cb = self.pending_callback
-                            self.pending_callback = None
-                            Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
-                        return
 
             except Exception as e:
-                Logger.error("Camera launch failed: %s" % e)
+                self._dbg(f"相机启动异常: {str(e)[:100]}")
                 Logger.error(traceback.format_exc())
                 self._camera_launched = False
-                self._toast(f"相机错误：{str(e)[:60]}")
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
@@ -1200,13 +1217,13 @@ class CameraManager:
 
     def on_camera_result(self, result_code):
         """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。"""
+        self._dbg(f"收到相机结果: result_code={result_code}, launched={self._camera_launched}")
         if not self._camera_launched:
             return
         self._camera_launched = False
         if result_code == -1:  # RESULT_OK
-            # 处理 MediaStore URI：通过 content resolver 打开输入流，复制到应用目录
             if self._media_uri is not None:
-                copied_path = None
+                self._dbg("处理MediaStore返回的照片...")
                 try:
                     from jnius import autoclass
                     PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -1217,7 +1234,6 @@ class CameraManager:
                     dest_path = os.path.join(
                         APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
                     )
-                    # 用 Python 方式复制（通过 Java 字节数组中转）
                     ByteArrayOutputStream = autoclass('java.io.ByteArrayOutputStream')
                     baos = ByteArrayOutputStream()
                     buf = bytearray(8192)
@@ -1231,11 +1247,9 @@ class CameraManager:
                         f.write(bytes(baos.toByteArray()))
                     baos.close()
                     self.photo_path = dest_path
-                    copied_path = dest_path
-                    Logger.info("Camera: MediaStore copied to %s (%d bytes)", dest_path, os.path.getsize(dest_path))
+                    self._dbg(f"MediaStore照片已保存: {os.path.getsize(dest_path)} bytes")
                 except Exception as e:
-                    Logger.error("Camera: MediaStore copy failed: %s", str(e)[:200])
-                    Logger.error(traceback.format_exc())
+                    self._dbg(f"MediaStore复制失败: {str(e)[:100]}")
                     self._media_uri = None
                     if self.pending_callback:
                         cb = self.pending_callback
@@ -1245,13 +1259,16 @@ class CameraManager:
                 self._media_uri = None
 
             if self.photo_path and os.path.exists(self.photo_path) and os.path.getsize(self.photo_path) > 0:
+                self._dbg(f"照片OK: {os.path.getsize(self.photo_path)} bytes")
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
                     cb(self.photo_path)
                 return
             else:
-                Logger.warning("Camera: photo file not found or empty: %s", self.photo_path)
+                self._dbg(f"照片文件不存在或为空: {self.photo_path}")
+        else:
+            self._dbg("用户取消拍照或相机返回失败")
         if self.pending_callback:
             cb = self.pending_callback
             self.pending_callback = None
@@ -2206,14 +2223,21 @@ class MainScreen(Screen):
         self._photos_in_session = 0
         self.status_label.text = "正在启动相机（%s），按返回键可结束拍摄" % photo_type
         self.status_label.color = THEME['warning']
-        Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.3)
+        Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.3)
+
+    def _camera_status_update(self, msg):
+        """CameraManager回调：更新UI状态显示调试信息"""
+        def _update(dt):
+            self.status_label.text = msg
+            self.status_label.color = THEME['warning']
+        Clock.schedule_once(_update, 0)
 
     def _launch_next_photo(self):
         """拍完一张后立即重新调起相机，继续拍摄同一类型，用户按快门拍下一张。"""
         if self._continuous_shooting:
             self.status_label.text = "准备下一张（%s）…按返回键结束" % self._current_photo_type
             self.status_label.color = THEME['warning']
-            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done), 0.3)
+            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.3)
 
     def _on_photo_done(self, photo_path):
         if photo_path is None:
