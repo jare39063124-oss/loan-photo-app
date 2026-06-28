@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.10.0
+资产盘点专项拍照工具 App - v3.10.1
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -979,7 +979,8 @@ class CameraManager:
             Toast = autoclass('android.widget.Toast')
             activity = PythonActivity.mActivity
             if activity:
-                toast = Toast.makeText(activity, msg, Toast.LENGTH_LONG)
+                LENGTH_LONG = 1
+                toast = Toast.makeText(activity, msg, LENGTH_LONG)
                 toast.show()
         except Exception as e:
             Logger.warning("Toast failed: %s", str(e)[:80])
@@ -1047,7 +1048,11 @@ class CameraManager:
         Clock.schedule_once(_handle, 0)
 
     def _launch_camera_intent(self):
-        """通过 Android Intent.ACTION_IMAGE_CAPTURE 调用系统相机。
+        """通过 Android Intent 调用系统相机。
+        v3.10.1 修复：
+        - 关键Bug修复：ACTION_IMAGE_CAPTURE不是Intent类常量，而是MediaStore类常量
+          导致pyjnius反射失败AttributeError，相机完全无法启动
+        - 所有Android常量改为直接使用字符串/整数值，避免pyjnius反射问题
         v3.10.0 修复：
         - 底部日志面板高度增大到200dp，显示更多行
         - 新增「📋 完整日志」按钮，打开全屏日志记事本查看历史记录
@@ -1085,6 +1090,11 @@ class CameraManager:
                     Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
                 return
 
+            ACTION_IMAGE_CAPTURE = "android.media.action.IMAGE_CAPTURE"
+            EXTRA_OUTPUT = "output"
+            FLAG_GRANT_READ_URI_PERMISSION = 1
+            FLAG_GRANT_WRITE_URI_PERMISSION = 2
+
             try:
                 raw_activity = PythonActivity.mActivity
                 if raw_activity is None:
@@ -1110,9 +1120,9 @@ class CameraManager:
                 self.photo_path = os.path.join(save_dir, photo_fname)
                 self._dbg(f"保存目录: ...{save_dir[-30:]}")
 
-                intent = Intent(Intent.ACTION_IMAGE_CAPTURE)
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                intent = Intent(ACTION_IMAGE_CAPTURE)
+                intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
 
                 uri = None
                 uri_type = "none"
@@ -1191,10 +1201,7 @@ class CameraManager:
                         Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
                     return
 
-                if uri_type == "MediaStore" and MediaStore_Images is not None:
-                    intent.putExtra(MediaStore_Images.EXTRA_OUTPUT, uri)
-                else:
-                    intent.putExtra("output", uri)
+                intent.putExtra(EXTRA_OUTPUT, uri)
                 self._dbg(f"URI已设置(type={uri_type})")
 
                 try:
@@ -1207,7 +1214,7 @@ class CameraManager:
                                 ri = resolves.get(i)
                                 pkg = ri.activityInfo.packageName
                                 activity.grantUriPermission(pkg, uri,
-                                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    FLAG_GRANT_WRITE_URI_PERMISSION | FLAG_GRANT_READ_URI_PERMISSION)
                             except:
                                 pass
                     else:
@@ -1236,8 +1243,8 @@ class CameraManager:
                     self._dbg("直接启动失败，尝试通过选择器启动...")
                     try:
                         chooser_intent = Intent.createChooser(intent, "选择相机应用")
-                        chooser_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        chooser_intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                        chooser_intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                        chooser_intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
                         activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
                         launched = True
                         self._camera_launched = True
@@ -1437,7 +1444,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.10.0", font_size='12sp',
+            text="v3.10.1", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -2131,15 +2138,21 @@ class MainScreen(Screen):
             Intent = autoclass('android.content.Intent')
             activity = PythonActivity.mActivity
 
-            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
-            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            ACTION_OPEN_DOCUMENT = "android.intent.action.OPEN_DOCUMENT"
+            CATEGORY_OPENABLE = "android.intent.category.OPENABLE"
+            EXTRA_MIME_TYPES = "android.intent.extra.MIME_TYPES"
+            FLAG_GRANT_READ_URI_PERMISSION = 1
+            FLAG_GRANT_PERSISTABLE_URI_PERMISSION = 64
+
+            intent = Intent(ACTION_OPEN_DOCUMENT)
+            intent.addCategory(CATEGORY_OPENABLE)
             intent.setType("*/*")
-            intent.putExtra(Intent.EXTRA_MIME_TYPES, [
+            intent.putExtra(EXTRA_MIME_TYPES, [
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 "application/vnd.ms-excel",
             ])
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
             self._android_file_picker_code = 0x1001
             activity.startActivityForResult(intent, self._android_file_picker_code)
@@ -2165,10 +2178,9 @@ class MainScreen(Screen):
 
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 activity = PythonActivity.mActivity
-                Intent = autoclass('android.content.Intent')
                 resolver = activity.getContentResolver()
                 try:
-                    take_flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    take_flags = 1
                     resolver.takePersistableUriPermission(uri, take_flags)
                 except:
                     pass
