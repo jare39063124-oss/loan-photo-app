@@ -6,9 +6,9 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf,xml
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
-version = 3.17.0
+version = 3.18.1
 
-requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
+requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius,requests,certifi,urllib3
 
 android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_MEDIA_IMAGES,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 android.api = 35
@@ -20,6 +20,7 @@ android.arch = arm64-v8a
 android.gradle_dependencies = androidx.core:core:1.12.0
 android.gradle_manifest_items = android:exported="true"
 android.add_resources = res
+android.extra_manifest_application_xml = res/extra_manifest_application.xml
 
 fullscreen = 0
 orientation = portrait

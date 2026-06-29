@@ -1,7 +1,13 @@
 """
 地名解析模块
-- 优先使用高德地图逆地理编码 API（需联网）
-- 离线 fallback：内置中国区县坐标表 + 最近邻匹配
+v3.18.1: 支持多源解析：
+  1. Android 系统 Geocoder（无需 key，小米/华为等国产机通常接入百度/高德后端）
+  2. 用户配置的在线地图 API（高德 / 百度，需用户配置 key）
+  3. 离线 fallback：内置中国区县坐标表 + 最近邻匹配
+
+说明：小米自带相机水印上的文字地址，本质上就是系统通过百度/高德服务把 GPS 坐标
+反解成地址文字。我们在 App 中通过 Android Geocoder 即可复用同一份系统能力，
+无需集成百度地图 SDK（用户只要文字信息）。
 """
 
 import os
@@ -9,7 +15,6 @@ import json
 import math
 import requests
 import logging
-from datetime import datetime
 
 # 安全日志：优先用 kivy.logger，回退到标准 logging（避免 NameError 闪退）
 try:
@@ -17,19 +22,18 @@ try:
 except Exception:
     Logger = logging.getLogger("geocoder")
 
-# 高德地图 API Key（用户可自行申请替换）
-# 免费额度：每天 5000 次
-AMAP_API_KEY = "YOUR_AMAP_KEY_HERE"
+# 高德地图逆地理编码 API
+AMAP_API_KEY = ""
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/regeo"
+
+# 百度地图逆地理编码 API
+BAIDU_API_KEY = ""
+BAIDU_GEOCODE_URL = "https://api.map.baidu.com/reverse_geocoding/v3/"
 
 # 离线数据文件路径
 OFFLINE_DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'locations.json')
 
-
-# ============================================================
 # 离线区县坐标数据库（精简版，覆盖全国主要区县）
-# 格式: {"name": "北京市海淀区", "lng": 116.298, "lat": 39.959}
-# ============================================================
 DEFAULT_LOCATIONS = [
     # 北京
     {"name": "北京市东城区", "lng": 116.418, "lat": 39.929},
@@ -335,15 +339,18 @@ DEFAULT_LOCATIONS = [
 class GeoCoder:
     """
     地名解析：将 GPS 坐标转换为地名
-    策略：
-    1. 优先调用高德逆地理编码 API（精准，需联网）
-    2. API 失败时用离线数据库做最近邻匹配
+    策略（按优先级）：
+    1. Android 系统 Geocoder（无需 key，小米/华为等国产机通常接入百度/高德后端）
+    2. 用户配置的在线地图 API（高德/百度）
+    3. 离线数据库最近邻匹配
     """
 
-    def __init__(self, api_key=None):
-        self.api_key = api_key or AMAP_API_KEY
+    def __init__(self, amap_key=None, baidu_key=None, provider="auto"):
+        self.amap_key = amap_key or AMAP_API_KEY
+        self.baidu_key = baidu_key or BAIDU_API_KEY
+        self.provider = provider  # "auto", "amap", "baidu", "android", "offline"
         self.offline_locations = self._load_offline_db()
-        self._cache = {}  # 缓存最近的查询结果
+        self._cache = {}
 
     def _load_offline_db(self):
         """加载离线位置数据库"""
@@ -358,53 +365,202 @@ class GeoCoder:
     def reverse_geocode(self, lng, lat):
         """
         逆地理编码：经纬度 -> 地名
-        返回: "省市区" 或 "详细地址"
+        返回: "省市区详细地址" 或 None
         """
-        # 尝试缓存
-        cache_key = f"{lng:.3f},{lat:.3f}"
+        try:
+            lng = float(lng)
+            lat = float(lat)
+        except Exception:
+            return None
+
+        cache_key = f"{lng:.5f},{lat:.5f}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        # 优先 API
-        if self.api_key and self.api_key != "YOUR_AMAP_KEY_HERE":
-            result = self._api_reverse(lng, lat)
-            if result:
-                self._cache[cache_key] = result
-                return result
+        result = None
 
-        # Fallback: 离线最近邻
-        result = self._offline_nearest(lng, lat)
-        self._cache[cache_key] = result
+        # 1. Android 系统 Geocoder（无需 key，优先使用；小米/华为通常接入百度/高德后端）
+        if not result and self.provider in ("auto", "android"):
+            result = self._android_geocoder(lng, lat)
+
+        # 2. 在线 API（用户配置了 key 才使用）
+        if not result and self.provider in ("auto", "amap") and self.amap_key and self.amap_key != "YOUR_AMAP_KEY_HERE":
+            result = self._api_reverse_amap(lng, lat)
+        if not result and self.provider in ("auto", "baidu") and self.baidu_key and self.baidu_key != "YOUR_BAIDU_KEY_HERE":
+            result = self._api_reverse_baidu(lng, lat)
+
+        # 3. 离线最近邻
+        if not result:
+            result = self._offline_nearest(lng, lat)
+
+        if result:
+            self._cache[cache_key] = result
         return result
 
-    def _api_reverse(self, lng, lat):
-        """调用高德逆地理编码 API"""
+    def _api_reverse_amap(self, lng, lat):
+        """调用高德逆地理编码 API（带一次重试）"""
+        for attempt in range(2):
+            try:
+                params = {
+                    "key": self.amap_key,
+                    "location": f"{lng},{lat}",
+                    "extensions": "base",
+                    "output": "JSON",
+                }
+                resp = requests.get(AMAP_GEOCODE_URL, params=params, timeout=5)
+                data = resp.json()
+                if data.get("status") == "1" and data.get("regeocode"):
+                    formatted = data["regeocode"].get("formatted_address", "")
+                    if formatted:
+                        return formatted
+                    addr = data["regeocode"].get("addressComponent", {})
+                    province = addr.get("province", "")
+                    city = addr.get("city", "")
+                    district = addr.get("district", "")
+                    if not city and province:
+                        city = province
+                    return f"{province}{city}{district}"
+                break
+            except Exception as e:
+                Logger.warning(f"GeoCoder AMap API 尝试{attempt + 1}失败: {e}")
+                if attempt == 0:
+                    import time
+                    time.sleep(0.5)
+        return None
+
+    def _api_reverse_baidu(self, lng, lat):
+        """调用百度逆地理编码 API（带一次重试 + WGS-84 转 BD-09）
+        Android GPS 返回的通常是 WGS-84。百度对 WGS-84 支持区县级别解析；
+        若用户配置了 AK，先把 WGS-84 转成 BD-09 再请求，门牌级精度更高。
+        """
+        for attempt in range(2):
+            try:
+                # WGS-84 -> GCJ-02 -> BD-09，提升百度解析精度
+                gcj_lng, gcj_lat = self._wgs84_to_gcj02(lng, lat)
+                bd_lng, bd_lat = self._gcj02_to_bd09(gcj_lng, gcj_lat)
+                params = {
+                    "ak": self.baidu_key,
+                    "location": f"{bd_lat},{bd_lng}",
+                    "output": "json",
+                    "coordtype": "bd09ll",
+                }
+                resp = requests.get(BAIDU_GEOCODE_URL, params=params, timeout=5)
+                data = resp.json()
+                if data.get("status") == 0 and data.get("result"):
+                    result = data["result"]
+                    formatted = result.get("formatted_address", "")
+                    if formatted:
+                        return formatted
+                    comp = result.get("addressComponent", {})
+                    province = comp.get("province", "")
+                    city = comp.get("city", "")
+                    district = comp.get("district", "")
+                    street = comp.get("street", "")
+                    return f"{province}{city}{district}{street}"
+                break
+            except Exception as e:
+                Logger.warning(f"GeoCoder Baidu API 尝试{attempt + 1}失败: {e}")
+                if attempt == 0:
+                    import time
+                    time.sleep(0.5)
+        return None
+
+    @staticmethod
+    def _wgs84_to_gcj02(lng, lat):
+        """WGS-84 转 GCJ-02（火星坐标）"""
+        if GeoCoder._out_of_china(lng, lat):
+            return lng, lat
+        dlat = GeoCoder._transform_lat(lng - 105.0, lat - 35.0)
+        dlng = GeoCoder._transform_lng(lng - 105.0, lat - 35.0)
+        radlat = lat / 180.0 * math.pi
+        magic = math.sin(radlat)
+        magic = 1 - 0.00669342162296594323 * magic * magic
+        sqrtmagic = math.sqrt(magic)
+        dlat = (dlat * 180.0) / ((6378245.0 * (1 - 0.00669342162296594323)) / (magic * sqrtmagic) * math.pi)
+        dlng = (dlng * 180.0) / (6378245.0 / sqrtmagic * math.cos(radlat) * math.pi)
+        return lng + dlng, lat + dlat
+
+    @staticmethod
+    def _gcj02_to_bd09(lng, lat):
+        """GCJ-02 转 BD-09（百度坐标）"""
+        x = lng
+        y = lat
+        z = math.sqrt(x * x + y * y) + 0.00002 * math.sin(y * math.pi * 3000.0 / 180.0)
+        theta = math.atan2(y, x) + 0.000003 * math.cos(x * math.pi * 3000.0 / 180.0)
+        bd_lng = z * math.cos(theta) + 0.0065
+        bd_lat = z * math.sin(theta) + 0.006
+        return bd_lng, bd_lat
+
+    @staticmethod
+    def _transform_lat(lng, lat):
+        ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * math.sqrt(abs(lng))
+        ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 * math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(lat * math.pi) + 40.0 * math.sin(lat / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(lat / 12.0 * math.pi) + 320 * math.sin(lat * math.pi / 30.0)) * 2.0 / 3.0
+        return ret
+
+    @staticmethod
+    def _transform_lng(lng, lat):
+        ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
+        ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 * math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(lng * math.pi) + 40.0 * math.sin(lng / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(lng / 12.0 * math.pi) + 300.0 * math.sin(lng / 30.0 * math.pi)) * 2.0 / 3.0
+        return ret
+
+    @staticmethod
+    def _out_of_china(lng, lat):
+        return lng < 72.004 or lng > 137.8347 or lat < 0.8293 or lat > 55.8271
+
+    def _android_geocoder(self, lng, lat):
+        """调用 Android 系统 Geocoder（无需 API key）
+        小米/华为等国产 ROM 通常会把 Geocoder 后端接到百度或高德，
+        因此无需额外 key 也能拿到中文地址。
+        """
         try:
-            params = {
-                "key": self.api_key,
-                "location": f"{lng},{lat}",
-                "extensions": "base",
-                "output": "JSON",
-            }
-            resp = requests.get(AMAP_GEOCODE_URL, params=params, timeout=5)
-            data = resp.json()
-            if data.get("status") == "1" and data.get("regeocode"):
-                addr = data["regeocode"].get("addressComponent", {})
-                province = addr.get("province", "")
-                city = addr.get("city", "")
-                district = addr.get("district", "")
-                # 直辖市可能 city 为空
-                if not city and province:
-                    city = province
-                # 拼接省市区
-                location = f"{province}{city}{district}"
-                # 如果有 formatted_address 更好
-                formatted = data["regeocode"].get("formatted_address", "")
-                if formatted:
-                    return formatted
-                return location
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+            if activity is None:
+                return None
+            Geocoder = autoclass('android.location.Geocoder')
+            if not Geocoder.isPresent():
+                Logger.warning("GeoCoder: 系统 Geocoder 不可用")
+                return None
+
+            Locale = autoclass('java.util.Locale')
+            gc = Geocoder(activity, Locale.CHINA)
+            # 部分 ROM 第一次调用可能超时，重试 2 次
+            for attempt in range(2):
+                try:
+                    addresses = gc.getFromLocation(float(lat), float(lng), 1)
+                    if addresses and addresses.size() > 0:
+                        addr = addresses.get(0)
+                        # 优先取完整地址行
+                        try:
+                            full = addr.getAddressLine(0)
+                            if full:
+                                return str(full)
+                        except Exception:
+                            pass
+                        # 回退：拼接省市区街道门牌
+                        parts = []
+                        for method in ['getAdminArea', 'getLocality', 'getSubLocality',
+                                       'getThoroughfare', 'getSubThoroughfare']:
+                            try:
+                                part = getattr(addr, method)()
+                                if part:
+                                    parts.append(str(part))
+                            except Exception:
+                                pass
+                        if parts:
+                            return "".join(parts)
+                except Exception as e:
+                    Logger.warning(f"GeoCoder Android Geocoder 尝试{attempt + 1}失败: {e}")
+                    if attempt == 0:
+                        import time
+                        time.sleep(0.3)
         except Exception as e:
-            Logger.error(f"GeoCoder API: {e}")
+            Logger.error(f"GeoCoder Android Geocoder: {e}")
         return None
 
     def _offline_nearest(self, lng, lat):
@@ -422,7 +578,6 @@ class GeoCoder:
                 nearest = loc
 
         if nearest:
-            # 如果距离太远（>100km），只返回城市级别
             if min_dist > 100:
                 return nearest["name"][:2] + "附近"
             return nearest["name"]
@@ -431,7 +586,7 @@ class GeoCoder:
     @staticmethod
     def _haversine(lng1, lat1, lng2, lat2):
         """计算两点间距离（km）"""
-        R = 6371  # 地球半径
+        R = 6371
         dlat = math.radians(lat2 - lat1)
         dlng = math.radians(lng2 - lng1)
         a = (math.sin(dlat / 2) ** 2 +
@@ -453,7 +608,6 @@ class GeoCoder:
 if __name__ == "__main__":
     gc = GeoCoder()
 
-    # 测试离线匹配
     print("=== 离线定位测试 ===")
     tests = [
         (116.407, 39.904, "北京天安门附近"),

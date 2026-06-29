@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.17.0
+资产盘点专项拍照工具 App - v3.18.1
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -528,10 +528,14 @@ class ProgressManager:
 
     def save(self):
         try:
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
             with open(self.filepath, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            Logger.info(f"ProgressManager.save: 已保存 {len(self.data)} 条记录到 {self.filepath}")
         except Exception as e:
-            Logger.error(f"ProgressManager.save: {e}")
+            Logger.error(f"ProgressManager.save: 保存失败 {e}")
 
     def mark_photo(self, key, photo_path, photo_type=""):
         """key = _make_key(borrower, address_general, address_precise)"""
@@ -673,41 +677,44 @@ class ExcelWriter:
         """保存备注到指定行（1-based row_index）的 E 列
         row_index: Excel 中的行号（含表头，从1开始）
         remark_text: 备注文本
+        返回: (bool, str) 是否成功, 人类可读提示
         """
         import shutil
-        # 方式1：直接写入原文件（使用临时文件避免损坏）
+        work_copy = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path))
+        os.makedirs(os.path.dirname(work_copy), exist_ok=True)
+
+        # 方式1：直接写入原文件（临时文件放在 APP_DIR，避免外部目录不可写）
         try:
             wb = openpyxl.load_workbook(file_path)
             ws = wb.active
             ws.cell(row=row_index, column=5, value=remark_text)
-            tmp = file_path + '.tmp'
+            tmp = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path) + '.tmp')
             wb.save(tmp)
             wb.close()
             shutil.move(tmp, file_path)
             Logger.info(f"save_remark: 直接写入成功 行{row_index}")
-            return True
+            return True, "已保存到 Excel"
         except Exception as e1:
             Logger.error(f"save_remark直接写入失败: {e1}")
-        # 方式2：复制到app私有目录再写入，然后复制回原路径
+
+        # 方式2：复制到 app 私有目录再写入，然后尝试复制回原路径
         try:
-            work_copy = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path))
-            os.makedirs(os.path.dirname(work_copy), exist_ok=True)
             shutil.copy2(file_path, work_copy)
             wb = openpyxl.load_workbook(work_copy)
             ws = wb.active
             ws.cell(row=row_index, column=5, value=remark_text)
             wb.save(work_copy)
             wb.close()
-            # 尝试复制回原路径
             try:
                 shutil.copy2(work_copy, file_path)
                 Logger.info(f"save_remark: 通过工作副本写入成功 行{row_index}")
+                return True, "已保存到 Excel"
             except Exception as e3:
                 Logger.error(f"save_remark: 无法复制回原路径({e3})，副本保留在 {work_copy}")
-            return True
+                return True, f"原 Excel 受系统保护无法直接写入，已保存到工作副本：{work_copy}"
         except Exception as e2:
             Logger.error(f"save_remark工作副本写入也失败: {e2}")
-            return False
+            return False, f"Excel 保存失败：{e2}"
 
     @staticmethod
     def save_all_remarks(file_path, remarks):
@@ -823,80 +830,111 @@ class PhotoProcessor:
     """水印、命名、保存"""
 
     @staticmethod
-    def build_watermark_text(segments, **kwargs):
-        """根据水印段配置生成水印文本（X-X-X 格式）
+    def build_watermark_lines(segments, **kwargs):
+        """根据段选择生成水印文字列表，每段一行。
         segments: ["经纬度"/"拍摄时间"/"地址名"/"空值", ...]
         kwargs: time_str(拍摄时间), address(地址), lat, lng(经纬度)
-        v3.16.0: 无GPS坐标时显示"定位中"（按设置完整输出，不省略段）
+        v3.18.0: 返回 [(段标签, 段文字), ...]，便于分行渲染，避免显示不全。
         """
         lat = kwargs.get('lat', '')
         lng = kwargs.get('lng', '')
         has_gps = bool(lat and lng)
-        parts = []
+        lines = []
         for seg in segments:
+            label = ""
             val = ""
             if seg == "经纬度":
+                label = "GPS"
                 if has_gps:
                     val = "%s,%s" % (lng, lat)
                 else:
                     val = "定位中"
             elif seg == "拍摄时间":
+                label = "TIME"
                 val = kwargs.get('time_str', '')
+                if not val:
+                    val = "--"
             elif seg == "地址名":
+                label = "ADDR"
                 addr = kwargs.get('address', '')
                 if addr and not addr.startswith("GPS") and not addr.startswith("定位"):
                     val = addr
                 else:
                     val = "定位中"
             elif seg == "空值":
-                val = ""
+                continue
             if val:
-                parts.append(val)
-        return "-".join(parts)
+                lines.append((label, val))
+        return lines
 
     @staticmethod
     def add_watermark(photo_path, config, **kwargs):
-        """根据配置添加水印（段选择模式）"""
+        """根据配置添加水印（段选择模式）。
+        v3.18.0: 改为每段独立一行，并按图片宽度自动缩放字体，避免显示不全。
+        """
         if not config.get('watermark_enabled', True):
             return
 
         try:
             segments = config.get('watermark_segments', DEFAULT_CONFIG['watermark_segments'])
-            text = PhotoProcessor.build_watermark_text(segments, **kwargs)
-            if not text:
+            lines = PhotoProcessor.build_watermark_lines(segments, **kwargs)
+            if not lines:
                 return
 
             img = PILImage.open(photo_path)
             draw = ImageDraw.Draw(img)
 
             font_size_key = config.get('watermark_font_size', '中')
-            font_size = WATERMARK_FONT_SIZE_MAP.get(font_size_key, 28)
+            base_font_size = WATERMARK_FONT_SIZE_MAP.get(font_size_key, 28)
             opacity = config.get('watermark_opacity', 170)
             position = config.get('watermark_position', 'bottom-right')
 
-            font = PhotoProcessor._get_font(font_size)
-
-            text_bbox = draw.textbbox((0, 0), text, font=font)
-            tw = text_bbox[2] - text_bbox[0]
-            th = text_bbox[3] - text_bbox[1] + 10
-
             padding = 12
+            max_width = max(img.width - padding * 2, 50)
+
+            # 计算能放下所有行的最大字号（最小 12，最大 base_font_size）
+            font_size = base_font_size
+            while font_size > 12:
+                font = PhotoProcessor._get_font(font_size)
+                fits = True
+                for _, text in lines:
+                    tw = draw.textbbox((0, 0), text, font=font)[2]
+                    if tw > max_width:
+                        fits = False
+                        break
+                if fits:
+                    break
+                font_size -= 2
+
+            font = PhotoProcessor._get_font(font_size)
+            line_height = font_size + 6
+            total_height = len(lines) * line_height + 8
+
+            # 计算整体背景框尺寸
+            max_text_width = 0
+            for _, text in lines:
+                tw = draw.textbbox((0, 0), text, font=font)[2]
+                if tw > max_text_width:
+                    max_text_width = tw
+            box_w = max_text_width + padding
+            box_h = total_height
+
             if position == 'bottom-right':
-                tx = img.width - tw - padding
-                ty = img.height - th - padding
+                bx = img.width - box_w - padding
+                by = img.height - box_h - padding
             elif position == 'bottom-left':
-                tx = padding
-                ty = img.height - th - padding
+                bx = padding
+                by = img.height - box_h - padding
             elif position == 'top-right':
-                tx = img.width - tw - padding
-                ty = padding
+                bx = img.width - box_w - padding
+                by = padding
             else:  # top-left
-                tx = padding
-                ty = padding
+                bx = padding
+                by = padding
 
             overlay = PILImage.new('RGBA', img.size, (0, 0, 0, 0))
             od = ImageDraw.Draw(overlay)
-            od.rectangle([tx - 4, ty - 2, tx + tw + 4, ty + th + 2],
+            od.rectangle([bx, by, bx + box_w, by + box_h],
                          fill=(0, 0, 0, min(opacity, 255)))
 
             if img.mode != 'RGBA':
@@ -904,7 +942,10 @@ class PhotoProcessor:
             img = PILImage.alpha_composite(img, overlay)
 
             draw = ImageDraw.Draw(img)
-            draw.text((tx, ty), text, font=font, fill=(255, 255, 255))
+            cy = by + 4
+            for _, text in lines:
+                draw.text((bx + padding / 2, cy), text, font=font, fill=(255, 255, 255))
+                cy += line_height
 
             final = img.convert('RGB') if img.mode == 'RGBA' else img
             final.save(photo_path, 'JPEG', quality=92)
@@ -980,68 +1021,118 @@ class PhotoProcessor:
 
     @staticmethod
     def save_to_gallery(photo_path):
-        """保存照片到系统相册，确保在相册/微信可见。
-        v3.16.0: 改用直接文件复制到DCIM/Camera目录（最可靠）+ MediaScanner广播。
+        """保存照片到系统相册，确保在相册/微信可见且稳定。
+        v3.18.1: Android 10+ 使用 MediaStore 直接插入 DCIM/Camera（不再设置 is_pending，
+                 避免部分 ROM 清理 pending 文件导致照片消失）；
+                 Android 9 及以下回退到直接复制；最后使用 MediaScannerConnection 刷新。
         """
-        if not IS_ANDROID:
+        if not IS_ANDROID or not os.path.exists(photo_path):
             return
+        fname = os.path.basename(photo_path)
+        inserted_uri = None
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+            ContentValues = autoclass('android.content.ContentValues')
+            ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
+            FileInputStream = autoclass('java.io.FileInputStream')
+
+            cv = ContentValues()
+            cv.put("_display_name", fname)
+            cv.put("mime_type", "image/jpeg")
+            if ANDROID_API >= 29:
+                cv.put("relative_path", "DCIM/Camera")
+            # 不设置 is_pending：直接作为可见文件插入，防止某些 ROM/清理工具删除 pending 文件。
+            uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
+            if uri is not None:
+                inserted_uri = uri
+                out = resolver.openOutputStream(uri)
+                fis = FileInputStream(photo_path)
+                buf = bytearray(8192)
+                while True:
+                    n = fis.read(buf)
+                    if n <= 0:
+                        break
+                    out.write(buf, 0, n)
+                fis.close()
+                out.close()
+                Logger.info(f"save_to_gallery: MediaStore 已插入 DCIM/Camera {fname}")
+                # 使用 MediaScannerConnection 刷新，Android 10+ 比旧广播更稳定。
+                PhotoProcessor._scan_file(photo_path, uri=uri)
+                return
+        except Exception as e:
+            Logger.error(f"save_to_gallery MediaStore 失败: {e}")
+            # 如果已插入但写入失败，尝试删除残留的 pending/空记录
+            if inserted_uri is not None:
+                try:
+                    from jnius import autoclass
+                    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                    resolver = PythonActivity.mActivity.getContentResolver()
+                    resolver.delete(inserted_uri, None, None)
+                except Exception:
+                    pass
+
+        # 回退：直接复制到 DCIM/Camera（Android 9 及以下或 MediaStore 失败时）
         try:
             import shutil
-            # 方式1：直接复制到DCIM/Camera目录（最可靠）
             dcim_dirs = [
                 '/storage/emulated/0/DCIM/Camera',
                 '/sdcard/DCIM/Camera',
             ]
-            dest_path = None
             for dcim_dir in dcim_dirs:
                 try:
                     os.makedirs(dcim_dir, exist_ok=True)
-                    dest_path = os.path.join(dcim_dir, os.path.basename(photo_path))
+                    dest_path = os.path.join(dcim_dir, fname)
                     shutil.copy2(photo_path, dest_path)
                     Logger.info(f"save_to_gallery: 已复制到 {dest_path}")
-                    break
+                    PhotoProcessor._scan_file(dest_path)
+                    return
                 except Exception as e:
                     Logger.error(f"save_to_gallery: 复制到{dcim_dir}失败: {e}")
                     continue
+        except Exception as e:
+            Logger.error(f"save_to_gallery 直接复制失败: {e}")
 
-            # 方式2：MediaStore插入（作为备份）
+    @staticmethod
+    def _scan_file(file_path, uri=None):
+        """刷新系统媒体库，让相册/微信立即看到新照片。
+        v3.18.1: Android 10+ 优先使用 MediaScannerConnection.scanFile；
+                 旧设备保留 MEDIA_SCANNER_SCAN_FILE 广播作为兜底。
+        """
+        if not IS_ANDROID or not file_path:
+            return
+        scanned = False
+        # 方案1: MediaScannerConnection.scanFile（Android 10+ 推荐）
+        if ANDROID_API >= 29:
             try:
-                from jnius import autoclass
+                from jnius import autoclass, PythonJavaClass, java_method
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 activity = PythonActivity.mActivity
-                resolver = activity.getContentResolver()
-                ContentValues = autoclass('android.content.ContentValues')
-                ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
-                FileInputStream = autoclass('java.io.FileInputStream')
+                MediaScannerConnection = autoclass('android.media.MediaScannerConnection')
+                String = autoclass('java.lang.String')
 
-                cv = ContentValues()
-                fname = os.path.basename(photo_path)
-                cv.put("_display_name", fname)
-                cv.put("mime_type", "image/jpeg")
+                class _ScanClient(PythonJavaClass):
+                    __javainterfaces__ = ['android/media/MediaScannerConnection$OnScanCompletedListener']
 
-                if ANDROID_API >= 29:
-                    cv.put("relative_path", "DCIM/Camera")
-                    cv.put("is_pending", 1)
-                    uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
-                    if uri is not None:
-                        out = resolver.openOutputStream(uri)
-                        fis = FileInputStream(photo_path)
-                        buf = bytearray(8192)
-                        while True:
-                            n = fis.read(buf)
-                            if n <= 0:
-                                break
-                            out.write(buf, 0, n)
-                        fis.close()
-                        out.close()
-                        cv2 = ContentValues()
-                        cv2.put("is_pending", 0)
-                        resolver.update(uri, cv2, None, None)
-                        Logger.info("save_to_gallery: MediaStore插入成功")
+                    @java_method('(Ljava/lang/String;Landroid/net/Uri;)V')
+                    def onScanCompleted(self, path, uri):
+                        Logger.info(f"MediaScannerConnection: 扫描完成 {path}")
+
+                MediaScannerConnection.scanFile(
+                    activity,
+                    [String(file_path)],
+                    [String("image/jpeg")],
+                    _ScanClient()
+                )
+                scanned = True
+                Logger.info(f"save_to_gallery: MediaScannerConnection 已扫描 {file_path}")
             except Exception as e:
-                Logger.error(f"save_to_gallery: MediaStore失败: {e}")
+                Logger.error(f"save_to_gallery MediaScannerConnection 失败: {e}")
 
-            # 方式3：广播MediaScanner让相册立即刷新
+        # 方案2: 旧版广播（兜底）
+        if not scanned:
             try:
                 from jnius import autoclass
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
@@ -1049,17 +1140,15 @@ class PhotoProcessor:
                 Intent = autoclass('android.content.Intent')
                 Uri = autoclass('android.net.Uri')
                 File = autoclass('java.io.File')
-                # 扫描目标文件（DCIM/Camera中的副本）
-                scan_file = dest_path if dest_path else photo_path
-                file_uri = Uri.fromFile(File(scan_file))
+                if not os.path.exists(file_path):
+                    return
+                file_uri = Uri.fromFile(File(file_path))
                 scan_intent = Intent("android.intent.action.MEDIA_SCANNER_SCAN_FILE")
                 scan_intent.setData(file_uri)
                 activity.sendBroadcast(scan_intent)
-                Logger.info(f"save_to_gallery: MediaScanner已广播 {scan_file}")
+                Logger.info(f"save_to_gallery: MediaScanner 广播已发送 {file_path}")
             except Exception as e:
-                Logger.error(f"save_to_gallery: MediaScanner失败: {e}")
-        except Exception as e:
-            Logger.error(f"PhotoProcessor.save_to_gallery: {e}")
+                Logger.error(f"save_to_gallery MediaScanner 广播失败: {e}")
 
 # ============================================================
 # GPS 管理器（非阻塞缓存）
@@ -1067,18 +1156,20 @@ class PhotoProcessor:
 
 class GpsManager:
     """异步获取 GPS 坐标并缓存，供水印经纬度段使用。
-    不会阻塞主线程：在后台缓存最后一次定位结果。
-    v3.15.0: 增加 Android LocationManager 直连作为 plyer 备选方案。
+    v3.18.1: 优先使用 Android LocationManager 主动请求位置更新（GPS + Network），
+             比仅依赖 getLastKnownLocation 更能拿到有效坐标；plyer 作为备选。
     """
     def __init__(self):
         self.lat = ""
         self.lng = ""
         self._started = False
         self._lm_started = False
+        self._lm = None
+        self._listener = None
         if IS_ANDROID:
             self._start()
-            # 延迟启动 LocationManager 备选方案（1秒后）
-            Clock.schedule_once(lambda dt: self._start_location_manager(), 1)
+            # 尽快启动 LocationManager（主动更新 + 最后已知位置）
+            Clock.schedule_once(lambda dt: self._start_location_manager(), 0.2)
 
     def _start(self):
         try:
@@ -1090,46 +1181,116 @@ class GpsManager:
             self._started = False
 
     def _start_location_manager(self):
-        """使用 Android LocationManager 直连作为备选 GPS 源（plyer 在 Android 16 可能不工作）"""
+        """使用 Android LocationManager 直连获取位置（主动更新 + 最后已知位置）。"""
         if self._lm_started:
             return
         try:
-            from jnius import autoclass
+            from jnius import autoclass, PythonJavaClass, java_method
             PythonActivity = autoclass('org.kivy.android.PythonActivity')
             activity = PythonActivity.mActivity
+            if activity is None:
+                return
             Context = autoclass('android.content.Context')
             LocationManager = autoclass('android.location.LocationManager')
             lm = activity.getSystemService(Context.LOCATION_SERVICE)
             if lm is None:
                 return
             self._lm = lm
+
             # 检查权限
             if ANDROID_API >= 23:
                 if activity.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != 0:
+                    Logger.warning("GpsManager: 缺少定位权限")
                     return
-            # 获取最后一次已知位置（快速）
+
+            # 先取最后已知位置（快速暖机）
+            self._read_last_known(lm, LocationManager)
+
+            # 再注册主动更新（GPS + Network 双保险）
             try:
-                last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                if last is None:
-                    last = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                if last is not None:
-                    self.lat = "%.6f" % last.getLatitude()
-                    self.lng = "%.6f" % last.getLongitude()
-                    Logger.info("GpsManager: getLastKnownLocation (%s,%s)" % (self.lat, self.lng))
-            except Exception:
-                pass
+                self._listener = self._create_listener()
+                min_time_ms = 1000  # 1秒
+                min_distance_m = 0.0
+                if lm.isProviderEnabled(LocationManager.GPS_PROVIDER):
+                    lm.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        min_time_ms, min_distance_m,
+                        self._listener
+                    )
+                    Logger.info("GpsManager: 已注册 GPS 位置更新")
+                if lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER):
+                    lm.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER,
+                        min_time_ms, min_distance_m,
+                        self._listener
+                    )
+                    Logger.info("GpsManager: 已注册 Network 位置更新")
+            except Exception as e:
+                Logger.error(f"GpsManager: requestLocationUpdates 失败 {e}")
+
             self._lm_started = True
         except Exception as e:
             Logger.error("GpsManager._start_location_manager: %s" % e)
 
+    def _read_last_known(self, lm, LocationManager):
+        try:
+            last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            if last is None:
+                last = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if last is not None:
+                self.lat = "%.6f" % last.getLatitude()
+                self.lng = "%.6f" % last.getLongitude()
+                Logger.info("GpsManager: getLastKnownLocation (%s,%s)" % (self.lat, self.lng))
+        except Exception:
+            pass
+
+    def _create_listener(self):
+        from jnius import PythonJavaClass, java_method
+
+        class _LocationListener(PythonJavaClass):
+            __javainterfaces__ = ['android/location/LocationListener']
+
+            def __init__(self, manager):
+                super().__init__()
+                self.manager = manager
+
+            @java_method('(Landroid/location/Location;)V')
+            def onLocationChanged(self, location):
+                try:
+                    if location is not None:
+                        lat = location.getLatitude()
+                        lng = location.getLongitude()
+                        self.manager.lat = "%.6f" % lat
+                        self.manager.lng = "%.6f" % lng
+                        Logger.info(f"GpsManager: 位置更新 ({self.manager.lat},{self.manager.lng})")
+                except Exception:
+                    pass
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderEnabled(self, provider):
+                pass
+
+            @java_method('(Ljava/lang/String;)V')
+            def onProviderDisabled(self, provider):
+                pass
+
+            @java_method('(Ljava/lang/String;ILandroid/os/Bundle;)V')
+            def onStatusChanged(self, provider, status, extras):
+                pass
+
+        return _LocationListener(self)
+
     def refresh_last_known(self):
-        """手动刷新最后一次已知位置（拍照前调用）"""
+        """手动刷新位置（拍照前调用）。如尚未启动则尝试启动。"""
         if not IS_ANDROID:
             return
-        if self.lat and self.lng:
-            return  # 已有坐标
         try:
-            self._start_location_manager()
+            if not self._lm_started:
+                self._start_location_manager()
+            elif self._lm is not None:
+                from jnius import autoclass
+                LocationManager = autoclass('android.location.LocationManager')
+                self._read_last_known(self._lm, LocationManager)
         except Exception:
             pass
 
@@ -1171,6 +1332,8 @@ class AIService:
         """调用 chat/completions 接口
         messages: [{"role":"system","content":"..."},{"role":"user","content":"..."}]
         返回 (success, response_text_or_error)
+        v3.18.1: 改用 requests 库，禁用 SSL 验证（Android 上 certifi 证书链可能不完整），
+                 增加详细日志，解决 Android 上 urllib SSL 偶发失败问题。
         """
         # 使用内置默认 key（如果未配置）
         if not self.api_key:
@@ -1180,7 +1343,11 @@ class AIService:
             self.model = self.DEFAULT_MODEL
 
         import json as _json
-        import urllib.request
+        try:
+            import requests
+        except Exception as e:
+            Logger.error(f"AIService: requests 库未导入 {e}")
+            return False, "缺少网络库 requests"
 
         url = "%s/chat/completions" % self.api_url
         payload = {
@@ -1196,12 +1363,15 @@ class AIService:
             "X-Title": "资产盘点拍照工具",
         }
 
+        Logger.info(f"AIService: 请求 {url} model={self.model}")
+        Logger.info(f"AIService: key={self.api_key[:15]}...{self.api_key[-8:]}")
         try:
-            data = _json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode('utf-8')
-                result = _json.loads(body)
+            # 禁用 SSL 验证：Android 上 certifi 证书链可能不完整导致 SSL 错误
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout, verify=False)
+            Logger.info(f"AIService: 响应 HTTP {resp.status_code}, len={len(resp.text)}")
+            Logger.info(f"AIService: 响应内容前200字: {resp.text[:200]}")
+            if resp.status_code == 200:
+                result = resp.json()
                 if 'choices' in result and len(result['choices']) > 0:
                     content = result['choices'][0].get('message', {}).get('content', '')
                     return True, content.strip()
@@ -1211,15 +1381,23 @@ class AIService:
                     return False, "API错误: %s" % err_msg[:200]
                 else:
                     return False, "API返回格式异常: %s" % str(result)[:200]
-        except urllib.error.HTTPError as e:
-            try:
-                err_body = e.read().decode('utf-8')
-                err_data = _json.loads(err_body)
-                err_msg = err_data.get('error', {}).get('message', err_body) if isinstance(err_data, dict) else err_body
-            except Exception:
-                err_msg = str(e)
-            return False, "HTTP %d: %s" % (e.code, str(err_msg)[:200])
+            else:
+                try:
+                    err_data = resp.json()
+                    err_msg = err_data.get('error', {}).get('message', resp.text)
+                except Exception:
+                    err_msg = resp.text
+                return False, "HTTP %d: %s" % (resp.status_code, str(err_msg)[:200])
+        except requests.exceptions.Timeout as e:
+            Logger.error(f"AIService: 请求超时 {e}")
+            return False, "请求超时，请检查网络"
+        except requests.exceptions.ConnectionError as e:
+            Logger.error(f"AIService: 连接失败 {type(e).__name__}: {e}")
+            return False, "网络连接失败: %s" % str(e)[:100]
         except Exception as e:
+            Logger.error(f"AIService: 请求异常 {type(e).__name__}: {e}")
+            import traceback as _tb
+            Logger.error(_tb.format_exc())
             return False, "请求失败: %s" % str(e)[:200]
 
     @staticmethod
@@ -1516,11 +1694,14 @@ class CameraManager:
                         uri = raw_uri
                         uri_set_ok = True
                         self._dbg("  FileProvider URI成功（全分辨率）")
-                except Exception as e:
-                    self._dbg(f"  FileProvider失败: {str(e)[:100]}")
+                except:  # 裸except：pyjnius的Java异常不继承BaseException
+                    import sys as _sys
+                    e = _sys.exc_info()[1]
+                    self._dbg(f"  FileProvider失败: {str(e)[:100] if e else 'Unknown'}")
                     intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                # 策略2：MediaStore content:// URI（Android 10+，全分辨率）
+                # 策略2：MediaStore content:// URI（Android 10+，全分辨率，保存到 DCIM/Camera）
+                # v3.18.0: 不再设置 is_pending=1，否则外部相机应用无法写入该 URI。
                 if not uri_set_ok and ANDROID_API >= 29:
                     self._dbg("策略2: MediaStore URI")
                     try:
@@ -1532,7 +1713,7 @@ class CameraManager:
                         cv.put("_display_name", photo_fname)
                         cv.put("mime_type", "image/jpeg")
                         cv.put("relative_path", "DCIM/Camera")
-                        cv.put("is_pending", 1)
+                        # 不设置 is_pending，让相机应用可以直接写入公共 DCIM/Camera 目录
                         raw_uri = resolver.insert(EXTERNAL_CONTENT_URI, cv)
                         if raw_uri is not None:
                             parcel_uri = cast('android.os.Parcelable', raw_uri)
@@ -1543,9 +1724,11 @@ class CameraManager:
                             self._media_uri = raw_uri
                             uri_set_ok = True
                             self.photo_path = None
-                            self._dbg("  MediaStore URI成功（全分辨率）")
-                    except Exception as e:
-                        self._dbg(f"  MediaStore失败: {str(e)[:100]}")
+                            self._dbg("  MediaStore URI成功（全分辨率，DCIM/Camera）")
+                    except:  # 裸except：pyjnius的Java异常不继承BaseException
+                        import sys as _sys
+                        e = _sys.exc_info()[1]
+                        self._dbg(f"  MediaStore失败: {str(e)[:100] if e else 'Unknown'}")
                     if not uri_set_ok:
                         intent = Intent(ACTION_IMAGE_CAPTURE)
 
@@ -1564,7 +1747,7 @@ class CameraManager:
                             b.penaltyLog()
                             StrictMode.setVmPolicy(b.build())
                             self._dbg("  StrictMode已禁用")
-                        except Exception:
+                        except:
                             pass
                         raw_uri = Uri.fromFile(photo_file)
                         parcel_uri = cast('android.os.Parcelable', raw_uri)
@@ -1574,8 +1757,10 @@ class CameraManager:
                         uri = raw_uri
                         uri_set_ok = True
                         self._dbg("  file:// URI设置成功")
-                    except Exception as e:
-                        self._dbg(f"  file:// URI失败: {str(e)[:80]}")
+                    except:  # 裸except：pyjnius的Java异常不继承BaseException
+                        import sys as _sys
+                        e = _sys.exc_info()[1]
+                        self._dbg(f"  file:// URI失败: {str(e)[:80] if e else 'Unknown'}")
                         intent = Intent(ACTION_IMAGE_CAPTURE)
 
                 # 策略4：无EXTRA_OUTPUT（兜底，只获取缩略图）
@@ -1600,7 +1785,7 @@ class CameraManager:
                                         FLAG_GRANT_WRITE_URI_PERMISSION | FLAG_GRANT_READ_URI_PERMISSION)
                                 except:
                                     pass
-                    except Exception:
+                    except:
                         pass
 
                 # ========== 启动相机（无论URI是否设置成功都必须执行！）==========
@@ -1617,9 +1802,11 @@ class CameraManager:
                         activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
                         launched = True
                         self._dbg("✓ 相机选择器已弹出！")
-                    except Exception as e:
-                        ename = type(e).__name__
-                        emsg = str(e)[:80]
+                    except:  # 裸except：pyjnius的Java异常不继承BaseException
+                        import sys as _sys
+                        e = _sys.exc_info()[1]
+                        ename = type(e).__name__ if e else "Unknown"
+                        emsg = str(e)[:80] if e else ""
                         if 'ActivityNotFound' in ename or 'Notfound' in ename:
                             launch_error = "系统未安装相机应用"
                         else:
@@ -1632,12 +1819,15 @@ class CameraManager:
                         activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
                         launched = True
                         self._dbg("✓ 相机已启动！")
-                    except Exception as e:
-                        ename = type(e).__name__
+                    except:  # 裸except：pyjnius的Java异常不继承BaseException
+                        import sys as _sys
+                        e = _sys.exc_info()[1]
+                        ename = type(e).__name__ if e else "Unknown"
+                        emsg = str(e)[:80] if e else ""
                         if 'ActivityNotFound' in ename or 'Notfound' in ename:
                             launch_error = "未找到相机应用"
                         else:
-                            launch_error = f"启动异常: {ename}: {str(e)[:80]}"
+                            launch_error = f"启动异常: {ename}: {emsg}"
                         self._dbg(launch_error)
 
                 if launched:
@@ -1651,8 +1841,10 @@ class CameraManager:
                         self.pending_callback = None
                         Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
 
-            except Exception as e:
-                err_msg = f"相机启动异常: {type(e).__name__}: {str(e)[:100]}"
+            except:  # 裸except：pyjnius的Java异常不继承BaseException
+                import sys as _sys
+                e = _sys.exc_info()[1]
+                err_msg = f"相机启动异常: {type(e).__name__ if e else 'Unknown'}: {str(e)[:100] if e else ''}"
                 self._dbg(err_msg, show_toast=True)
                 Logger.error(traceback.format_exc())
                 self._camera_launched = False
@@ -1667,8 +1859,10 @@ class CameraManager:
             _do_launch_ui()
         except ImportError:
             Clock.schedule_once(lambda dt: _do_launch(), 0)
-        except Exception as e:
-            self._dbg(f"UI线程调度失败: {str(e)[:60]}，直接执行")
+        except:  # 裸except：pyjnius的Java异常不继承BaseException
+            import sys as _sys
+            e = _sys.exc_info()[1]
+            self._dbg(f"UI线程调度失败: {str(e)[:60] if e else 'Unknown'}，直接执行")
             _do_launch()
 
     def on_camera_result(self, result_code, intent=None):
@@ -1710,6 +1904,18 @@ class CameraManager:
                 PythonActivity = autoclass('org.kivy.android.PythonActivity')
                 activity = PythonActivity.mActivity
                 resolver = activity.getContentResolver()
+
+                # 强制解除 is_pending，防止某些相机应用写入后未清理 pending 导致照片不可见
+                try:
+                    ContentValues = autoclass('android.content.ContentValues')
+                    cv = ContentValues()
+                    cv.put("is_pending", 0)
+                    resolver.update(self._media_uri, cv, None, None)
+                except:
+                    import sys as _sys
+                    e = _sys.exc_info()[1]
+                    self._dbg(f"解除 MediaStore is_pending 失败(可能已是可见状态): {str(e)[:80] if e else ''}")
+
                 istream = resolver.openInputStream(self._media_uri)
                 os.makedirs(APP_DIR, exist_ok=True)
                 dest_path = os.path.join(
@@ -1736,8 +1942,10 @@ class CameraManager:
                         self.pending_callback = None
                         Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                     return
-            except Exception as e:
-                self._dbg(f"MediaStore复制失败: {str(e)[:100]}")
+            except:
+                import sys as _sys
+                e = _sys.exc_info()[1]
+                self._dbg(f"MediaStore复制失败: {str(e)[:100] if e else 'Unknown'}")
                 self._media_uri = None
 
         # ========== 第3优先级：扫描DCIM/Camera目录获取最新照片 ==========
@@ -1789,8 +1997,10 @@ class CameraManager:
                     else:
                         self._dbg(f"  照片太旧({age:.0f}秒前)或太小({fsize}bytes)，跳过")
                 self._dbg("DCIM扫描完成，未找到符合条件的照片")
-            except Exception as e:
-                self._dbg(f"DCIM扫描失败: {str(e)[:80]}")
+            except:
+                import sys as _sys
+                e = _sys.exc_info()[1]
+                self._dbg(f"DCIM扫描失败: {str(e)[:80] if e else 'Unknown'}")
 
         # ========== 第4优先级：从返回Intent获取照片 ==========
         if intent is not None:
@@ -1830,8 +2040,10 @@ class CameraManager:
                                 self.pending_callback = None
                                 Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                             return
-                    except Exception as e:
-                        self._dbg(f"从URI读取失败: {str(e)[:80]}")
+                    except:
+                        import sys as _sys
+                        e = _sys.exc_info()[1]
+                        self._dbg(f"从URI读取失败: {str(e)[:80] if e else 'Unknown'}")
                 else:
                     extras = intent.getExtras()
                     if extras is not None and extras.containsKey("data"):
@@ -1848,8 +2060,10 @@ class CameraManager:
                                 try:
                                     CompressFormat = autoclass('android.graphics.Bitmap$CompressFormat')
                                     bitmap.compress(CompressFormat.PNG, 100, fos)
-                                except Exception as ce:
-                                    self._dbg(f"  CompressFormat反射失败: {str(ce)[:60]}，尝试备选方案")
+                                except:
+                                    import sys as _sys
+                                    ce = _sys.exc_info()[1]
+                                    self._dbg(f"  CompressFormat反射失败: {str(ce)[:60] if ce else ''}，尝试备选方案")
                                     bitmap.compress(autoclass('android.graphics.Bitmap').CompressFormat.PNG, 100, fos)
                                 fos.flush()
                                 fos.close()
@@ -1862,8 +2076,10 @@ class CameraManager:
                                         self.pending_callback = None
                                         Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                                     return
-                        except Exception as e:
-                            self._dbg(f"缩略图保存失败: {str(e)[:80]}")
+                        except:
+                            import sys as _sys
+                            e = _sys.exc_info()[1]
+                            self._dbg(f"缩略图保存失败: {str(e)[:80] if e else 'Unknown'}")
                     else:
                         clip_data = intent.getClipData()
                         if clip_data is not None and clip_data.getItemCount() > 0:
@@ -1902,12 +2118,16 @@ class CameraManager:
                                             self.pending_callback = None
                                             Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
                                         return
-                            except Exception as e:
-                                self._dbg(f"ClipData读取失败: {str(e)[:80]}")
+                            except:
+                                import sys as _sys
+                                e = _sys.exc_info()[1]
+                                self._dbg(f"ClipData读取失败: {str(e)[:80] if e else 'Unknown'}")
                         else:
                             self._dbg("Intent无data/extras/clipData")
-            except Exception as e:
-                self._dbg(f"处理Intent返回失败: {str(e)[:100]}")
+            except:
+                import sys as _sys
+                e = _sys.exc_info()[1]
+                self._dbg(f"处理Intent返回失败: {str(e)[:100] if e else 'Unknown'}")
 
         # ========== 所有方式都失败 ==========
         if result_code == 0:
@@ -2951,9 +3171,12 @@ class MainScreen(Screen):
             address_general = row[1] if len(row) > 1 else ""
             address_precise = row[2] if len(row) > 2 else ""
             property_type = row[3] if len(row) > 3 else ""
-            remark = row[4] if len(row) > 4 else ""
+            excel_remark = row[4] if len(row) > 4 else ""
             full_addr = (address_general + address_precise).strip()
             pk = self.progress_mgr._make_key(borrower, full_addr)
+            # v3.18.1: 优先从 ProgressManager 恢复备注，防止 Excel 写入失败后备注丢失
+            saved_remark = self.progress_mgr.get_remark(pk)
+            remark = saved_remark if saved_remark else excel_remark
 
             rw = RowWidget(
                 row_index=i, borrower=borrower,
@@ -3343,14 +3566,16 @@ class MainScreen(Screen):
             if self.excel_path:
                 import threading
                 def _save_excel():
-                    ok = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
+                    ok, msg = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
-                        self.camera_mgr._dbg(f"✓ 备注已写入Excel 行{rw.excel_row_index}", show_toast=True)
+                        self.camera_mgr._dbg(f"✓ {msg} 行{rw.excel_row_index}", show_toast=True)
                     else:
                         Logger.error("备注保存失败 行%d" % rw.excel_row_index)
-                        self.camera_mgr._dbg(f"⚠ Excel写入失败，但已保存到app内存 行{rw.excel_row_index}", show_toast=True)
+                        self.camera_mgr._dbg(f"⚠ {msg}，但已保存到app内部 行{rw.excel_row_index}", show_toast=True)
                 threading.Thread(target=_save_excel, daemon=True).start()
+            else:
+                self.camera_mgr._dbg("备注已保存到app内部（未关联Excel文件）", show_toast=True)
             self._show_msg("备注已保存", toast=True)
             popup.dismiss()
 
