@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.15.0
+资产盘点专项拍照工具 App - v3.16.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -369,12 +369,12 @@ DEFAULT_CONFIG = {
     'watermark_opacity': 170,
     'ai_api_url': 'https://openrouter.ai/api/v1',
     'ai_api_key': '',
-    'ai_model': '',
+    'ai_model': 'openrouter/owl-alpha',
 }
 
 # AI API Key (base64编码存储，避免泄露)
 import base64 as _b64
-_AI_KEY_B64 = "c2stb3ItdjEtZTUyYTI1MThmMzBlNWRhZGFlZTYzZDJmYjEzYmFhMzdhMWJiYWQ4NTFmOTQ1NWY5MmYxY2NjODNiZGQ5MTc0MQ=="
+_AI_KEY_B64 = "c2stb3ItdjEtZWRkMGQyZTc2MzJkN2Y4NjQ3M2Q4ODU3ZjRlMDM0N2Q0ZGY0OTM2OWFmZmVhZmI5YzkyMTA0ZDYyYjEwNDQxYw=="
 AI_DEFAULT_API_KEY = _b64.b64decode(_AI_KEY_B64).decode('utf-8')
 
 # === 命名段选项（用-连接成 X-X-X-X）===
@@ -645,7 +645,7 @@ class ExcelReader:
 
 class ExcelWriter:
     """写入 Excel 备注列（E列）
-    v3.15.0: 支持将备注保存到已打开的 Excel 文件，保留原文件结构。
+    v3.16.0: 增加工作副本回退机制（Android 11+无法直接写入外部存储）。
     """
     @staticmethod
     def save_remark(file_path, row_index, remark_text):
@@ -653,15 +653,39 @@ class ExcelWriter:
         row_index: Excel 中的行号（含表头，从1开始）
         remark_text: 备注文本
         """
+        import shutil
+        # 方式1：直接写入原文件（使用临时文件避免损坏）
         try:
             wb = openpyxl.load_workbook(file_path)
             ws = wb.active
             ws.cell(row=row_index, column=5, value=remark_text)
-            wb.save(file_path)
+            tmp = file_path + '.tmp'
+            wb.save(tmp)
             wb.close()
+            shutil.move(tmp, file_path)
+            Logger.info(f"save_remark: 直接写入成功 行{row_index}")
             return True
-        except Exception as e:
-            Logger.error(f"ExcelWriter.save_remark: {e}")
+        except Exception as e1:
+            Logger.error(f"save_remark直接写入失败: {e1}")
+        # 方式2：复制到app私有目录再写入，然后复制回原路径
+        try:
+            work_copy = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path))
+            os.makedirs(os.path.dirname(work_copy), exist_ok=True)
+            shutil.copy2(file_path, work_copy)
+            wb = openpyxl.load_workbook(work_copy)
+            ws = wb.active
+            ws.cell(row=row_index, column=5, value=remark_text)
+            wb.save(work_copy)
+            wb.close()
+            # 尝试复制回原路径
+            try:
+                shutil.copy2(work_copy, file_path)
+                Logger.info(f"save_remark: 通过工作副本写入成功 行{row_index}")
+            except Exception as e3:
+                Logger.error(f"save_remark: 无法复制回原路径({e3})，副本保留在 {work_copy}")
+            return True
+        except Exception as e2:
+            Logger.error(f"save_remark工作副本写入也失败: {e2}")
             return False
 
     @staticmethod
@@ -669,16 +693,38 @@ class ExcelWriter:
         """批量保存备注
         remarks: dict {row_index: remark_text}
         """
+        import shutil
+        # 方式1：直接写入
         try:
             wb = openpyxl.load_workbook(file_path)
             ws = wb.active
             for row_idx, text in remarks.items():
                 ws.cell(row=row_idx, column=5, value=text)
-            wb.save(file_path)
+            tmp = file_path + '.tmp'
+            wb.save(tmp)
             wb.close()
+            shutil.move(tmp, file_path)
             return True
         except Exception as e:
-            Logger.error(f"ExcelWriter.save_all_remarks: {e}")
+            Logger.error(f"save_all_remarks直接写入失败: {e}")
+        # 方式2：工作副本
+        try:
+            work_copy = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path))
+            os.makedirs(os.path.dirname(work_copy), exist_ok=True)
+            shutil.copy2(file_path, work_copy)
+            wb = openpyxl.load_workbook(work_copy)
+            ws = wb.active
+            for row_idx, text in remarks.items():
+                ws.cell(row=row_idx, column=5, value=text)
+            wb.save(work_copy)
+            wb.close()
+            try:
+                shutil.copy2(work_copy, file_path)
+            except Exception:
+                pass
+            return True
+        except Exception as e2:
+            Logger.error(f"save_all_remarks工作副本写入失败: {e2}")
             return False
 
 # ============================================================
@@ -760,7 +806,7 @@ class PhotoProcessor:
         """根据水印段配置生成水印文本（X-X-X 格式）
         segments: ["经纬度"/"拍摄时间"/"地址名"/"空值", ...]
         kwargs: time_str(拍摄时间), address(地址), lat, lng(经纬度)
-        v3.15.0: 无GPS坐标时省略定位段（不显示"定位中"/"GPS未开启或无权限"）
+        v3.16.0: 无GPS坐标时显示"定位中"（按设置完整输出，不省略段）
         """
         lat = kwargs.get('lat', '')
         lng = kwargs.get('lng', '')
@@ -771,15 +817,16 @@ class PhotoProcessor:
             if seg == "经纬度":
                 if has_gps:
                     val = "%s,%s" % (lng, lat)
-                # 无GPS时省略，不显示"定位中"
+                else:
+                    val = "定位中"
             elif seg == "拍摄时间":
                 val = kwargs.get('time_str', '')
             elif seg == "地址名":
                 addr = kwargs.get('address', '')
-                # 过滤掉错误占位文本
                 if addr and not addr.startswith("GPS") and not addr.startswith("定位"):
                     val = addr
-                # 无有效地址时省略
+                else:
+                    val = "定位中"
             elif seg == "空值":
                 val = ""
             if val:
@@ -913,76 +960,83 @@ class PhotoProcessor:
     @staticmethod
     def save_to_gallery(photo_path):
         """保存照片到系统相册，确保在相册/微信可见。
-        v3.15.0: Android 10+ 使用 RELATIVE_PATH + IS_PENDING 替代废弃的 DATA 字段。
+        v3.16.0: 改用直接文件复制到DCIM/Camera目录（最可靠）+ MediaScanner广播。
         """
         if not IS_ANDROID:
             return
         try:
-            from jnius import autoclass
-            PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            activity = PythonActivity.mActivity
-            resolver = activity.getContentResolver()
-            ContentValues = autoclass('android.content.ContentValues')
-            MediaStore = autoclass('android.provider.MediaStore')
-            ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
-            FileInputStream = autoclass('java.io.FileInputStream')
+            import shutil
+            # 方式1：直接复制到DCIM/Camera目录（最可靠）
+            dcim_dirs = [
+                '/storage/emulated/0/DCIM/Camera',
+                '/sdcard/DCIM/Camera',
+            ]
+            dest_path = None
+            for dcim_dir in dcim_dirs:
+                try:
+                    os.makedirs(dcim_dir, exist_ok=True)
+                    dest_path = os.path.join(dcim_dir, os.path.basename(photo_path))
+                    shutil.copy2(photo_path, dest_path)
+                    Logger.info(f"save_to_gallery: 已复制到 {dest_path}")
+                    break
+                except Exception as e:
+                    Logger.error(f"save_to_gallery: 复制到{dcim_dir}失败: {e}")
+                    continue
 
-            cv = ContentValues()
-            fname = os.path.basename(photo_path)
-            cv.put("_display_name", fname)
-            cv.put("mime_type", "image/jpeg")
-
-            if ANDROID_API >= 29:
-                # Android 10+: 使用 RELATIVE_PATH + IS_PENDING 流程
-                cv.put("relative_path", "DCIM/Camera")
-                cv.put("is_pending", 1)
-                uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
-                if uri is not None:
-                    out = resolver.openOutputStream(uri)
-                    fis = FileInputStream(photo_path)
-                    buf = bytearray(8192)
-                    while True:
-                        n = fis.read(buf)
-                        if n <= 0:
-                            break
-                        out.write(buf, 0, n)
-                    fis.close()
-                    out.close()
-                    # 标记完成（IS_PENDING=0）
-                    cv2 = ContentValues()
-                    cv2.put("is_pending", 0)
-                    resolver.update(uri, cv2, None, None)
-                    Logger.info("save_to_gallery: 已保存到DCIM/Camera (API29+)")
-                else:
-                    Logger.error("save_to_gallery: insert返回null")
-            else:
-                # Android 9及以下: 旧方式
-                cv.put("_data", photo_path)
-                uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
-                if uri is not None:
-                    out = resolver.openOutputStream(uri)
-                    fis = FileInputStream(photo_path)
-                    buf = bytearray(8192)
-                    while True:
-                        n = fis.read(buf)
-                        if n <= 0:
-                            break
-                        out.write(buf, 0, n)
-                    fis.close()
-                    out.close()
-                    Logger.info("save_to_gallery: 已保存 (API<29)")
-
-            # 额外触发 MediaScanner 让相册立即刷新（兼容所有版本）
+            # 方式2：MediaStore插入（作为备份）
             try:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                activity = PythonActivity.mActivity
+                resolver = activity.getContentResolver()
+                ContentValues = autoclass('android.content.ContentValues')
+                ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
+                FileInputStream = autoclass('java.io.FileInputStream')
+
+                cv = ContentValues()
+                fname = os.path.basename(photo_path)
+                cv.put("_display_name", fname)
+                cv.put("mime_type", "image/jpeg")
+
+                if ANDROID_API >= 29:
+                    cv.put("relative_path", "DCIM/Camera")
+                    cv.put("is_pending", 1)
+                    uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
+                    if uri is not None:
+                        out = resolver.openOutputStream(uri)
+                        fis = FileInputStream(photo_path)
+                        buf = bytearray(8192)
+                        while True:
+                            n = fis.read(buf)
+                            if n <= 0:
+                                break
+                            out.write(buf, 0, n)
+                        fis.close()
+                        out.close()
+                        cv2 = ContentValues()
+                        cv2.put("is_pending", 0)
+                        resolver.update(uri, cv2, None, None)
+                        Logger.info("save_to_gallery: MediaStore插入成功")
+            except Exception as e:
+                Logger.error(f"save_to_gallery: MediaStore失败: {e}")
+
+            # 方式3：广播MediaScanner让相册立即刷新
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                activity = PythonActivity.mActivity
                 Intent = autoclass('android.content.Intent')
                 Uri = autoclass('android.net.Uri')
                 File = autoclass('java.io.File')
-                file_uri = Uri.fromFile(File(photo_path))
+                # 扫描目标文件（DCIM/Camera中的副本）
+                scan_file = dest_path if dest_path else photo_path
+                file_uri = Uri.fromFile(File(scan_file))
                 scan_intent = Intent("android.intent.action.MEDIA_SCANNER_SCAN_FILE")
                 scan_intent.setData(file_uri)
                 activity.sendBroadcast(scan_intent)
-            except Exception:
-                pass
+                Logger.info(f"save_to_gallery: MediaScanner已广播 {scan_file}")
+            except Exception as e:
+                Logger.error(f"save_to_gallery: MediaScanner失败: {e}")
         except Exception as e:
             Logger.error(f"PhotoProcessor.save_to_gallery: {e}")
 
@@ -1085,7 +1139,7 @@ class AIService:
     """
     DEFAULT_API_URL = "https://openrouter.ai/api/v1"
     DEFAULT_API_KEY = ""
-    DEFAULT_MODEL = ""
+    DEFAULT_MODEL = "openrouter/owl-alpha"
 
     def __init__(self, api_url=None, api_key=None, model=None):
         self.api_url = (api_url or self.DEFAULT_API_URL).rstrip('/')
@@ -1100,8 +1154,9 @@ class AIService:
         # 使用内置默认 key（如果未配置）
         if not self.api_key:
             self.api_key = AI_DEFAULT_API_KEY
+        # 使用内置默认模型（如果未配置）
         if not self.model:
-            return False, "未配置模型 ID，请在设置→AI设置中填写（如 owl-alpha）"
+            self.model = self.DEFAULT_MODEL
 
         import json as _json
         import urllib.request
@@ -1240,24 +1295,28 @@ class CameraManager:
         self._debug_log_path = ""
         self._log_lines = []
         self._max_log_lines = 50
+        self._log_enabled = False  # v3.16.0: 日志记录开关，默认关闭
 
     def _dbg(self, msg, show_toast=False):
         """Write debug message to log file and update UI status.
-        show_toast=True to also show an Android Toast (use sparingly to avoid flashing)."""
+        show_toast=True to also show an Android Toast (use sparingly to avoid flashing).
+        v3.16.0: 日志开关关闭时不写日志文件（避免侵占手机空间）"""
         ts = get_system_date().strftime('%H:%M:%S')
         line = f"[{ts}] {msg}"
         Logger.info("CAMDBG: %s", msg)
         self._log_lines.append(line)
         if len(self._log_lines) > self._max_log_lines:
             self._log_lines = self._log_lines[-self._max_log_lines:]
-        try:
-            if not self._debug_log_path:
-                self._debug_log_path = os.path.join(APP_DIR, "camera_debug.log")
-            os.makedirs(APP_DIR, exist_ok=True)
-            with open(self._debug_log_path, 'a', encoding='utf-8') as f:
-                f.write(line + "\n")
-        except:
-            pass
+        # 只在日志开关开启时写入日志文件
+        if self._log_enabled:
+            try:
+                if not self._debug_log_path:
+                    self._debug_log_path = os.path.join(APP_DIR, "camera_debug.log")
+                os.makedirs(APP_DIR, exist_ok=True)
+                with open(self._debug_log_path, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+            except:
+                pass
         if self.status_callback:
             try:
                 self.status_callback('\n'.join(self._log_lines[-10:]))
@@ -2059,9 +2118,11 @@ class PhotoViewerPopup(Popup):
                 item.add_widget(KivyImage(source=photo_path, size_hint_x=0.38, allow_stretch=True, keep_ratio=True))
 
             info_box = BoxLayout(orientation='vertical', spacing=dp(6), size_hint_x=0.62)
-            info_box.add_widget(Label(text=os.path.basename(photo_path), font_size='12sp',
+            name_label = Label(text=os.path.basename(photo_path), font_size='14sp',
                                       halign='left', valign='top', size_hint_y=0.5,
-                                      text_size=(None, None)))
+                                      text_size=(0, None))
+            name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
+            info_box.add_widget(name_label)
             del_btn = Button(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
@@ -2638,36 +2699,35 @@ class MainScreen(Screen):
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
-        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(200), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
+        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(52), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(4))
-        report_btn = Button(text="（已屏蔽）生成报告", font_size='12sp',
-                           background_color=(0.35, 0.35, 0.35, 1), background_normal='',
-                           size_hint_x=0.35, color=(0.7, 0.7, 0.7, 1))
-        report_btn.disabled = True
-        btn_row.add_widget(report_btn)
-
         log_btn = Button(text="📋 完整日志", font_size='12sp',
                              background_color=THEME['accent'], background_normal='',
-                             size_hint_x=0.35, color=(1,1,1,1))
+                             size_hint_x=0.34, color=(1,1,1,1))
         log_btn.bind(on_release=self._show_full_log)
         btn_row.add_widget(log_btn)
 
-        clear_log_btn = Button(text="清空", font_size='12sp',
+        self.log_toggle_btn = Button(text="🔇 日志:关", font_size='12sp',
                               background_color=(0.4, 0.4, 0.45, 1), background_normal='',
-                              size_hint_x=0.30, color=(1,1,1,1))
+                              size_hint_x=0.33, color=(1,1,1,1))
+        self.log_toggle_btn.bind(on_release=self._toggle_log_recording)
+        btn_row.add_widget(self.log_toggle_btn)
+
+        clear_log_btn = Button(text="清空日志", font_size='12sp',
+                              background_color=(0.4, 0.4, 0.45, 1), background_normal='',
+                              size_hint_x=0.33, color=(1,1,1,1))
         clear_log_btn.bind(on_release=self._clear_debug_log)
         btn_row.add_widget(clear_log_btn)
         footer.add_widget(btn_row)
 
-        log_scroll = ScrollView(do_scroll_x=False, do_scroll_y=True, size_hint_y=1)
-        self.status_label = Label(text="请点击「打开Excel」选择文件\n底部日志区域：相机调试信息会显示在这里", font_size='11sp',
-                                  color=THEME['warning'],
+        # 底部日志显示区已隐藏（v3.16.0），只保留按钮
+        # status_label仍然创建（供代码引用），但不显示在UI中
+        self.status_label = Label(text="", font_size='11sp',
+                                  color=THEME['text_dim'],
                                   halign='left', valign='top',
-                                  size_hint_y=None, markup=False)
+                                  size_hint_y=None, markup=False, opacity=0)
         self.status_label.bind(texture_size=self._update_log_label_size, width=lambda i, v: setattr(i, 'text_size', (v, None)))
-        log_scroll.add_widget(self.status_label)
-        footer.add_widget(log_scroll)
         parent.add_widget(footer)
 
         self._show_empty_state()
@@ -2910,8 +2970,24 @@ class MainScreen(Screen):
                 os.remove(self.camera_mgr._debug_log_path)
         except:
             pass
-        self.status_label.text = "日志已清空\n底部日志区域：相机调试信息会显示在这里"
+        self.status_label.text = ""
         self.status_label.color = THEME['text_dim']
+        if IS_ANDROID:
+            self.camera_mgr._toast("日志已清空")
+
+    def _toggle_log_recording(self, instance):
+        """切换日志记录开关（v3.16.0）"""
+        self.camera_mgr._log_enabled = not self.camera_mgr._log_enabled
+        if self.camera_mgr._log_enabled:
+            self.log_toggle_btn.text = "🔊 日志:开"
+            self.log_toggle_btn.background_color = THEME['success']
+            if IS_ANDROID:
+                self.camera_mgr._toast("日志记录已开启")
+        else:
+            self.log_toggle_btn.text = "🔇 日志:关"
+            self.log_toggle_btn.background_color = (0.4, 0.4, 0.45, 1)
+            if IS_ANDROID:
+                self.camera_mgr._toast("日志记录已关闭")
 
     def _show_full_log(self, instance):
         """打开全屏日志记事本，显示完整的调试日志内容"""
@@ -3254,6 +3330,11 @@ class AIScreen(Screen):
         from kivy.uix.textinput import TextInput
 
         layout = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(6))
+
+        # 状态栏占位（避免与系统状态栏重叠）
+        from kivy.uix.widget import Widget
+        status_bar_pad = Widget(size_hint_y=None, height=dp(30))
+        layout.add_widget(status_bar_pad)
 
         # 顶部标题栏
         top_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
