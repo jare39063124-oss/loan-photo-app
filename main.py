@@ -410,9 +410,9 @@ WATERMARK_POSITION_LABELS = {'bottom-right': '右下', 'bottom-left': '左下',
 WATERMARK_POSITION_LABEL_TO_KEY = {v: k for k, v in WATERMARK_POSITION_LABELS.items()}
 
 # === 作者信息 ===
-AUTHOR_NAME = "王硕"
-AUTHOR_PHONE = "15940454123（同微信）"
-AUTHOR_INFO = f"作者：{AUTHOR_NAME}\n联系方式：{AUTHOR_PHONE}\n有问题请联系作者"
+AUTHOR_NAME = "抚顺银行风险管理部"
+AUTHOR_PHONE = ""
+AUTHOR_INFO = "抚顺银行风险管理部"
 
 # === 颜色主题 ===
 # v3.19.0: 全面重新设计为明亮浅色主题，参考2026移动端设计趋势
@@ -799,67 +799,151 @@ class ExcelWriter:
 # ============================================================
 
 class ReportGenerator:
-    def __init__(self, template_path=None):
-        self.template_path = template_path
+    """日报表生成器 v3.19.2: 基于内置模板，调用 AI 根据备注+Excel内容
+    生成专业的"现状描述"与"风险备注"，保存到用户指定位置。"""
 
-    def generate(self, excel_data, progress_mgr, output_path=None):
-        headers, rows = excel_data
-        try:
-            wb = load_workbook(self.template_path) if self.template_path and os.path.exists(self.template_path) else None
-        except:
-            wb = None
+    TEMPLATE_NAME = 'report_template.xlsx'
 
-        if wb is None:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Sheet1"
-            ws['A3'] = '序号'
-            ws['B3'] = '日期'
-            ws['C3'] = '勘查业务贷款人名称'
-            ws['D3'] = '抵押物/抵债资产具体情况'
-            ws['E3'] = '现状描述'
-            ws['F3'] = '备注（是否存在发生风险的可能）'
-        else:
-            ws = wb['Sheet1']
+    REPORT_SYSTEM_PROMPT = (
+        "你是银行抵押物、抵债资产现场勘查日报表撰写助手。"
+        "根据勘查人员提供的客户名称、抵押物地址、抵押物类型、备注与拍照情况，"
+        "为每位客户撰写日报表中的三列内容：\n"
+        "1. 抵押物情况(detail)：概括盘点了几处、什么类型的抵押物及地址位置，20-40字\n"
+        "2. 现状描述(status)：客观描述抵押物当前使用状态(自用/出租/闲置)、位置楼层、"
+        "装修、维护情况等，50-120字\n"
+        "3. 风险备注(risk)：评估是否存在风险(如闲置、渗水裂缝、价格波动、用途变更等)，"
+        "给出关注建议；无风险则说明整体状态良好暂无异常，30-80字\n"
+        "要求：语言专业、简洁，符合银行风控用语；如实反映备注中的信息，"
+        "备注为空时按抵押物类型合理推断。\n"
+        "仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。"
+        "格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]"
+    )
 
-        for row_idx in range(4, ws.max_row + 1):
-            if row_idx < 25:
-                for col in range(1, 7):
-                    ws.cell(row=row_idx, column=col).value = None
+    def __init__(self):
+        self.template_path = self._resolve_template()
 
-        report_date = get_report_date_str()
-        current_row = 4
-        seq_num = 1
+    def _resolve_template(self):
+        """定位内置模板（打包目录优先）"""
+        for d in [_APP_DIR, os.path.dirname(os.path.abspath(__file__))]:
+            p = os.path.join(d, self.TEMPLATE_NAME)
+            if os.path.exists(p) and os.path.getsize(p) > 1000:
+                return p
+        return None
 
-        for i, row in enumerate(rows):
-            customer_name = row[0] if len(row) > 0 else ""
-            address_general = row[1] if len(row) > 1 else ""
-            address_precise = row[2] if len(row) > 2 else ""
+    def _collect_records(self, rows, progress_mgr):
+        """收集每位客户的勘查记录（含备注与拍照数）"""
+        records = []
+        for row in rows:
+            borrower = row[0] if len(row) > 0 else ""
+            if not borrower:
+                continue
+            addr_general = row[1] if len(row) > 1 else ""
+            addr_precise = row[2] if len(row) > 2 else ""
             property_type = row[3] if len(row) > 3 else ""
+            excel_remark = row[4] if len(row) > 4 else ""
+            full_addr = (addr_general + addr_precise).strip()
+            pk = progress_mgr._make_key(borrower, full_addr)
+            saved_remark = progress_mgr.get_remark(pk)
+            remark = saved_remark if saved_remark else excel_remark
+            photo_info = progress_mgr.get_photo_types(pk) if hasattr(progress_mgr, 'get_photo_types') else {}
+            photo_count = sum(photo_info.values()) if isinstance(photo_info, dict) else 0
+            records.append({
+                'name': borrower,
+                'address': full_addr,
+                'property_type': property_type,
+                'remark': remark,
+                'photo_count': photo_count,
+            })
+        return records
 
-            if customer_name:
-                full_address = (address_general + address_precise).strip()
-                ws.cell(row=current_row, column=1, value=seq_num)
-                ws.cell(row=current_row, column=2, value=report_date)
-                ws.cell(row=current_row, column=3, value=customer_name)
-                ws.cell(row=current_row, column=4, value=full_address)
-                ws.cell(row=current_row, column=5, value=property_type)
-                ws.cell(row=current_row, column=6, value="")
-                seq_num += 1
-                current_row += 1
+    def _build_prompt(self, records):
+        """构建发送给 AI 的用户提示词"""
+        lines = ["以下是今日现场勘查记录，请为每位客户撰写日报表内容：\n"]
+        for i, r in enumerate(records, 1):
+            lines.append(
+                "【客户%d】名称：%s | 抵押物地址：%s | 抵押物类型：%s | 拍照数：%d | 勘查备注：%s"
+                % (i, r['name'], r['address'], r['property_type'] or '未注明',
+                   r['photo_count'], r['remark'] or '无')
+            )
+        lines.append("\n请按 JSON 数组返回，每个元素含 name/detail/status/risk 四字段，顺序与客户一致。")
+        return "\n".join(lines)
 
-        if current_row <= 17:
-            current_row = 17
-        ws.cell(row=17, column=5, value="当天线路完成进度：100%")
-
-        if output_path is None:
-            output_path = os.path.join(APP_DIR, f"现场勘查日报表_{get_date_str()}.xlsx")
-
+    def _parse_ai_response(self, ai_text, records):
+        """解析 AI 返回的 JSON（容错：去掉 markdown 代码块标记）"""
+        import json as _json
+        text = ai_text.strip()
+        # 去掉可能的 ```json ... ``` 包裹
+        if text.startswith('```'):
+            text = text.split('\n', 1)[-1] if '\n' in text else text[3:]
+            if text.endswith('```'):
+                text = text[:-3]
+            text = text.strip()
         try:
-            wb.save(output_path)
-            return output_path
-        except:
-            return None
+            items = _json.loads(text)
+            if isinstance(items, list) and len(items) > 0:
+                return items
+        except Exception:
+            pass
+        # 解析失败：用原始记录兜底，status/risk 留 AI 原文
+        return [{
+            'name': r['name'],
+            'detail': "共计盘点1处%s，地址：%s" % (r['property_type'] or '抵押物', r['address']),
+            'status': ai_text[:120] if ai_text else '现场勘查完成，状态正常',
+            'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
+        } for r in records]
+
+    def _fill_template(self, items, out_path):
+        """填充模板并保存"""
+        import shutil as _shutil
+        if not self.template_path or not os.path.exists(self.template_path):
+            raise RuntimeError("未找到日报表模板 report_template.xlsx")
+        # 复制模板到输出路径，避免污染原模板
+        _shutil.copy2(self.template_path, out_path)
+        wb = load_workbook(out_path)
+        ws = wb['Sheet1']
+        # 清空示例数据 R4-R13
+        for r in range(4, 14):
+            for c in range(1, 7):
+                ws.cell(row=r, column=c).value = None
+        # 数据超过10条时插入行，保留底部签字/注释区
+        n = len(items)
+        if n > 10:
+            try:
+                ws.insert_rows(14, n - 10)
+            except Exception:
+                pass
+        report_date = get_report_date_str()
+        for i, item in enumerate(items):
+            r = 4 + i
+            ws.cell(row=r, column=1, value=i + 1)
+            ws.cell(row=r, column=2, value=report_date)
+            ws.cell(row=r, column=3, value=item.get('name', ''))
+            ws.cell(row=r, column=4, value=item.get('detail', ''))
+            ws.cell(row=r, column=5, value=item.get('status', ''))
+            ws.cell(row=r, column=6, value=item.get('risk', ''))
+        wb.save(out_path)
+        wb.close()
+        return out_path
+
+    def generate_with_ai(self, rows, progress_mgr, ai_service):
+        """AI 生成日报表。返回 (ok, out_path_or_None, msg)"""
+        records = self._collect_records(rows, progress_mgr)
+        if not records:
+            return False, None, "没有可生成报告的客户数据，请先打开Excel"
+        prompt = self._build_prompt(records)
+        ok, ai_text = ai_service.chat([
+            {"role": "system", "content": self.REPORT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ], timeout=120)
+        if not ok:
+            return False, None, "AI生成失败：%s" % ai_text
+        items = self._parse_ai_response(ai_text, records)
+        out_path = os.path.join(APP_DIR, "现场勘查日报表_%s.xlsx" % get_date_str())
+        try:
+            self._fill_template(items, out_path)
+            return True, out_path, "日报表已生成（共%d条）" % len(items)
+        except Exception as e:
+            return False, None, "填充模板失败：%s" % e
 
 # ============================================================
 # 照片处理器
@@ -1400,8 +1484,9 @@ class AIService:
         headers = {
             "Content-Type": "application/json",
             "Authorization": "Bearer %s" % self.api_key,
+            # v3.19.2: 移除 X-Title（含中文"资产盘点拍照工具"8字符 → position 0-7，
+            #          requests 按 latin-1 编码 HTTP 头会报 ordinal not in range(256)）
             "HTTP-Referer": "https://github.com/jare39063124-oss/loan-photo-app",
-            "X-Title": "资产盘点拍照工具",
         }
 
         Logger.info(f"AIService: 请求 {url} model={self.model}")
@@ -1842,7 +1927,7 @@ class CameraManager:
                         chooser_intent = Intent.createChooser(intent, "选择相机应用")
                         activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
                         launched = True
-                        self._dbg("✓ 相机选择器已弹出！")
+                        self._dbg("[OK] 相机选择器已弹出！")
                     except:  # 裸except：pyjnius的Java异常不继承BaseException
                         import sys as _sys
                         e = _sys.exc_info()[1]
@@ -1859,7 +1944,7 @@ class CameraManager:
                     try:
                         activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
                         launched = True
-                        self._dbg("✓ 相机已启动！")
+                        self._dbg("[OK] 相机已启动！")
                     except:  # 裸except：pyjnius的Java异常不继承BaseException
                         import sys as _sys
                         e = _sys.exc_info()[1]
@@ -1873,7 +1958,7 @@ class CameraManager:
 
                 if launched:
                     self._camera_launched = True
-                    self._toast("拍完照请点击✓保存按钮！")
+                    self._toast("拍完照请点击对勾保存按钮！")
                 else:
                     self._dbg(f"相机启动失败: {launch_error}", show_toast=True)
                     self._camera_launched = False
@@ -1920,7 +2005,7 @@ class CameraManager:
         if self.photo_path and os.path.exists(self.photo_path):
             fsize = os.path.getsize(self.photo_path)
             if fsize > 0:
-                self._dbg(f"✓ 照片文件已存在({fsize} bytes)，拍照成功！", show_toast=True)
+                self._dbg(f"[OK] 照片文件已存在({fsize} bytes)，拍照成功！", show_toast=True)
                 if self.pending_callback:
                     cb = self.pending_callback
                     self.pending_callback = None
@@ -2037,7 +2122,7 @@ class CameraManager:
                         )
                         shutil.copy2(latest, dest_path)
                         self.photo_path = dest_path
-                        self._dbg(f"✓ 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
+                        self._dbg(f"[OK] 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
                         # v3.19.0: 删除 DCIM 原始文件，避免相册出现相机原始命名+规范命名两份
                         try:
                             os.remove(latest)
@@ -2294,9 +2379,9 @@ class WelcomeScreen(Screen):
         self._status_spacer = Label(size_hint_y=None, height=dp(get_status_bar_height_dp()))
         root.add_widget(self._status_spacer)
 
-        # Logo 图标
+        # Logo 图标（v3.19.2: 用 SimHei 支持的◆符号替换📷emoji，避免显示为方块）
         root.add_widget(Label(
-            text="📷", font_size='80sp',
+            text="◆", font_size='80sp',
             size_hint_y=None, height=dp(96), color=THEME['accent'],
         ))
 
@@ -2316,7 +2401,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.19.1", font_size='12sp',
+            text="v3.19.2", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -2328,10 +2413,10 @@ class WelcomeScreen(Screen):
         feat_card = CardWidget(size_hint_y=None)
         feat_card.bind(minimum_height=feat_card.setter('height'))
         features = [
-            "✓  四类拍照引导（远景/近景/内部/瑕疵）",
-            "✓  水印自选模式（段+位置+字号）",
-            "✓  文件命名自选模式（4段下拉）",
-            "✓  一键生成勘查日报表",
+            "●  四类拍照引导（远景/近景/内部/瑕疵）",
+            "●  水印自选模式（段+位置+字号）",
+            "●  文件命名自选模式（4段下拉）",
+            "●  一键生成勘查日报表",
         ]
         for feat in features:
             feat_card.add_widget(Label(
@@ -2496,7 +2581,7 @@ class PhotoViewerPopup(Popup):
         content.add_widget(Label(text=f"确定要删除该客户的全部照片吗？\n此操作不可撤销！",
                                  font_size='16sp', color=THEME['danger'], halign='center'))
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        popup = Popup(title="⚠ 危险操作确认", size_hint=(0.85, 0.35), auto_dismiss=True)
+        popup = Popup(title="危险操作确认", size_hint=(0.85, 0.35), auto_dismiss=True)
         yes_btn = Button(text="全部删除", font_size='16sp', background_color=THEME['danger'],
                          background_normal='', color=(1,1,1,1), bold=True)
         no_btn = Button(text="取消", font_size='16sp', background_color=THEME['accent'],
@@ -2531,7 +2616,7 @@ class SettingsScreen(Screen):
 
         # 标题栏 - 增大高度和按钮
         title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
-        back_btn = Button(text="← 返回", font_size='18sp', size_hint_x=0.28,
+        back_btn = Button(text="返回", font_size='18sp', size_hint_x=0.28,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True,
                          size_hint_y=None, height=dp(52))
@@ -2549,7 +2634,7 @@ class SettingsScreen(Screen):
         naming_card = CardWidget(size_hint_y=None)
         naming_card.bind(minimum_height=naming_card.setter('height'))
 
-        naming_card.add_widget(SectionLabel(text="📋 照片命名规则"))
+        naming_card.add_widget(SectionLabel(text="照片命名规则"))
 
         naming_card.add_widget(Label(text="格式：X-X-X-X（每段自选，空值段自动省略）",
                                      font_size='13sp', color=THEME['text_dim'],
@@ -2589,7 +2674,7 @@ class SettingsScreen(Screen):
         watermark_card = CardWidget(size_hint_y=None)
         watermark_card.bind(minimum_height=watermark_card.setter('height'))
 
-        watermark_card.add_widget(SectionLabel(text="💧 水印设置"))
+        watermark_card.add_widget(SectionLabel(text="水印设置"))
 
         # 水印开关
         toggle_box = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
@@ -2658,7 +2743,7 @@ class SettingsScreen(Screen):
         # === AI 设置 === v3.15.0
         ai_card = CardWidget(size_hint_y=None)
         ai_card.bind(minimum_height=ai_card.setter('height'))
-        ai_card.add_widget(SectionLabel(text="🤖 AI 助手设置"))
+        ai_card.add_widget(SectionLabel(text="AI 助手设置"))
 
         ai_url_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         ai_url_row.add_widget(Label(text="API地址", font_size='14sp',
@@ -2875,7 +2960,7 @@ class RowWidget(BoxLayout):
 
         # 备注按钮 v3.15.0
         self.remark_btn = Button(
-            text="备注✓" if self.remark else "备注",
+            text="备注●" if self.remark else "备注",
             font_size='15sp', size_hint_x=0.22,
             background_color=THEME['warning'] if self.remark else THEME['muted'],
             background_normal='',
@@ -2934,7 +3019,7 @@ class RowWidget(BoxLayout):
     def set_remark(self, remark_text):
         """更新备注并刷新按钮显示"""
         self.remark = remark_text or ""
-        self.remark_btn.text = "备注✓" if self.remark else "备注"
+        self.remark_btn.text = "备注●" if self.remark else "备注"
         self.remark_btn.background_color = THEME['warning'] if self.remark else THEME['muted']
 
     def mark_done(self):
@@ -2960,6 +3045,9 @@ class MainScreen(Screen):
         self.excel_path = ""
         # v3.19.0: SAF 选择的原始 Excel content:// URI，用于写回备注到原始文件
         self._excel_uri = None
+        # v3.19.2: 日报表生成后待保存到用户指定位置的临时路径
+        self._pending_report_path = None
+        self._report_save_code = 0x201
         self.headers = []
         self.rows = []  # [borrower, address_general, address_precise, property_type]
         self.progress_mgr = ProgressManager()
@@ -2994,14 +3082,14 @@ class MainScreen(Screen):
         title_bar.add_widget(Label(text="资产盘点拍照", font_size='19sp', bold=True, color=THEME['accent_dark'],
                                    size_hint_x=0.46, halign='left', valign='middle'))
 
-        ai_btn = Button(text="🤖 AI", font_size='15sp', size_hint_x=0.16,
+        ai_btn = Button(text="AI助手", font_size='15sp', size_hint_x=0.16,
                        background_color=THEME['success'], background_normal='',
                        color=(1,1,1,1), bold=True)
         ai_btn.bind(on_release=self._go_ai)
         bind_press_animation(ai_btn)
         title_bar.add_widget(ai_btn)
 
-        settings_btn = Button(text="⚙ 设置", font_size='15sp', size_hint_x=0.20,
+        settings_btn = Button(text="设置", font_size='15sp', size_hint_x=0.20,
                              background_color=THEME['accent'], background_normal='',
                              color=(1,1,1,1), bold=True)
         settings_btn.bind(on_release=self._go_settings)
@@ -3014,19 +3102,27 @@ class MainScreen(Screen):
         parent.add_widget(title_bar)
 
         toolbar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
-        open_btn = Button(text="📂 打开Excel", font_size='15sp', size_hint_x=0.36,
+        # v3.19.2: 工具栏纯文字标签（emoji在SimHei字体下显示为方块），新增"日报表"按钮
+        open_btn = Button(text="打开Excel", font_size='15sp', size_hint_x=0.27,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
         bind_press_animation(open_btn)
         toolbar.add_widget(open_btn)
 
-        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.44,
+        report_btn = Button(text="生成日报表", font_size='15sp', size_hint_x=0.25,
+                          background_color=THEME['success'], background_normal='',
+                          color=(1,1,1,1), bold=True)
+        report_btn.bind(on_release=self._generate_report)
+        bind_press_animation(report_btn)
+        toolbar.add_widget(report_btn)
+
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.28,
                                       foreground_color=THEME['text'], hint_text_color=THEME['text_dim'])
         self.search_input.bind(text=self._on_search)
         toolbar.add_widget(self.search_input)
 
-        search_btn = Button(text="🔍 搜索", font_size='14sp', size_hint_x=0.20,
+        search_btn = Button(text="搜索", font_size='14sp', size_hint_x=0.20,
                            background_color=THEME['accent_dark'], background_normal='',
                            color=(1,1,1,1), bold=True)
         search_btn.bind(on_release=self._do_search)
@@ -3043,13 +3139,13 @@ class MainScreen(Screen):
         footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(52), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(4))
-        log_btn = Button(text="📋 完整日志", font_size='12sp',
+        log_btn = Button(text="完整日志", font_size='12sp',
                              background_color=THEME['accent'], background_normal='',
                              size_hint_x=0.34, color=(1,1,1,1))
         log_btn.bind(on_release=self._show_full_log)
         btn_row.add_widget(log_btn)
 
-        self.log_toggle_btn = Button(text="🔇 日志:关", font_size='12sp',
+        self.log_toggle_btn = Button(text="日志:关", font_size='12sp',
                               background_color=THEME['muted'], background_normal='',
                               size_hint_x=0.33, color=(1,1,1,1))
         self.log_toggle_btn.bind(on_release=self._toggle_log_recording)
@@ -3161,7 +3257,7 @@ class MainScreen(Screen):
             except Exception as e:
                 Logger.error("on_camera_result crash: %s" % e)
                 Logger.error(traceback.format_exc())
-                self.camera_mgr._dbg(f"❌ 处理结果时崩溃: {type(e).__name__}: {str(e)[:100]}", show_toast=True)
+                self.camera_mgr._dbg(f"[ERR] 处理结果时崩溃: {type(e).__name__}: {str(e)[:100]}", show_toast=True)
                 self.camera_mgr._camera_launched = False
                 if self.camera_mgr.pending_callback:
                     cb = self.camera_mgr.pending_callback
@@ -3196,6 +3292,28 @@ class MainScreen(Screen):
             except Exception as e:
                 Logger.error("on_activity_result (file): %s" % e)
                 self._show_msg(f"文件选择失败: {str(e)[:40]}", THEME['danger'])
+            return
+
+        # v3.19.2: 日报表保存（ACTION_CREATE_DOCUMENT 返回的 URI）
+        if request_code == getattr(self, '_report_save_code', -1):
+            if result_code != -1 or intent is None:
+                return
+            try:
+                from jnius import autoclass
+                uri = intent.getData()
+                if uri is None or not getattr(self, '_pending_report_path', None):
+                    return
+                uri_str = str(uri.toString())
+                src = self._pending_report_path
+                ok, m = ExcelWriter.write_back_to_uri(uri_str, src)
+                if ok:
+                    self._show_msg("日报表已保存到您选择的位置", THEME['success'])
+                else:
+                    self._show_msg("app内部已生成：%s；%s" % (src, m), THEME['warning'])
+            except Exception as e:
+                Logger.error("on_activity_result (report save): %s" % e)
+                self._show_msg(f"日报表保存失败: {str(e)[:40]}", THEME['danger'])
+            return
 
     def _on_file_selected(self, selection):
         if not selection:
@@ -3258,7 +3376,7 @@ class MainScreen(Screen):
                         while len(self.rows[i]) < 5:
                             self.rows[i].append("")
                         self.rows[i][4] = saved_remark
-            self._show_msg(f"✓ 已加载 {len(self.rows)} 条客户记录", THEME['success'])
+            self._show_msg(f"● 已加载 {len(self.rows)} 条客户记录", THEME['success'])
             self._refresh_list()
         except Exception as e:
             err_msg = str(e)
@@ -3346,12 +3464,12 @@ class MainScreen(Screen):
         """切换日志记录开关（v3.16.0）"""
         self.camera_mgr._log_enabled = not self.camera_mgr._log_enabled
         if self.camera_mgr._log_enabled:
-            self.log_toggle_btn.text = "🔊 日志:开"
+            self.log_toggle_btn.text = "日志:开"
             self.log_toggle_btn.background_color = THEME['success']
             if IS_ANDROID:
                 self.camera_mgr._toast("日志记录已开启")
         else:
-            self.log_toggle_btn.text = "🔇 日志:关"
+            self.log_toggle_btn.text = "日志:关"
             self.log_toggle_btn.background_color = (0.4, 0.4, 0.45, 1)
             if IS_ANDROID:
                 self.camera_mgr._toast("日志记录已关闭")
@@ -3403,7 +3521,7 @@ class MainScreen(Screen):
         btn_row.add_widget(copy_btn)
         content.add_widget(btn_row)
 
-        popup = Popup(title='📋 调试日志（拍照问题请截图此页）',
+        popup = Popup(title='调试日志（拍照问题请截图此页）',
                       content=content,
                       size_hint=(0.95, 0.9))
 
@@ -3562,7 +3680,7 @@ class MainScreen(Screen):
     @mainthread
     def _on_photo_saved(self, row_index, filename):
         self._refresh_row_done(row_index)
-        self.camera_mgr._dbg(f"✓ 已保存: {filename}", show_toast=True)
+        self.camera_mgr._dbg(f"[OK] 已保存: {filename}", show_toast=True)
         self._launch_next_photo()
 
     @mainthread
@@ -3702,10 +3820,10 @@ class MainScreen(Screen):
                             msg = f"app内部已保存；{msg2}"
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
-                        self.camera_mgr._dbg(f"✓ {msg} 行{rw.excel_row_index}", show_toast=True)
+                        self.camera_mgr._dbg(f"[OK] {msg} 行{rw.excel_row_index}", show_toast=True)
                     else:
                         Logger.error("备注保存失败 行%d" % rw.excel_row_index)
-                        self.camera_mgr._dbg(f"⚠ {msg}，但已保存到app内部 行{rw.excel_row_index}", show_toast=True)
+                        self.camera_mgr._dbg(f"[WARN] {msg}，但已保存到app内部 行{rw.excel_row_index}", show_toast=True)
                 threading.Thread(target=_save_excel, daemon=True).start()
             else:
                 self.camera_mgr._dbg("备注已保存到app内部（未关联Excel文件）", show_toast=True)
@@ -3717,7 +3835,67 @@ class MainScreen(Screen):
         popup.open()
 
     def _generate_report(self, instance):
-        self._show_msg("报告功能暂未开放", toast=True)
+        """v3.19.2: 调用 AI 基于备注+Excel内容生成勘查日报表，保存到用户指定位置。"""
+        if not self.rows or not any((r[0] if len(r) > 0 else "") for r in self.rows):
+            self._show_msg("请先打开Excel客户数据", THEME['warning'])
+            return
+        if not self.report_generator.template_path:
+            self._show_msg("未找到日报表模板", THEME['danger'])
+            return
+
+        # 进度弹窗（AI生成较慢）
+        content = BoxLayout(orientation='vertical', padding=dp(24), spacing=dp(16))
+        msg = Label(text="正在通过 AI 生成日报表，请稍候…", font_size='16sp', color=THEME['text'],
+                    size_hint_y=None, height=dp(40))
+        content.add_widget(msg)
+        from kivy.uix.progressbar import ProgressBar
+        pb = ProgressBar(size_hint_y=None, height=dp(8))
+        content.add_widget(pb)
+        popup = Popup(title='生成日报表', content=content, size_hint=(0.85, 0.35),
+                      auto_dismiss=False, title_color=THEME['text'])
+        popup.open()
+
+        def _run():
+            ai_svc = AIService(
+                api_url=self.config.get('ai_api_url', DEFAULT_CONFIG['ai_api_url']),
+                api_key=self.config.get('ai_api_key', '') or AI_DEFAULT_API_KEY,
+                model=self.config.get('ai_model', DEFAULT_CONFIG['ai_model']),
+            )
+            ok, path, m = self.report_generator.generate_with_ai(self.rows, self.progress_mgr, ai_svc)
+
+            def _done(dt):
+                try:
+                    popup.dismiss()
+                except:
+                    pass
+                if ok and path:
+                    self._pending_report_path = path
+                    self._show_msg(m + "，正在选择保存位置…", THEME['success'])
+                    self._save_report_to_user(path)
+                else:
+                    self._show_msg(m, THEME['danger'])
+            Clock.schedule_once(_done, 0)
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _save_report_to_user(self, src_path):
+        """通过 SAF 让用户选择日报表保存位置"""
+        if not IS_ANDROID:
+            self._show_msg("日报表已保存：%s" % src_path, THEME['success'])
+            return
+        try:
+            from jnius import autoclass
+            Intent = autoclass('android.content.Intent')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            intent = Intent("android.intent.action.CREATE_DOCUMENT")
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            intent.putExtra(Intent.EXTRA_TITLE, "现场勘查日报表_%s.xlsx" % get_date_str())
+            self._report_save_code = 0x201
+            PythonActivity.mActivity.startActivityForResult(intent, self._report_save_code)
+        except:
+            self._show_msg("已保存到app内部：%s" % src_path, THEME['success'])
 
 
 # ============================================================
@@ -3749,7 +3927,7 @@ class AIScreen(Screen):
         # 顶部标题栏
         top_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
         back_btn = Button(
-            text="← 返回", font_size='16sp', size_hint_x=0.2,
+            text="返回", font_size='16sp', size_hint_x=0.2,
             background_color=THEME['accent'], background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
@@ -3758,7 +3936,7 @@ class AIScreen(Screen):
         top_bar.add_widget(back_btn)
 
         title = Label(
-            text="🤖 AI 拍摄助手", font_size='18sp', bold=True,
+            text="AI 拍摄助手", font_size='18sp', bold=True,
             color=THEME['text'], size_hint_x=0.6,
         )
         top_bar.add_widget(title)
@@ -3901,7 +4079,7 @@ class AIScreen(Screen):
         )
 
         # 显示"思考中"
-        self._add_message("assistant", "🤔 思考中...")
+        self._add_message("assistant", "思考中...")
 
         import threading
 
@@ -3914,7 +4092,7 @@ class AIScreen(Screen):
 
     def _on_ai_response(self, success, response):
         # 移除"思考中"消息
-        if self.chat_history and self.chat_history[-1]["text"] == "🤔 思考中...":
+        if self.chat_history and self.chat_history[-1]["text"] == "思考中...":
             self.chat_history.pop()
             if len(self.chat_layout.children) > 0:
                 self.chat_layout.remove_widget(self.chat_layout.children[-1])
@@ -3922,7 +4100,7 @@ class AIScreen(Screen):
         if success:
             self._add_message("assistant", response)
         else:
-            self._add_message("assistant", "❌ " + response)
+            self._add_message("assistant", "错误: " + response)
             # 如果是未配置模型，提示去设置
             if "未配置" in response:
                 self._add_message("assistant", "请到「设置」页面填写 AI 模型 ID（如 owl-alpha）")

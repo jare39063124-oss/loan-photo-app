@@ -2,7 +2,7 @@ $repo = "jare39063124-oss/loan-photo-app"
 $apiBase = "https://api.github.com/repos/$repo"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $projectDir = "D:\hermes\loan_photo_app"
-$finalApkName = "loan-photo-tool-v3.19.1.apk"
+$finalApkName = "loan-photo-tool-v3.19.2.apk"
 $destPath = Join-Path $desktop $finalApkName
 
 Write-Host "=== Step 1: Git Push (retry every 60s) ===" -ForegroundColor Cyan
@@ -92,8 +92,8 @@ while ($true) {
 
 Write-Host ""
 Write-Host "=== Step 4: Downloading APK via nightly.link ===" -ForegroundColor Cyan
-$tempZip = Join-Path $env:TEMP "loan-apk-v3191.zip"
-$extractDir = Join-Path $env:TEMP "loan-apk-v3191-extract"
+$tempZip = Join-Path $env:TEMP "loan-apk-v3192.zip"
+$extractDir = Join-Path $env:TEMP "loan-apk-v3192-extract"
 $downloadUrl = "https://nightly.link/$repo/actions/runs/$runId/loan-photo-apk.zip"
 if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
 if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
@@ -114,7 +114,7 @@ if ($apks.Count -gt 0) {
     $finalSize = [math]::Round((Get-Item $destPath).Length / 1MB, 2)
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host "  v3.19.1 APK READY!" -ForegroundColor Green
+    Write-Host "  v3.19.2 APK READY!" -ForegroundColor Green
     Write-Host "  File: $finalApkName"
     Write-Host "  Size: ${finalSize} MB"
     Write-Host "  Path: $destPath"
