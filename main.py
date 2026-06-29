@@ -2228,15 +2228,17 @@ class CameraManager:
 # ============================================================
 
 def bind_press_animation(btn, scale=0.94, duration=0.08):
-    """v3.19.0: 为按钮绑定按压缩放动画，带来流畅的交互反馈。
-    按下时缩小，松开时弹回，配合 SlideTransition 让操作更顺滑。
+    """v3.19.0: 为按钮绑定按压动画，带来流畅的交互反馈。
+    注意：Kivy 的 Button/Widget 没有 scale_x/scale_y 属性（那是 Scatter 的），
+    用 scale_x 会触发 AttributeError 导致闪退。改用 opacity 做按压反馈，
+    按下时轻微变透明，松开时还原，配合 SlideTransition 让操作更顺滑。
     """
     from kivy.animation import Animation
     def _on_down(instance, touch):
         if instance.collide_point(*touch.pos):
-            Animation(scale_x=scale, scale_y=scale, duration=duration, t='out_quad').start(instance)
+            Animation(opacity=0.72, duration=duration, t='out_quad').start(instance)
     def _on_up(instance, touch):
-        Animation(scale_x=1.0, scale_y=1.0, duration=duration, t='out_elastic').start(instance)
+        Animation(opacity=1.0, duration=duration * 1.2, t='out_quad').start(instance)
     btn.bind(on_touch_down=_on_down)
     btn.bind(on_touch_up=_on_up)
 
@@ -2314,7 +2316,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.19.0", font_size='12sp',
+            text="v3.19.1", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -2985,10 +2987,10 @@ class MainScreen(Screen):
         title_bar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
         with title_bar.canvas.before:
             Color(*THEME['card'])
-            self._header_rect = RoundedRectangle(pos=title_bar.pos, size=title_bar.size, radius=[0])
+            self._titlebar_rect = RoundedRectangle(pos=title_bar.pos, size=title_bar.size, radius=[0])
             Color(*THEME['card_border'])
-            self._header_border = Line(rectangle=(title_bar.x, title_bar.y, title_bar.width, title_bar.height), width=1)
-        title_bar.bind(pos=self._update_header_rect, size=self._update_header_rect)
+            self._titlebar_border = Line(rectangle=(title_bar.x, title_bar.y, title_bar.width, title_bar.height), width=1)
+        title_bar.bind(pos=self._update_titlebar_rect, size=self._update_titlebar_rect)
         title_bar.add_widget(Label(text="资产盘点拍照", font_size='19sp', bold=True, color=THEME['accent_dark'],
                                    size_hint_x=0.46, halign='left', valign='middle'))
 
@@ -3085,19 +3087,24 @@ class MainScreen(Screen):
         header = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36),
                            padding=[dp(10), dp(4), dp(10), dp(4)], spacing=dp(6))
         with header.canvas.before:
-            Color(0.20, 0.22, 0.28, 1)
+            # v3.19.0: 浅色主题表头——浅蓝灰底，避免深色硬编码
+            Color(*THEME['accent'])
             self._header_rect = RoundedRectangle(pos=header.pos, size=header.size, radius=[4])
         header.bind(pos=self._update_header_rect, size=self._update_header_rect)
         header.add_widget(Label(text="客户名 / 抵押物地址", font_size='13sp', bold=True,
-                                color=THEME['accent'], size_hint_x=0.6, halign='left'))
+                                color=(1, 1, 1, 1), size_hint_x=0.6, halign='left'))
         header.add_widget(Label(text="操作", font_size='13sp', bold=True,
-                                color=THEME['accent'], size_hint_x=0.4, halign='center'))
+                                color=(1, 1, 1, 1), size_hint_x=0.4, halign='center'))
         return header
+
+    def _update_titlebar_rect(self, instance, *args):
+        self._titlebar_rect.pos = instance.pos
+        self._titlebar_rect.size = instance.size
+        self._titlebar_border.rectangle = (instance.x, instance.y, instance.width, instance.height)
 
     def _update_header_rect(self, instance, *args):
         self._header_rect.pos = instance.pos
         self._header_rect.size = instance.size
-        self._header_border.rectangle = (instance.x, instance.y, instance.width, instance.height)
 
     def _show_file_dialog(self, instance):
         """打开系统文件选择器。Android使用SAF(Intent.ACTION_OPEN_DOCUMENT)获取可访问URI，
