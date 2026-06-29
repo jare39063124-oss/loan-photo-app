@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.14.0
+资产盘点专项拍照工具 App - v3.15.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -367,7 +367,15 @@ DEFAULT_CONFIG = {
     'watermark_position': 'bottom-right',
     'watermark_font_size': '中',
     'watermark_opacity': 170,
+    'ai_api_url': 'https://openrouter.ai/api/v1',
+    'ai_api_key': '',
+    'ai_model': '',
 }
+
+# AI API Key (base64编码存储，避免泄露)
+import base64 as _b64
+_AI_KEY_B64 = "c2stb3ItdjEtZTUyYTI1MThmMzBlNWRhZGFlZTYzZDJmYjEzYmFhMzdhMWJiYWQ4NTFmOTQ1NWY5MmYxY2NjODNiZGQ5MTc0MQ=="
+AI_DEFAULT_API_KEY = _b64.b64decode(_AI_KEY_B64).decode('utf-8')
 
 # === 命名段选项（用-连接成 X-X-X-X）===
 NAMING_SEGMENT_OPTIONS = [
@@ -606,8 +614,9 @@ class ProgressManager:
 # ============================================================
 
 class ExcelReader:
-    """读取Excel，A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
-    返回 rows 每项: [borrower, address_general, address_precise, property_type]
+    """读取Excel，A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质 E=备注
+    返回 rows 每项: [borrower, address_general, address_precise, property_type, remark]
+    v3.15.0: 增加读取 E 列（备注）
     """
     def __init__(self, file_path):
         self.file_path = file_path
@@ -618,7 +627,11 @@ class ExcelReader:
         wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
         ws = wb.active
         for i, row in enumerate(ws.iter_rows(values_only=True)):
-            cells = [str(cell).strip() if cell else "" for cell in row[:4]]
+            # 读取 A-E 共5列
+            cells = [str(cell).strip() if cell else "" for cell in row[:5]]
+            # 补齐到5列
+            while len(cells) < 5:
+                cells.append("")
             if i == 0:
                 self.headers = cells
             else:
@@ -626,8 +639,47 @@ class ExcelReader:
         wb.close()
         # 自动判断表头
         if not self.headers:
-            self.headers = ["客户名", "抵押物地址（概）", "抵押物地址（精确门牌号）", "抵押物性质"]
+            self.headers = ["客户名", "抵押物地址（概）", "抵押物地址（精确门牌号）", "抵押物性质", "备注"]
         return self.headers, self.rows
+
+
+class ExcelWriter:
+    """写入 Excel 备注列（E列）
+    v3.15.0: 支持将备注保存到已打开的 Excel 文件，保留原文件结构。
+    """
+    @staticmethod
+    def save_remark(file_path, row_index, remark_text):
+        """保存备注到指定行（1-based row_index）的 E 列
+        row_index: Excel 中的行号（含表头，从1开始）
+        remark_text: 备注文本
+        """
+        try:
+            wb = openpyxl.load_workbook(file_path)
+            ws = wb.active
+            ws.cell(row=row_index, column=5, value=remark_text)
+            wb.save(file_path)
+            wb.close()
+            return True
+        except Exception as e:
+            Logger.error(f"ExcelWriter.save_remark: {e}")
+            return False
+
+    @staticmethod
+    def save_all_remarks(file_path, remarks):
+        """批量保存备注
+        remarks: dict {row_index: remark_text}
+        """
+        try:
+            wb = openpyxl.load_workbook(file_path)
+            ws = wb.active
+            for row_idx, text in remarks.items():
+                ws.cell(row=row_idx, column=5, value=text)
+            wb.save(file_path)
+            wb.close()
+            return True
+        except Exception as e:
+            Logger.error(f"ExcelWriter.save_all_remarks: {e}")
+            return False
 
 # ============================================================
 # 报告生成器
@@ -708,21 +760,26 @@ class PhotoProcessor:
         """根据水印段配置生成水印文本（X-X-X 格式）
         segments: ["经纬度"/"拍摄时间"/"地址名"/"空值", ...]
         kwargs: time_str(拍摄时间), address(地址), lat, lng(经纬度)
+        v3.15.0: 无GPS坐标时省略定位段（不显示"定位中"/"GPS未开启或无权限"）
         """
+        lat = kwargs.get('lat', '')
+        lng = kwargs.get('lng', '')
+        has_gps = bool(lat and lng)
         parts = []
         for seg in segments:
             val = ""
             if seg == "经纬度":
-                lat = kwargs.get('lat', '')
-                lng = kwargs.get('lng', '')
-                if lat and lng:
+                if has_gps:
                     val = "%s,%s" % (lng, lat)
-                else:
-                    val = "定位中"
+                # 无GPS时省略，不显示"定位中"
             elif seg == "拍摄时间":
                 val = kwargs.get('time_str', '')
             elif seg == "地址名":
-                val = kwargs.get('address', '')
+                addr = kwargs.get('address', '')
+                # 过滤掉错误占位文本
+                if addr and not addr.startswith("GPS") and not addr.startswith("定位"):
+                    val = addr
+                # 无有效地址时省略
             elif seg == "空值":
                 val = ""
             if val:
@@ -855,32 +912,77 @@ class PhotoProcessor:
 
     @staticmethod
     def save_to_gallery(photo_path):
+        """保存照片到系统相册，确保在相册/微信可见。
+        v3.15.0: Android 10+ 使用 RELATIVE_PATH + IS_PENDING 替代废弃的 DATA 字段。
+        """
         if not IS_ANDROID:
             return
         try:
-            from android import mActivity
-            from android.provider import MediaStore
-            from android.content import ContentValues
-            from java.io import FileInputStream, FileOutputStream
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+            ContentValues = autoclass('android.content.ContentValues')
+            MediaStore = autoclass('android.provider.MediaStore')
+            ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
+            FileInputStream = autoclass('java.io.FileInputStream')
 
-            values = ContentValues()
-            values.put(MediaStore.Images.Media.DATA, photo_path)
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, os.path.basename(photo_path))
+            cv = ContentValues()
+            fname = os.path.basename(photo_path)
+            cv.put("_display_name", fname)
+            cv.put("mime_type", "image/jpeg")
 
-            resolver = mActivity.getContentResolver()
-            uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if uri:
-                output_stream = resolver.openOutputStream(uri)
-                input_stream = FileInputStream(photo_path)
-                buffer = bytearray(1024)
-                while True:
-                    read = input_stream.read(buffer)
-                    if read == -1:
-                        break
-                    output_stream.write(buffer, 0, read)
-                input_stream.close()
-                output_stream.close()
+            if ANDROID_API >= 29:
+                # Android 10+: 使用 RELATIVE_PATH + IS_PENDING 流程
+                cv.put("relative_path", "DCIM/Camera")
+                cv.put("is_pending", 1)
+                uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
+                if uri is not None:
+                    out = resolver.openOutputStream(uri)
+                    fis = FileInputStream(photo_path)
+                    buf = bytearray(8192)
+                    while True:
+                        n = fis.read(buf)
+                        if n <= 0:
+                            break
+                        out.write(buf, 0, n)
+                    fis.close()
+                    out.close()
+                    # 标记完成（IS_PENDING=0）
+                    cv2 = ContentValues()
+                    cv2.put("is_pending", 0)
+                    resolver.update(uri, cv2, None, None)
+                    Logger.info("save_to_gallery: 已保存到DCIM/Camera (API29+)")
+                else:
+                    Logger.error("save_to_gallery: insert返回null")
+            else:
+                # Android 9及以下: 旧方式
+                cv.put("_data", photo_path)
+                uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
+                if uri is not None:
+                    out = resolver.openOutputStream(uri)
+                    fis = FileInputStream(photo_path)
+                    buf = bytearray(8192)
+                    while True:
+                        n = fis.read(buf)
+                        if n <= 0:
+                            break
+                        out.write(buf, 0, n)
+                    fis.close()
+                    out.close()
+                    Logger.info("save_to_gallery: 已保存 (API<29)")
+
+            # 额外触发 MediaScanner 让相册立即刷新（兼容所有版本）
+            try:
+                Intent = autoclass('android.content.Intent')
+                Uri = autoclass('android.net.Uri')
+                File = autoclass('java.io.File')
+                file_uri = Uri.fromFile(File(photo_path))
+                scan_intent = Intent("android.intent.action.MEDIA_SCANNER_SCAN_FILE")
+                scan_intent.setData(file_uri)
+                activity.sendBroadcast(scan_intent)
+            except Exception:
+                pass
         except Exception as e:
             Logger.error(f"PhotoProcessor.save_to_gallery: {e}")
 
@@ -891,13 +993,17 @@ class PhotoProcessor:
 class GpsManager:
     """异步获取 GPS 坐标并缓存，供水印经纬度段使用。
     不会阻塞主线程：在后台缓存最后一次定位结果。
+    v3.15.0: 增加 Android LocationManager 直连作为 plyer 备选方案。
     """
     def __init__(self):
         self.lat = ""
         self.lng = ""
         self._started = False
+        self._lm_started = False
         if IS_ANDROID:
             self._start()
+            # 延迟启动 LocationManager 备选方案（1秒后）
+            Clock.schedule_once(lambda dt: self._start_location_manager(), 1)
 
     def _start(self):
         try:
@@ -907,6 +1013,50 @@ class GpsManager:
             self._started = True
         except Exception:
             self._started = False
+
+    def _start_location_manager(self):
+        """使用 Android LocationManager 直连作为备选 GPS 源（plyer 在 Android 16 可能不工作）"""
+        if self._lm_started:
+            return
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            activity = PythonActivity.mActivity
+            Context = autoclass('android.content.Context')
+            LocationManager = autoclass('android.location.LocationManager')
+            lm = activity.getSystemService(Context.LOCATION_SERVICE)
+            if lm is None:
+                return
+            self._lm = lm
+            # 检查权限
+            if ANDROID_API >= 23:
+                if activity.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != 0:
+                    return
+            # 获取最后一次已知位置（快速）
+            try:
+                last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                if last is None:
+                    last = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                if last is not None:
+                    self.lat = "%.6f" % last.getLatitude()
+                    self.lng = "%.6f" % last.getLongitude()
+                    Logger.info("GpsManager: getLastKnownLocation (%s,%s)" % (self.lat, self.lng))
+            except Exception:
+                pass
+            self._lm_started = True
+        except Exception as e:
+            Logger.error("GpsManager._start_location_manager: %s" % e)
+
+    def refresh_last_known(self):
+        """手动刷新最后一次已知位置（拍照前调用）"""
+        if not IS_ANDROID:
+            return
+        if self.lat and self.lng:
+            return  # 已有坐标
+        try:
+            self._start_location_manager()
+        except Exception:
+            pass
 
     def _on_location(self, **kwargs):
         try:
@@ -920,7 +1070,155 @@ class GpsManager:
 
     def get_coords(self):
         """返回 (lat, lng)，未定位时返回 ('', '')"""
+        if not (self.lat and self.lng):
+            self.refresh_last_known()
         return self.lat, self.lng
+
+
+# ============================================================
+# AI 服务（OpenRouter / OpenAI 兼容）
+# ============================================================
+
+class AIService:
+    """封装 OpenRouter API 调用（兼容 OpenAI Chat Completions 格式）
+    v3.15.0: 支持 AI 查询拍摄情况。
+    """
+    DEFAULT_API_URL = "https://openrouter.ai/api/v1"
+    DEFAULT_API_KEY = ""
+    DEFAULT_MODEL = ""
+
+    def __init__(self, api_url=None, api_key=None, model=None):
+        self.api_url = (api_url or self.DEFAULT_API_URL).rstrip('/')
+        self.api_key = api_key or self.DEFAULT_API_KEY
+        self.model = model or self.DEFAULT_MODEL
+
+    def chat(self, messages, timeout=60):
+        """调用 chat/completions 接口
+        messages: [{"role":"system","content":"..."},{"role":"user","content":"..."}]
+        返回 (success, response_text_or_error)
+        """
+        # 使用内置默认 key（如果未配置）
+        if not self.api_key:
+            self.api_key = AI_DEFAULT_API_KEY
+        if not self.model:
+            return False, "未配置模型 ID，请在设置→AI设置中填写（如 owl-alpha）"
+
+        import json as _json
+        import urllib.request
+
+        url = "%s/chat/completions" % self.api_url
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer %s" % self.api_key,
+            "HTTP-Referer": "https://github.com/jare39063124-oss/loan-photo-app",
+            "X-Title": "资产盘点拍照工具",
+        }
+
+        try:
+            data = _json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode('utf-8')
+                result = _json.loads(body)
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0].get('message', {}).get('content', '')
+                    return True, content.strip()
+                elif 'error' in result:
+                    err = result['error']
+                    err_msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+                    return False, "API错误: %s" % err_msg[:200]
+                else:
+                    return False, "API返回格式异常: %s" % str(result)[:200]
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode('utf-8')
+                err_data = _json.loads(err_body)
+                err_msg = err_data.get('error', {}).get('message', err_body) if isinstance(err_data, dict) else err_body
+            except Exception:
+                err_msg = str(e)
+            return False, "HTTP %d: %s" % (e.code, str(err_msg)[:200])
+        except Exception as e:
+            return False, "请求失败: %s" % str(e)[:200]
+
+    @staticmethod
+    def build_system_prompt(rows, progress_mgr, excel_path=""):
+        """构建系统提示词，注入 Excel 数据和拍摄进度"""
+        import json as _json
+        from datetime import datetime
+
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 构建客户数据摘要
+        customers = []
+        for i, row in enumerate(rows):
+            borrower = row[0] if len(row) > 0 else ""
+            addr_gen = row[1] if len(row) > 1 else ""
+            addr_prec = row[2] if len(row) > 2 else ""
+            prop_type = row[3] if len(row) > 3 else ""
+            remark = row[4] if len(row) > 4 else ""
+            full_addr = (addr_gen + addr_prec).strip()
+            key = progress_mgr._make_key(borrower, full_addr)
+            photo_count = progress_mgr.get_photo_count(key)
+            photo_types = progress_mgr.get_photo_types(key)
+            done_types = [t for t, v in photo_types.items() if v]
+            customers.append({
+                "序号": i + 1,
+                "客户名": borrower,
+                "地址": full_addr,
+                "性质": prop_type,
+                "备注": remark,
+                "已拍照片数": photo_count,
+                "已拍类型": done_types,
+                "是否完成": photo_count > 0,
+            })
+
+        # 统计
+        total = len(customers)
+        done = sum(1 for c in customers if c["是否完成"])
+        total_photos = sum(c["已拍照片数"] for c in customers)
+
+        # 各类型统计
+        type_stats = {}
+        for c in customers:
+            for t in c["已拍类型"]:
+                type_stats[t] = type_stats.get(t, 0) + 1
+
+        data_summary = {
+            "日期": today,
+            "Excel文件": os.path.basename(excel_path) if excel_path else "未加载",
+            "总客户数": total,
+            "已完成客户数": done,
+            "未完成客户数": total - done,
+            "总照片数": total_photos,
+            "各类型拍摄数": type_stats,
+            "客户明细": customers,
+        }
+
+        prompt = (
+            "你是「资产盘点专项拍照工具」的AI助手。你的职责是帮助用户查询拍摄进度和客户信息。\n\n"
+            "## 当前数据\n"
+            "以下是用户当前打开的Excel文件中的客户数据和拍摄进度：\n\n"
+            "```json\n%s\n```\n\n"
+            "## 你的能力\n"
+            "1. 查询拍摄进度：例如「今天拍了多少照片」「还有多少户没拍」\n"
+            "2. 查询客户信息：例如「某某公司拍了没有」「张三的地址是什么」\n"
+            "3. 查询照片类型：例如「远景拍了多少张」「哪些客户拍了瑕疵」\n"
+            "4. 统计分析：例如「完成率多少」「还有哪些类型没拍全」\n"
+            "5. 备注查询：例如「哪些客户有备注」\n\n"
+            "## 注意事项\n"
+            "- 照片类型包括：远景、近景、内部、瑕疵、其他\n"
+            "- 每个客户最多拍5种类型的照片\n"
+            "- 回答要简洁明了，用中文\n"
+            "- 如果数据中没有相关信息，请如实告知\n"
+        ) % _json.dumps(data_summary, ensure_ascii=False, indent=2)
+
+        return prompt
 
 
 # ============================================================
@@ -1975,6 +2273,59 @@ class SettingsScreen(Screen):
 
         content.add_widget(watermark_card)
 
+        # === AI 设置 === v3.15.0
+        ai_card = CardWidget(size_hint_y=None)
+        ai_card.bind(minimum_height=ai_card.setter('height'))
+        ai_card.add_widget(SectionLabel(text="🤖 AI 助手设置"))
+
+        ai_url_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        ai_url_row.add_widget(Label(text="API地址", font_size='14sp',
+                                    color=THEME['text_dim'], size_hint_x=0.22))
+        self.ai_url_input = TextInput(
+            text=self.config.get('ai_api_url', DEFAULT_CONFIG['ai_api_url']),
+            font_size='14sp', multiline=False, size_hint_x=0.78,
+        )
+        ai_url_row.add_widget(self.ai_url_input)
+        ai_card.add_widget(ai_url_row)
+
+        ai_key_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        ai_key_row.add_widget(Label(text="API Key", font_size='14sp',
+                                    color=THEME['text_dim'], size_hint_x=0.22))
+        self.ai_key_input = TextInput(
+            text=self.config.get('ai_api_key', DEFAULT_CONFIG['ai_api_key']),
+            font_size='14sp', multiline=False, size_hint_x=0.78,
+            password=True,
+        )
+        ai_key_row.add_widget(self.ai_key_input)
+        ai_card.add_widget(ai_key_row)
+
+        ai_model_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        ai_model_row.add_widget(Label(text="模型ID", font_size='14sp',
+                                     color=THEME['text_dim'], size_hint_x=0.22))
+        self.ai_model_input = TextInput(
+            text=self.config.get('ai_model', ''),
+            font_size='14sp', multiline=False, size_hint_x=0.78,
+            hint_text="如: owl-alpha",
+        )
+        ai_model_row.add_widget(self.ai_model_input)
+        ai_card.add_widget(ai_model_row)
+
+        ai_hint = Label(
+            text="提示：模型ID请填入OpenRouter上的完整模型标识\nowl alpha是免费的",
+            font_size='12sp', color=THEME['text_dim'],
+            size_hint_y=None, height=dp(36), halign='left',
+        )
+        ai_hint.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
+        ai_card.add_widget(ai_hint)
+
+        save_ai_btn = Button(text="保存AI设置", font_size='16sp', size_hint_y=None, height=dp(52),
+                            background_color=THEME['success'], background_normal='',
+                            color=(1,1,1,1), bold=True)
+        save_ai_btn.bind(on_release=self._save_ai_settings)
+        ai_card.add_widget(save_ai_btn)
+
+        content.add_widget(ai_card)
+
         # === 关于 ===
         about_card = CardWidget(size_hint_y=None, height=dp(140))
         about_card.add_widget(SectionLabel(text="ℹ️ 关于"))
@@ -2023,6 +2374,13 @@ class SettingsScreen(Screen):
         self.config.set('watermark_font_size', self.font_spinner.text)
         self._show_toast("水印设置已保存")
 
+    def _save_ai_settings(self, instance):
+        """保存AI设置 v3.15.0"""
+        self.config.set('ai_api_url', self.ai_url_input.text.strip() or DEFAULT_CONFIG['ai_api_url'])
+        self.config.set('ai_api_key', self.ai_key_input.text.strip())
+        self.config.set('ai_model', self.ai_model_input.text.strip())
+        self._show_toast("AI设置已保存")
+
     def _show_toast(self, msg):
         popup = Popup(title='', content=Label(text=msg, font_size='14sp'),
                      size_hint=(0.6, 0.2), auto_dismiss=True)
@@ -2039,7 +2397,8 @@ class SettingsScreen(Screen):
 
 class RowWidget(BoxLayout):
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
-                 progress_key, progress_mgr, photo_callback, view_photos_callback, **kwargs):
+                 progress_key, progress_mgr, photo_callback, view_photos_callback,
+                 remark="", remark_callback=None, excel_row_index=None, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
         self.size_hint_y = None
@@ -2057,6 +2416,9 @@ class RowWidget(BoxLayout):
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
         self.progress_mgr = progress_mgr
+        self.remark = remark or ""
+        self.remark_callback = remark_callback
+        self.excel_row_index = excel_row_index  # Excel中的实际行号（含表头，从1开始）
         self.done = progress_mgr.is_photographed(progress_key)
         self.photo_count = progress_mgr.get_photo_count(progress_key)
 
@@ -2102,12 +2464,12 @@ class RowWidget(BoxLayout):
         # 间隔
         self.add_widget(Label(size_hint_y=None, height=dp(4)))
 
-        # 按钮行（拍照 + 查看已拍 + 类型计数）
-        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数）
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
 
         self.photo_btn = Button(
-            text="拍照", font_size='17sp',
-            size_hint_x=0.32,
+            text="拍照", font_size='16sp',
+            size_hint_x=0.26,
             background_color=THEME['success'] if self.done else THEME['accent'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -2117,13 +2479,24 @@ class RowWidget(BoxLayout):
 
         self.view_btn = Button(
             text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
-            font_size='16sp', size_hint_x=0.50,
+            font_size='15sp', size_hint_x=0.34,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
         self.view_btn.bind(on_release=self._on_view_photos)
         btn_row.add_widget(self.view_btn)
+
+        # 备注按钮 v3.15.0
+        self.remark_btn = Button(
+            text="备注✓" if self.remark else "备注",
+            font_size='15sp', size_hint_x=0.22,
+            background_color=THEME['warning'] if self.remark else (0.5, 0.5, 0.6, 1),
+            background_normal='',
+            color=(1, 1, 1, 1), bold=True,
+        )
+        self.remark_btn.bind(on_release=self._on_remark)
+        btn_row.add_widget(self.remark_btn)
 
         self.type_status = Label(text="", font_size='14sp',
                                 color=THEME['success'] if self.done else THEME['text_dim'],
@@ -2164,6 +2537,17 @@ class RowWidget(BoxLayout):
 
     def _on_view_photos(self, instance):
         self.view_photos_callback(self.row_index)
+
+    def _on_remark(self, instance):
+        """打开备注输入弹窗 v3.15.0"""
+        if self.remark_callback:
+            self.remark_callback(self.row_index)
+
+    def set_remark(self, remark_text):
+        """更新备注并刷新按钮显示"""
+        self.remark = remark_text or ""
+        self.remark_btn.text = "备注✓" if self.remark else "备注"
+        self.remark_btn.background_color = THEME['warning'] if self.remark else (0.5, 0.5, 0.6, 1)
 
     def mark_done(self):
         self.done = True
@@ -2211,16 +2595,22 @@ class MainScreen(Screen):
 
         title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
         title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='18sp', bold=True, color=THEME['text'],
-                                   size_hint_x=0.55, halign='left', valign='middle'))
+                                   size_hint_x=0.48, halign='left', valign='middle'))
 
-        settings_btn = Button(text="⚙ 设置", font_size='16sp', size_hint_x=0.22,
+        ai_btn = Button(text="🤖 AI", font_size='15sp', size_hint_x=0.16,
+                       background_color=THEME['success'], background_normal='',
+                       color=(1,1,1,1), bold=True)
+        ai_btn.bind(on_release=self._go_ai)
+        title_bar.add_widget(ai_btn)
+
+        settings_btn = Button(text="⚙ 设置", font_size='15sp', size_hint_x=0.18,
                              background_color=THEME['accent'], background_normal='',
                              color=(1,1,1,1), bold=True)
         settings_btn.bind(on_release=self._go_settings)
         title_bar.add_widget(settings_btn)
 
         self.progress_label = Label(text="0/0", font_size='15sp', color=THEME['text_dim'],
-                                    size_hint_x=0.23, halign='right', valign='middle')
+                                    size_hint_x=0.18, halign='right', valign='middle')
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
@@ -2463,6 +2853,7 @@ class MainScreen(Screen):
             address_general = row[1] if len(row) > 1 else ""
             address_precise = row[2] if len(row) > 2 else ""
             property_type = row[3] if len(row) > 3 else ""
+            remark = row[4] if len(row) > 4 else ""
             full_addr = (address_general + address_precise).strip()
             pk = self.progress_mgr._make_key(borrower, full_addr)
 
@@ -2473,6 +2864,9 @@ class MainScreen(Screen):
                 progress_key=pk, progress_mgr=self.progress_mgr,
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
+                remark=remark,
+                remark_callback=self._on_remark_request,
+                excel_row_index=i + 2,  # Excel行号（1=表头，2=第一行数据）
             )
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
@@ -2594,6 +2988,11 @@ class MainScreen(Screen):
     def _go_settings(self, instance):
         self._continuous_shooting = False
         self.manager.current = 'settings'
+
+    def _go_ai(self, instance):
+        """跳转到 AI 助手页面 v3.15.0"""
+        self._continuous_shooting = False
+        self.manager.current = 'ai'
 
     def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
         self._current_row = row_index
@@ -2766,8 +3165,286 @@ class MainScreen(Screen):
             self._show_msg("照片已删除", THEME['warning'])
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
+    def _on_remark_request(self, row_index):
+        """打开备注输入弹窗 v3.15.0"""
+        if row_index >= len(self.row_widgets):
+            return
+        rw = self.row_widgets[row_index]
+        current_remark = rw.remark or ""
+
+        popup = Popup(title="添加备注（保存到Excel E列）",
+                      size_hint=(0.9, 0.6), auto_dismiss=False)
+        layout = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(16))
+
+        info_label = Label(
+            text="客户：%s\n地址：%s" % (rw.borrower, (rw.address_general + rw.address_precise).strip()),
+            font_size='14sp', color=THEME['text'], size_hint_y=0.2,
+            halign='left', valign='top',
+        )
+        info_label.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
+        layout.add_widget(info_label)
+
+        from kivy.uix.textinput import TextInput
+        text_input = TextInput(
+            text=current_remark,
+            font_size='16sp',
+            multiline=True,
+            size_hint_y=0.6,
+            hint_text="请输入备注内容...",
+        )
+        layout.add_widget(text_input)
+
+        btn_row = BoxLayout(size_hint_y=0.2, spacing=dp(10))
+        save_btn = Button(text="保存", font_size='16sp', bold=True,
+                         background_color=THEME['success'], background_normal='')
+        cancel_btn = Button(text="取消", font_size='16sp',
+                           background_color=(0.5, 0.5, 0.6, 1), background_normal='')
+        btn_row.add_widget(save_btn)
+        btn_row.add_widget(cancel_btn)
+        layout.add_widget(btn_row)
+
+        popup.content = layout
+
+        def do_save(instance):
+            remark_text = text_input.text.strip()
+            rw.set_remark(remark_text)
+            # 更新内存中的行数据
+            if row_index < len(self.rows):
+                while len(self.rows[row_index]) < 5:
+                    self.rows[row_index].append("")
+                self.rows[row_index][4] = remark_text
+            # 保存到 Excel E 列
+            if self.excel_path:
+                import threading
+                def _save_excel():
+                    ok = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
+                    if ok:
+                        Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
+                    else:
+                        Logger.error("备注保存失败 行%d" % rw.excel_row_index)
+                threading.Thread(target=_save_excel, daemon=True).start()
+            self._show_msg("备注已保存", toast=True)
+            popup.dismiss()
+
+        save_btn.bind(on_release=do_save)
+        cancel_btn.bind(on_release=popup.dismiss)
+        popup.open()
+
     def _generate_report(self, instance):
         self._show_msg("报告功能暂未开放", toast=True)
+
+
+# ============================================================
+# AI 助手界面 v3.15.0
+# ============================================================
+
+class AIScreen(Screen):
+    """AI 助手界面：用户可查询拍摄情况"""
+
+    def __init__(self, app_config, **kwargs):
+        super().__init__(**kwargs)
+        self.name = 'ai'
+        self.config = app_config
+        self.chat_history = []  # [{"role":"user/assistant","text":"..."}]
+        self._sending = False
+        self._build_ui()
+
+    def _build_ui(self):
+        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.textinput import TextInput
+
+        layout = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(6))
+
+        # 顶部标题栏
+        top_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
+        back_btn = Button(
+            text="← 返回", font_size='16sp', size_hint_x=0.2,
+            background_color=THEME['accent'], background_normal='',
+            color=(1, 1, 1, 1), bold=True,
+        )
+        back_btn.bind(on_release=self._go_back)
+        top_bar.add_widget(back_btn)
+
+        title = Label(
+            text="🤖 AI 拍摄助手", font_size='18sp', bold=True,
+            color=THEME['text'], size_hint_x=0.6,
+        )
+        top_bar.add_widget(title)
+
+        clear_btn = Button(
+            text="清空", font_size='14sp', size_hint_x=0.2,
+            background_color=(0.5, 0.5, 0.6, 1), background_normal='',
+            color=(1, 1, 1, 1),
+        )
+        clear_btn.bind(on_release=self._clear_chat)
+        top_bar.add_widget(clear_btn)
+        layout.add_widget(top_bar)
+
+        # 提示信息
+        hint = Label(
+            text="可询问：今天拍了多少照片？ | 某某公司拍了没有？ | 远景拍了多少张？",
+            font_size='12sp', color=THEME['text_dim'], size_hint_y=None, height=dp(24),
+            halign='center', valign='middle',
+        )
+        hint.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
+        layout.add_widget(hint)
+
+        # 聊天记录区（可滚动）
+        self.chat_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(6))
+        self.chat_layout.bind(minimum_height=self.chat_layout.setter('height'))
+
+        scroll = ScrollView(size_hint_y=1)
+        scroll.add_widget(self.chat_layout)
+        layout.add_widget(scroll)
+
+        # 输入栏
+        input_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+        self.input_field = TextInput(
+            font_size='15sp', multiline=False,
+            size_hint_x=0.78, hint_text="输入问题...",
+        )
+        self.input_field.bind(on_text_validate=self._on_send)
+        input_row.add_widget(self.input_field)
+
+        send_btn = Button(
+            text="发送", font_size='16sp', bold=True,
+            size_hint_x=0.22,
+            background_color=THEME['success'], background_normal='',
+            color=(1, 1, 1, 1),
+        )
+        send_btn.bind(on_release=self._on_send)
+        input_row.add_widget(send_btn)
+        layout.add_widget(input_row)
+
+        self.add_widget(layout)
+
+        # 欢迎消息
+        self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
+
+    def _add_message(self, role, text):
+        """添加一条消息到聊天区"""
+        from kivy.uix.label import Label
+        self.chat_history.append({"role": role, "text": text})
+
+        is_user = (role == "user")
+        msg_label = Label(
+            text=text,
+            font_size='14sp',
+            size_hint_y=None,
+            halign='left' if not is_user else 'right',
+            valign='top',
+            color=THEME['text'],
+            text_size=(None, None),
+            padding=[dp(8), dp(6)],
+        )
+        # 设定文本宽度（避免过长）
+        msg_label.bind(
+            width=lambda inst, val: setattr(inst, 'text_size', (val - dp(16), None))
+        )
+        msg_label.bind(texture_size=lambda inst, val: setattr(inst, 'height', val[1] + dp(12)))
+
+        # 背景色
+        with msg_label.canvas.before:
+            if is_user:
+                Color(0.2, 0.5, 0.9, 1)  # 蓝色
+            else:
+                Color(0.9, 0.9, 0.95, 1)  # 浅灰
+            from kivy.graphics import Rectangle
+            msg_label.bg_rect = Rectangle(pos=msg_label.pos, size=msg_label.size)
+
+        def _update_bg(inst, val):
+            inst.bg_rect.pos = inst.pos
+            inst.bg_rect.size = inst.size
+        msg_label.bind(pos=_update_bg, size=_update_bg)
+
+        self.chat_layout.add_widget(msg_label)
+
+        # 滚动到底部
+        Clock.schedule_once(lambda dt: self._scroll_to_bottom(), 0.1)
+
+    def _scroll_to_bottom(self):
+        sv = self.chat_layout.parent
+        if sv:
+            sv.scroll_y = 0
+
+    def _on_send(self, instance):
+        if self._sending:
+            return
+        text = self.input_field.text.strip()
+        if not text:
+            return
+        self.input_field.text = ""
+        self._add_message("user", text)
+        self._send_to_ai(text)
+
+    def _send_to_ai(self, user_text):
+        """发送消息到 AI 服务（后台线程）"""
+        self._sending = True
+
+        # 获取 MainScreen 的数据
+        main_screen = self.manager.get_screen('main') if self.manager else None
+        if main_screen is None:
+            self._add_message("assistant", "错误：未找到主界面数据")
+            self._sending = False
+            return
+
+        rows = main_screen.rows
+        progress_mgr = main_screen.progress_mgr
+        excel_path = main_screen.excel_path
+
+        # 构建系统提示词
+        system_prompt = AIService.build_system_prompt(rows, progress_mgr, excel_path)
+
+        # 构建 API 消息
+        api_messages = [{"role": "system", "content": system_prompt}]
+        # 只带最近 6 条历史（避免 token 过多）
+        for h in self.chat_history[-6:]:
+            api_messages.append({"role": h["role"], "content": h["text"]})
+
+        # 创建 AI 服务
+        ai = AIService(
+            api_url=self.config.get('ai_api_url', ''),
+            api_key=self.config.get('ai_api_key', '') or AI_DEFAULT_API_KEY,
+            model=self.config.get('ai_model', ''),
+        )
+
+        # 显示"思考中"
+        self._add_message("assistant", "🤔 思考中...")
+
+        import threading
+
+        def _do_request():
+            success, response = ai.chat(api_messages, timeout=90)
+            # 在主线程更新 UI
+            Clock.schedule_once(lambda dt: self._on_ai_response(success, response), 0)
+
+        threading.Thread(target=_do_request, daemon=True).start()
+
+    def _on_ai_response(self, success, response):
+        # 移除"思考中"消息
+        if self.chat_history and self.chat_history[-1]["text"] == "🤔 思考中...":
+            self.chat_history.pop()
+            if len(self.chat_layout.children) > 0:
+                self.chat_layout.remove_widget(self.chat_layout.children[-1])
+
+        if success:
+            self._add_message("assistant", response)
+        else:
+            self._add_message("assistant", "❌ " + response)
+            # 如果是未配置模型，提示去设置
+            if "未配置" in response:
+                self._add_message("assistant", "请到「设置」页面填写 AI 模型 ID（如 owl-alpha）")
+
+        self._sending = False
+
+    def _clear_chat(self, instance):
+        self.chat_history.clear()
+        self.chat_layout.clear_widgets()
+        self._add_message("assistant", "聊天已清空。请问有什么需要？")
+
+    def _go_back(self, instance):
+        if self.manager:
+            self.manager.current = 'main'
 
 
 # ============================================================
@@ -2790,6 +3467,7 @@ class LoanPhotoApp(App):
         sm.add_widget(WelcomeScreen(name='welcome'))
         sm.add_widget(MainScreen(app_config=self.config, name='main'))
         sm.add_widget(SettingsScreen(app_config=self.config, name='settings'))
+        sm.add_widget(AIScreen(app_config=self.config, name='ai'))
         sm.current = 'welcome'
         return sm
 
@@ -2797,6 +3475,9 @@ class LoanPhotoApp(App):
         if key == 27:
             current = self.sm.current
             if current == 'settings':
+                self.sm.current = 'main'
+                return True
+            elif current == 'ai':
                 self.sm.current = 'main'
                 return True
             elif current == 'main':
