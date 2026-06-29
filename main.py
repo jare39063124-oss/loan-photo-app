@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.16.0
+资产盘点专项拍照工具 App - v3.17.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -15,6 +15,7 @@ import os
 import json
 import sys
 import re
+import time
 import traceback
 from datetime import datetime
 from collections import defaultdict
@@ -503,14 +504,17 @@ class AppConfig:
 # ============================================================
 
 class ProgressManager:
-    """拍照进度管理 - 用借款人+地址作为持久化key，跨Excel文件可识别"""
+    """拍照进度管理 - 用借款人+地址作为持久化key，跨Excel文件可识别
+    v3.17.0: 增加备注持久化（remark字段），退出app后备注不丢失。
+    key = md5(借款人|地址概+地址精确)，即A+B+C列拼接，确保同借款人不同抵押物唯一识别。
+    """
     def __init__(self, filepath=None):
         self.filepath = filepath or PROGRESS_FILE
         self.data = {}
         self.load()
 
     def _make_key(self, borrower, address=""):
-        """基于借款人+地址生成持久化key"""
+        """基于借款人+地址(A+B+C列)生成持久化key"""
         raw = (borrower + "|" + address).strip("|")
         return hashlib.md5(raw.encode('utf-8')).hexdigest()[:16]
 
@@ -530,9 +534,9 @@ class ProgressManager:
             Logger.error(f"ProgressManager.save: {e}")
 
     def mark_photo(self, key, photo_path, photo_type=""):
-        """key = _make_key(borrower, address)"""
+        """key = _make_key(borrower, address_general, address_precise)"""
         if key not in self.data:
-            self.data[key] = {"photos": [], "types": {}, "timestamp": ""}
+            self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
         # 验证并保存完整路径
         self.data[key]["photos"].append(os.path.abspath(photo_path))
         if photo_type:
@@ -540,16 +544,33 @@ class ProgressManager:
         self.data[key]["timestamp"] = get_full_datetime_str()
         self.save()
 
+    def save_remark(self, key, remark_text):
+        """保存备注到持久化存储（v3.17.0）"""
+        if key not in self.data:
+            self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
+        self.data[key]["remark"] = remark_text
+        self.save()
+
+    def get_remark(self, key):
+        """获取备注（v3.17.0）"""
+        if key not in self.data:
+            return ""
+        return self.data[key].get("remark", "")
+
     def delete_photo(self, key, photo_index):
         if key in self.data and photo_index < len(self.data[key]["photos"]):
             self.data[key]["photos"].pop(photo_index)
             if not self.data[key]["photos"]:
-                del self.data[key]
+                # 保留remark字段，不删除整个entry（v3.17.0）
+                self.data[key]["photos"] = []
+                self.data[key]["types"] = {}
             self.save()
 
     def delete_all_photos(self, key):
         if key in self.data:
-            del self.data[key]
+            # 保留remark字段（v3.17.0）
+            self.data[key]["photos"] = []
+            self.data[key]["types"] = {}
             self.save()
 
     def is_photographed(self, key):
@@ -1471,25 +1492,71 @@ class CameraManager:
                 uri_set_ok = False
                 self._media_uri = None
 
-                # ========== API 30+：file:// URI不工作（照片大小为0），直接使用无EXTRA_OUTPUT ==========
-                # 相机自行保存到DCIM/Camera，拍完后通过DCIM扫描获取照片
-                if ANDROID_API >= 30:
-                    self._dbg("API 30+：不使用EXTRA_OUTPUT（file:// URI在Android 16不工作）")
-                    self._dbg("相机将自行保存照片，拍完照后通过DCIM扫描获取")
-                    self.photo_path = None
-                    self._media_uri = None
-                    # intent保持干净（无EXTRA_OUTPUT），策略4直接生效
-                else:
-                    # API < 30：尝试file:// URI策略
-                    self._dbg("尝试设置输出URI（用于高清照片）...")
+                # 记录拍摄前时间戳（用于DCIM扫描过滤旧照片）
+                self._photo_launch_time = time.time()
 
-                    # 策略1：file:// URI + 禁用StrictMode
+                # ========== 统一URI策略（API 30+和API < 30都尝试）==========
+                self._dbg("尝试设置输出URI（用于高清照片）...")
+
+                # 策略1：FileProvider content:// URI（官方推荐，全分辨率）
+                try:
+                    self._dbg("策略1: FileProvider URI")
+                    FileProvider = autoclass('androidx.core.content.FileProvider')
+                    authority = package_name + ".fileprovider"
+                    photo_file = File(self.photo_path)
+                    if photo_file.exists():
+                        photo_file.delete()
+                    photo_file.createNewFile()
+                    raw_uri = FileProvider.getUriForFile(activity, authority, photo_file)
+                    if raw_uri is not None:
+                        parcel_uri = cast('android.os.Parcelable', raw_uri)
+                        intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                        intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                        intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                        uri = raw_uri
+                        uri_set_ok = True
+                        self._dbg("  FileProvider URI成功（全分辨率）")
+                except Exception as e:
+                    self._dbg(f"  FileProvider失败: {str(e)[:100]}")
+                    intent = Intent(ACTION_IMAGE_CAPTURE)
+
+                # 策略2：MediaStore content:// URI（Android 10+，全分辨率）
+                if not uri_set_ok and ANDROID_API >= 29:
+                    self._dbg("策略2: MediaStore URI")
                     try:
+                        ImagesMedia = autoclass('android.provider.MediaStore$Images$Media')
+                        EXTERNAL_CONTENT_URI = ImagesMedia.EXTERNAL_CONTENT_URI
+                        ContentValues = autoclass('android.content.ContentValues')
+                        resolver = activity.getContentResolver()
+                        cv = ContentValues()
+                        cv.put("_display_name", photo_fname)
+                        cv.put("mime_type", "image/jpeg")
+                        cv.put("relative_path", "DCIM/Camera")
+                        cv.put("is_pending", 1)
+                        raw_uri = resolver.insert(EXTERNAL_CONTENT_URI, cv)
+                        if raw_uri is not None:
+                            parcel_uri = cast('android.os.Parcelable', raw_uri)
+                            intent.putExtra(EXTRA_OUTPUT, parcel_uri)
+                            intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
+                            intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
+                            uri = raw_uri
+                            self._media_uri = raw_uri
+                            uri_set_ok = True
+                            self.photo_path = None
+                            self._dbg("  MediaStore URI成功（全分辨率）")
+                    except Exception as e:
+                        self._dbg(f"  MediaStore失败: {str(e)[:100]}")
+                    if not uri_set_ok:
+                        intent = Intent(ACTION_IMAGE_CAPTURE)
+
+                # 策略3：file:// URI + 禁用StrictMode（API < 30）
+                if not uri_set_ok and ANDROID_API < 30:
+                    try:
+                        self._dbg("策略3: file:// URI")
                         photo_file = File(self.photo_path)
                         if photo_file.exists():
                             photo_file.delete()
                         photo_file.createNewFile()
-                        self._dbg("策略1: file:// URI")
                         try:
                             StrictMode = autoclass('android.os.StrictMode')
                             VmPolicyBuilder = autoclass('android.os.StrictMode$VmPolicy$Builder')
@@ -1506,68 +1573,17 @@ class CameraManager:
                         intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
                         uri = raw_uri
                         uri_set_ok = True
-                        self._dbg("  file:// URI设置成功（已cast为Parcelable）")
+                        self._dbg("  file:// URI设置成功")
                     except Exception as e:
-                        self._dbg(f"  file:// URI失败: {type(e).__name__}: {str(e)[:80]}")
+                        self._dbg(f"  file:// URI失败: {str(e)[:80]}")
                         intent = Intent(ACTION_IMAGE_CAPTURE)
 
-                    # 策略2：FileProvider content:// URI
-                    if not uri_set_ok:
-                        self._dbg("策略2: FileProvider URI")
-                        for fp_cls_name in ['androidx.core.content.FileProvider',
-                                             'android.support.v4.content.FileProvider']:
-                            try:
-                                FileProvider = autoclass(fp_cls_name)
-                                authority = package_name + ".fileprovider"
-                                photo_file2 = File(self.photo_path)
-                                raw_uri = FileProvider.getUriForFile(activity, authority, photo_file2)
-                                if raw_uri is not None:
-                                    parcel_uri = cast('android.os.Parcelable', raw_uri)
-                                    intent.putExtra(EXTRA_OUTPUT, parcel_uri)
-                                    intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                                    intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
-                                    uri = raw_uri
-                                    uri_set_ok = True
-                                    self._dbg(f"  FileProvider URI成功: {fp_cls_name.split('.')[-1]}")
-                                    break
-                            except Exception as e:
-                                self._dbg(f"  {fp_cls_name.split('.')[-1]}失败: {str(e)[:80]}")
-                        if not uri_set_ok:
-                            intent = Intent(ACTION_IMAGE_CAPTURE)
-
-                    # 策略3：MediaStore content:// URI
-                    if not uri_set_ok and ANDROID_API >= 29:
-                        self._dbg("策略3: MediaStore URI")
-                        try:
-                            ContentValues = autoclass('android.content.ContentValues')
-                            resolver = activity.getContentResolver()
-                            cv = ContentValues()
-                            cv.put("_display_name", photo_fname)
-                            cv.put("mime_type", "image/jpeg")
-                            cv.put("relative_path", "Pictures/LoanPhoto")
-                            media_ext_uri = Uri.parse("content://media/external/images/media")
-                            raw_uri = resolver.insert(media_ext_uri, cv)
-                            if raw_uri is not None:
-                                parcel_uri = cast('android.os.Parcelable', raw_uri)
-                                intent.putExtra(EXTRA_OUTPUT, parcel_uri)
-                                intent.addFlags(FLAG_GRANT_READ_URI_PERMISSION)
-                                intent.addFlags(FLAG_GRANT_WRITE_URI_PERMISSION)
-                                uri = raw_uri
-                                self._media_uri = raw_uri
-                                uri_set_ok = True
-                                self.photo_path = None
-                                self._dbg("  MediaStore URI成功")
-                        except Exception as e:
-                            self._dbg(f"  MediaStore失败: {str(e)[:100]}")
-                        if not uri_set_ok:
-                            intent = Intent(ACTION_IMAGE_CAPTURE)
-
-                    # 策略4：无EXTRA_OUTPUT（兜底）
-                    if not uri_set_ok:
-                        self._dbg("策略4: 无EXTRA_OUTPUT（从返回Intent获取照片）")
-                        self.photo_path = None
-                        self._media_uri = None
-                        intent = Intent(ACTION_IMAGE_CAPTURE)
+                # 策略4：无EXTRA_OUTPUT（兜底，只获取缩略图）
+                if not uri_set_ok:
+                    self._dbg("策略4: 无EXTRA_OUTPUT（兜底，仅缩略图）")
+                    self.photo_path = None
+                    self._media_uri = None
+                    intent = Intent(ACTION_IMAGE_CAPTURE)
 
                 # 尝试授予URI权限（如果有uri）
                 if uri is not None and uri_set_ok:
@@ -1726,11 +1742,13 @@ class CameraManager:
 
         # ========== 第3优先级：扫描DCIM/Camera目录获取最新照片 ==========
         # 在Intent处理之前执行DCIM扫描（Intent处理可能导致崩溃）
+        # v3.17.0: 使用拍摄前时间戳过滤旧照片，避免连拍循环
         if IS_ANDROID:
             self._dbg("扫描DCIM/Camera目录获取最新照片...")
             try:
-                import time
                 import shutil
+                launch_time = getattr(self, '_photo_launch_time', 0)
+                now = time.time()
                 dcim_dirs = [
                     '/storage/emulated/0/DCIM/Camera',
                     '/storage/emulated/0/DCIM/相机',
@@ -1748,7 +1766,12 @@ class CameraManager:
                     latest = files[0]
                     fsize = os.path.getsize(latest)
                     mtime = os.path.getmtime(latest)
-                    age = time.time() - mtime
+                    age = now - mtime
+                    # v3.17.0: 只接受拍摄后(launch_time之后)创建的照片
+                    # 避免复制旧照片导致连拍循环
+                    if launch_time > 0 and mtime < launch_time:
+                        self._dbg(f"DCIM最新: {os.path.basename(latest)} ({fsize}bytes, {age:.0f}秒前) - 早于拍摄时间，跳过")
+                        continue
                     self._dbg(f"DCIM最新: {os.path.basename(latest)} ({fsize}bytes, {age:.0f}秒前, {dcim_dir})")
                     if fsize > 10000 and age < 120:  # >10KB 且2分钟内
                         os.makedirs(APP_DIR, exist_ok=True)
@@ -2894,6 +2917,21 @@ class MainScreen(Screen):
         try:
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
+            # v3.17.0: 从progress_mgr恢复备注（Excel E列为空时用持久化备注）
+            for i, row in enumerate(self.rows):
+                borrower = row[0] if len(row) > 0 else ""
+                address_general = row[1] if len(row) > 1 else ""
+                address_precise = row[2] if len(row) > 2 else ""
+                remark = row[4] if len(row) > 4 else ""
+                if not remark:
+                    # Excel中没有备注，从progress_mgr恢复
+                    full_addr = (address_general + address_precise).strip()
+                    key = self.progress_mgr._make_key(borrower, full_addr)
+                    saved_remark = self.progress_mgr.get_remark(key)
+                    if saved_remark:
+                        while len(self.rows[i]) < 5:
+                            self.rows[i].append("")
+                        self.rows[i][4] = saved_remark
             self._show_msg(f"✓ 已加载 {len(self.rows)} 条客户记录", THEME['success'])
             self._refresh_list()
         except Exception as e:
@@ -3289,6 +3327,18 @@ class MainScreen(Screen):
                 while len(self.rows[row_index]) < 5:
                     self.rows[row_index].append("")
                 self.rows[row_index][4] = remark_text
+            # v3.17.0: 保存到progress_mgr（持久化到JSON，确保退出app后不丢失）
+            try:
+                row = self.rows[row_index]
+                borrower = row[0] if len(row) > 0 else ""
+                address_general = row[1] if len(row) > 1 else ""
+                address_precise = row[2] if len(row) > 2 else ""
+                full_addr = (address_general + address_precise).strip()
+                key = self.progress_mgr._make_key(borrower, full_addr)
+                self.progress_mgr.save_remark(key, remark_text)
+                self.camera_mgr._dbg(f"备注已保存到持久化存储(key={key})", show_toast=False)
+            except Exception as e:
+                Logger.error(f"备注保存到progress_mgr失败: {e}")
             # 保存到 Excel E 列
             if self.excel_path:
                 import threading
@@ -3296,8 +3346,10 @@ class MainScreen(Screen):
                     ok = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
+                        self.camera_mgr._dbg(f"✓ 备注已写入Excel 行{rw.excel_row_index}", show_toast=True)
                     else:
                         Logger.error("备注保存失败 行%d" % rw.excel_row_index)
+                        self.camera_mgr._dbg(f"⚠ Excel写入失败，但已保存到app内存 行{rw.excel_row_index}", show_toast=True)
                 threading.Thread(target=_save_excel, daemon=True).start()
             self._show_msg("备注已保存", toast=True)
             popup.dismiss()

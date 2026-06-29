@@ -6,11 +6,11 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf,xml
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
-version = 3.16.0
+version = 3.17.0
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius
 
-android.permissions = CAMERA,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_MEDIA_IMAGES,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
+android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_MEDIA_IMAGES,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 android.api = 35
 android.minapi = 26
 android.ndk = 28c
