@@ -399,8 +399,9 @@ WATERMARK_SEGMENT_OPTIONS = [
 ]
 
 # === 水印字号 ===
+# v3.19.0: 字号整体增大2倍，水印区域更大更清晰
 WATERMARK_FONT_SIZE_OPTIONS = ["大", "中", "小"]
-WATERMARK_FONT_SIZE_MAP = {"大": 40, "中": 28, "小": 18}
+WATERMARK_FONT_SIZE_MAP = {"大": 80, "中": 56, "小": 36}
 
 # === 水印位置 ===
 WATERMARK_POSITION_OPTIONS = ['bottom-right', 'bottom-left', 'top-right', 'top-left']
@@ -414,16 +415,20 @@ AUTHOR_PHONE = "15940454123（同微信）"
 AUTHOR_INFO = f"作者：{AUTHOR_NAME}\n联系方式：{AUTHOR_PHONE}\n有问题请联系作者"
 
 # === 颜色主题 ===
+# v3.19.0: 全面重新设计为明亮浅色主题，参考2026移动端设计趋势
+# （明亮配色 + 卡片化布局 + 柔和阴影 + 高对比度文字）
 THEME = {
-    'bg': (0.11, 0.11, 0.14, 1),
-    'card': (0.16, 0.17, 0.21, 1),
-    'accent': (0.22, 0.55, 0.85, 1),
-    'accent_dark': (0.17, 0.42, 0.72, 1),
-    'success': (0.25, 0.72, 0.32, 1),
-    'danger': (0.85, 0.25, 0.25, 1),
-    'text': (0.92, 0.92, 0.95, 1),
-    'text_dim': (0.55, 0.55, 0.65, 1),
-    'warning': (0.85, 0.80, 0.30, 1),
+    'bg': (0.95, 0.96, 0.98, 1),          # 明亮浅蓝灰背景 #F2F4F8
+    'card': (1.0, 1.0, 1.0, 1.0),         # 纯白卡片 #FFFFFF
+    'card_border': (0.86, 0.88, 0.92, 1), # 卡片浅灰描边
+    'accent': (0.13, 0.59, 0.95, 1),      # 活力蓝 #2196F3
+    'accent_dark': (0.08, 0.40, 0.78, 1), # 深蓝 #1465C7
+    'success': (0.20, 0.70, 0.36, 1),     # 清新绿 #33B35C
+    'danger': (0.95, 0.27, 0.21, 1),      # 珊瑚红 #F44336
+    'warning': (1.0, 0.62, 0.04, 1),     # 明亮琥珀 #FF9E0A
+    'text': (0.12, 0.13, 0.15, 1),       # 近黑文字 #1F2126
+    'text_dim': (0.42, 0.45, 0.50, 1),   # 中灰副文本 #6B7380
+    'muted': (0.62, 0.65, 0.70, 1),      # 禁用/次要按钮 #9EA6B3
 }
 
 # === 拍照类型 ===
@@ -755,6 +760,40 @@ class ExcelWriter:
             Logger.error(f"save_all_remarks工作副本写入失败: {e2}")
             return False
 
+    @staticmethod
+    def write_back_to_uri(uri_str, source_file):
+        """v3.19.0: 通过 SAF content:// URI 将本地 Excel 文件字节写回原始文件。
+        用于 Android 11+ scoped storage：直接写共享存储路径会失败，
+        但通过 ContentResolver.openOutputStream(uri) 可写回用户选择的原始文件。
+        返回: (bool, str) 是否成功, 提示。
+        """
+        if not IS_ANDROID or not uri_str or not os.path.exists(source_file):
+            return False, "无可用 URI 或源文件"
+        try:
+            from jnius import autoclass
+            Uri = autoclass('android.net.Uri')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            resolver = PythonActivity.mActivity.getContentResolver()
+            uri = Uri.parse(uri_str)
+            out = resolver.openOutputStream(uri)
+            FileInputStream = autoclass('java.io.FileInputStream')
+            fis = FileInputStream(source_file)
+            buf = bytearray(8192)
+            while True:
+                n = fis.read(buf)
+                if n <= 0:
+                    break
+                out.write(buf, 0, n)
+            fis.close()
+            out.close()
+            Logger.info(f"write_back_to_uri: 已写回原始 Excel URI")
+            return True, "已写回原始 Excel"
+        except:
+            import sys as _sys
+            e = _sys.exc_info()[1]
+            Logger.error(f"write_back_to_uri 失败: {e}")
+            return False, f"写回原始文件失败: {str(e)[:40] if e else ''}"
+
 # ============================================================
 # 报告生成器
 # ============================================================
@@ -870,6 +909,7 @@ class PhotoProcessor:
     @staticmethod
     def add_watermark(photo_path, config, **kwargs):
         """根据配置添加水印（段选择模式）。
+        v3.19.0: 水印区域与字体整体增大2倍，最小字号提升至24，保证清晰可读。
         v3.18.0: 改为每段独立一行，并按图片宽度自动缩放字体，避免显示不全。
         """
         if not config.get('watermark_enabled', True):
@@ -885,16 +925,17 @@ class PhotoProcessor:
             draw = ImageDraw.Draw(img)
 
             font_size_key = config.get('watermark_font_size', '中')
-            base_font_size = WATERMARK_FONT_SIZE_MAP.get(font_size_key, 28)
+            base_font_size = WATERMARK_FONT_SIZE_MAP.get(font_size_key, 56)
             opacity = config.get('watermark_opacity', 170)
             position = config.get('watermark_position', 'bottom-right')
 
-            padding = 12
+            # v3.19.0: 内边距与字号同步增大2倍
+            padding = 24
             max_width = max(img.width - padding * 2, 50)
 
-            # 计算能放下所有行的最大字号（最小 12，最大 base_font_size）
+            # 计算能放下所有行的最大字号（最小 24，最大 base_font_size）
             font_size = base_font_size
-            while font_size > 12:
+            while font_size > 24:
                 font = PhotoProcessor._get_font(font_size)
                 fits = True
                 for _, text in lines:
@@ -904,11 +945,11 @@ class PhotoProcessor:
                         break
                 if fits:
                     break
-                font_size -= 2
+                font_size -= 4
 
             font = PhotoProcessor._get_font(font_size)
-            line_height = font_size + 6
-            total_height = len(lines) * line_height + 8
+            line_height = font_size + 12
+            total_height = len(lines) * line_height + 16
 
             # 计算整体背景框尺寸
             max_text_width = 0
@@ -942,7 +983,7 @@ class PhotoProcessor:
             img = PILImage.alpha_composite(img, overlay)
 
             draw = ImageDraw.Draw(img)
-            cy = by + 4
+            cy = by + 8
             for _, text in lines:
                 draw.text((bx + padding / 2, cy), text, font=font, fill=(255, 255, 255))
                 cy += line_height
@@ -1937,6 +1978,14 @@ class CameraManager:
                 fsize = os.path.getsize(dest_path)
                 self._dbg(f"MediaStore照片已保存: {fsize} bytes")
                 if fsize > 0:
+                    # v3.19.0: 删除原始 MediaStore 条目，避免 DCIM/Camera 中出现
+                    # capture_xxx 与规范命名两份文件（save_to_gallery 会重新插入规范命名）
+                    try:
+                        resolver.delete(self._media_uri, None, None)
+                        self._dbg("已删除 MediaStore 临时条目，避免重复文件")
+                    except:
+                        pass
+                    self._media_uri = None
                     if self.pending_callback:
                         cb = self.pending_callback
                         self.pending_callback = None
@@ -1989,6 +2038,12 @@ class CameraManager:
                         shutil.copy2(latest, dest_path)
                         self.photo_path = dest_path
                         self._dbg(f"✓ 从DCIM复制照片成功: {os.path.getsize(dest_path)} bytes", show_toast=True)
+                        # v3.19.0: 删除 DCIM 原始文件，避免相册出现相机原始命名+规范命名两份
+                        try:
+                            os.remove(latest)
+                            self._dbg(f"已删除 DCIM 原文件 {os.path.basename(latest)}，避免重复")
+                        except:
+                            pass
                         if self.pending_callback:
                             cb = self.pending_callback
                             self.pending_callback = None
@@ -2172,21 +2227,40 @@ class CameraManager:
 # 自定义小组件
 # ============================================================
 
+def bind_press_animation(btn, scale=0.94, duration=0.08):
+    """v3.19.0: 为按钮绑定按压缩放动画，带来流畅的交互反馈。
+    按下时缩小，松开时弹回，配合 SlideTransition 让操作更顺滑。
+    """
+    from kivy.animation import Animation
+    def _on_down(instance, touch):
+        if instance.collide_point(*touch.pos):
+            Animation(scale_x=scale, scale_y=scale, duration=duration, t='out_quad').start(instance)
+    def _on_up(instance, touch):
+        Animation(scale_x=1.0, scale_y=1.0, duration=duration, t='out_elastic').start(instance)
+    btn.bind(on_touch_down=_on_down)
+    btn.bind(on_touch_up=_on_up)
+
+
 class CardWidget(BoxLayout):
-    """卡片式容器"""
+    """卡片式容器
+    v3.19.0: 明亮浅色主题——纯白卡片 + 浅灰描边 + 大圆角，更有层次感。
+    """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
-        self.padding = [12, 10, 12, 10]
+        self.padding = [14, 12, 14, 12]
         self.spacing = 6
         with self.canvas.before:
             Color(*THEME['card'])
-            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[6])
+            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[10])
+            Color(*THEME['card_border'])
+            self.border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, 10), width=1)
         self.bind(pos=self._update_rect, size=self._update_rect)
 
     def _update_rect(self, *args):
         self.rect.pos = self.pos
         self.rect.size = self.size
+        self.border.rounded_rectangle = (self.x, self.y, self.width, self.height, 10)
 
 
 class SectionLabel(Label):
@@ -2220,8 +2294,8 @@ class WelcomeScreen(Screen):
 
         # Logo 图标
         root.add_widget(Label(
-            text="📷", font_size='72sp',
-            size_hint_y=None, height=dp(90), color=THEME['accent'],
+            text="📷", font_size='80sp',
+            size_hint_y=None, height=dp(96), color=THEME['accent'],
         ))
 
         # 标题
@@ -2240,30 +2314,30 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.11.0", font_size='12sp',
+            text="v3.19.0", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
 
         # 间距
-        root.add_widget(Label(size_hint_y=None, height=dp(12)))
+        root.add_widget(Label(size_hint_y=None, height=dp(14)))
 
         # 功能简介卡片
         feat_card = CardWidget(size_hint_y=None)
         feat_card.bind(minimum_height=feat_card.setter('height'))
         features = [
-            "• 四类拍照引导（远景/近景/内部/瑕疵）",
-            "• 水印自选模式（段+位置+字号）",
-            "• 文件命名自选模式（4段下拉）",
-            "• 一键生成勘查日报表",
+            "✓  四类拍照引导（远景/近景/内部/瑕疵）",
+            "✓  水印自选模式（段+位置+字号）",
+            "✓  文件命名自选模式（4段下拉）",
+            "✓  一键生成勘查日报表",
         ]
         for feat in features:
             feat_card.add_widget(Label(
                 text=feat, font_size='15sp',
-                color=THEME['text_dim'],
-                size_hint_y=None, height=dp(32),
+                color=THEME['text'],
+                size_hint_y=None, height=dp(34),
                 halign='left', valign='middle',
-                text_size=(None, dp(32)),
+                text_size=(None, dp(34)),
             ))
         root.add_widget(feat_card)
 
@@ -2279,17 +2353,18 @@ class WelcomeScreen(Screen):
         root.add_widget(author_card)
 
         # 间距
-        root.add_widget(Label(size_hint_y=None, height=dp(10)))
+        root.add_widget(Label(size_hint_y=None, height=dp(12)))
 
         # 进入按钮 - 大尺寸适合手指点击
         start_btn = Button(
-            text="开始使用", font_size='22sp',
-            size_hint_y=None, height=dp(60),
+            text="开 始 使 用", font_size='22sp',
+            size_hint_y=None, height=dp(64),
             background_color=THEME['accent'],
             background_normal='',
             color=(1, 1, 1, 1),
             bold=True,
         )
+        bind_press_animation(start_btn)
         start_btn.bind(on_release=self._go_main)
         root.add_widget(start_btn)
 
@@ -2325,7 +2400,7 @@ class PhotoTypePopup(Popup):
             layout.add_widget(btn)
 
         cancel_btn = Button(text="取消", font_size='16sp', size_hint_y=None, height=dp(52),
-                           background_color=(0.5, 0.5, 0.5, 1), background_normal='',
+                           background_color=THEME['muted'], background_normal='',
                            color=(1,1,1,1))
         cancel_btn.bind(on_release=self.dismiss)
         layout.add_widget(cancel_btn)
@@ -2459,6 +2534,7 @@ class SettingsScreen(Screen):
                          color=(1,1,1,1), bold=True,
                          size_hint_y=None, height=dp(52))
         back_btn.bind(on_release=self._go_back)
+        bind_press_animation(back_btn)
         title_bar.add_widget(back_btn)
         title_bar.add_widget(Label(text="设置", font_size='22sp', bold=True, color=THEME['text']))
         main.add_widget(title_bar)
@@ -2728,7 +2804,9 @@ class RowWidget(BoxLayout):
 
         with self.canvas.before:
             Color(*THEME['card'])
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[4])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[8])
+            Color(*THEME['card_border'])
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, 8), width=1)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         full_address = (address_general + address_precise).strip()
@@ -2779,27 +2857,30 @@ class RowWidget(BoxLayout):
             color=(1, 1, 1, 1), bold=True,
         )
         self.photo_btn.bind(on_release=self._on_photo)
+        bind_press_animation(self.photo_btn)
         btn_row.add_widget(self.photo_btn)
 
         self.view_btn = Button(
             text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
             font_size='15sp', size_hint_x=0.34,
-            background_color=THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1),
+            background_color=THEME['accent_dark'] if self.photo_count > 0 else THEME['muted'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
         self.view_btn.bind(on_release=self._on_view_photos)
+        bind_press_animation(self.view_btn)
         btn_row.add_widget(self.view_btn)
 
         # 备注按钮 v3.15.0
         self.remark_btn = Button(
             text="备注✓" if self.remark else "备注",
             font_size='15sp', size_hint_x=0.22,
-            background_color=THEME['warning'] if self.remark else (0.5, 0.5, 0.6, 1),
+            background_color=THEME['warning'] if self.remark else THEME['muted'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
         self.remark_btn.bind(on_release=self._on_remark)
+        bind_press_animation(self.remark_btn)
         btn_row.add_widget(self.remark_btn)
 
         self.type_status = Label(text="", font_size='14sp',
@@ -2828,6 +2909,7 @@ class RowWidget(BoxLayout):
     def _update_bg(self, *args):
         self.bg_rect.pos = self.pos
         self.bg_rect.size = self.size
+        self.bg_border.rounded_rectangle = (self.x, self.y, self.width, self.height, 8)
 
     def _update_type_status(self):
         types = self.progress_mgr.get_photo_types(self.progress_key)
@@ -2851,7 +2933,7 @@ class RowWidget(BoxLayout):
         """更新备注并刷新按钮显示"""
         self.remark = remark_text or ""
         self.remark_btn.text = "备注✓" if self.remark else "备注"
-        self.remark_btn.background_color = THEME['warning'] if self.remark else (0.5, 0.5, 0.6, 1)
+        self.remark_btn.background_color = THEME['warning'] if self.remark else THEME['muted']
 
     def mark_done(self):
         self.done = True
@@ -2859,7 +2941,7 @@ class RowWidget(BoxLayout):
         self.photo_btn.background_color = THEME['success']
         self.name_label.color = THEME['success']
         self.view_btn.text = "查看已拍(%d)" % self.photo_count
-        self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else (0.3, 0.3, 0.4, 1)
+        self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else THEME['muted']
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
 
@@ -2874,6 +2956,8 @@ class MainScreen(Screen):
         self.name = 'main'
         self.config = app_config
         self.excel_path = ""
+        # v3.19.0: SAF 选择的原始 Excel content:// URI，用于写回备注到原始文件
+        self._excel_uri = None
         self.headers = []
         self.rows = []  # [borrower, address_general, address_precise, property_type]
         self.progress_mgr = ProgressManager()
@@ -2897,42 +2981,54 @@ class MainScreen(Screen):
     def _build_ui(self, parent):
         parent.add_widget(Label(size_hint_y=None, height=dp(get_status_bar_height_dp())))
 
-        title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
-        title_bar.add_widget(Label(text="资产盘点专项拍照工具", font_size='18sp', bold=True, color=THEME['text'],
-                                   size_hint_x=0.48, halign='left', valign='middle'))
+        # v3.19.0: 顶部标题栏——白底卡片样式，配活力蓝标题与进度徽章
+        title_bar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
+        with title_bar.canvas.before:
+            Color(*THEME['card'])
+            self._header_rect = RoundedRectangle(pos=title_bar.pos, size=title_bar.size, radius=[0])
+            Color(*THEME['card_border'])
+            self._header_border = Line(rectangle=(title_bar.x, title_bar.y, title_bar.width, title_bar.height), width=1)
+        title_bar.bind(pos=self._update_header_rect, size=self._update_header_rect)
+        title_bar.add_widget(Label(text="资产盘点拍照", font_size='19sp', bold=True, color=THEME['accent_dark'],
+                                   size_hint_x=0.46, halign='left', valign='middle'))
 
         ai_btn = Button(text="🤖 AI", font_size='15sp', size_hint_x=0.16,
                        background_color=THEME['success'], background_normal='',
                        color=(1,1,1,1), bold=True)
         ai_btn.bind(on_release=self._go_ai)
+        bind_press_animation(ai_btn)
         title_bar.add_widget(ai_btn)
 
-        settings_btn = Button(text="⚙ 设置", font_size='15sp', size_hint_x=0.18,
+        settings_btn = Button(text="⚙ 设置", font_size='15sp', size_hint_x=0.20,
                              background_color=THEME['accent'], background_normal='',
                              color=(1,1,1,1), bold=True)
         settings_btn.bind(on_release=self._go_settings)
+        bind_press_animation(settings_btn)
         title_bar.add_widget(settings_btn)
 
-        self.progress_label = Label(text="0/0", font_size='15sp', color=THEME['text_dim'],
-                                    size_hint_x=0.18, halign='right', valign='middle')
+        self.progress_label = Label(text="0/0", font_size='16sp', color=THEME['accent'],
+                                    size_hint_x=0.18, halign='right', valign='middle', bold=True)
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
-        toolbar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(6), padding=[dp(10), dp(4), dp(10), dp(4)])
-        open_btn = Button(text="📂 打开Excel", font_size='15sp', size_hint_x=0.34,
+        toolbar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
+        open_btn = Button(text="📂 打开Excel", font_size='15sp', size_hint_x=0.36,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
+        bind_press_animation(open_btn)
         toolbar.add_widget(open_btn)
 
-        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.46)
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.44,
+                                      foreground_color=THEME['text'], hint_text_color=THEME['text_dim'])
         self.search_input.bind(text=self._on_search)
         toolbar.add_widget(self.search_input)
 
-        search_btn = Button(text="搜索", font_size='14sp', size_hint_x=0.20,
-                           background_color=THEME['accent'], background_normal='',
+        search_btn = Button(text="🔍 搜索", font_size='14sp', size_hint_x=0.20,
+                           background_color=THEME['accent_dark'], background_normal='',
                            color=(1,1,1,1), bold=True)
         search_btn.bind(on_release=self._do_search)
+        bind_press_animation(search_btn)
         toolbar.add_widget(search_btn)
         parent.add_widget(toolbar)
 
@@ -2952,13 +3048,13 @@ class MainScreen(Screen):
         btn_row.add_widget(log_btn)
 
         self.log_toggle_btn = Button(text="🔇 日志:关", font_size='12sp',
-                              background_color=(0.4, 0.4, 0.45, 1), background_normal='',
+                              background_color=THEME['muted'], background_normal='',
                               size_hint_x=0.33, color=(1,1,1,1))
         self.log_toggle_btn.bind(on_release=self._toggle_log_recording)
         btn_row.add_widget(self.log_toggle_btn)
 
         clear_log_btn = Button(text="清空日志", font_size='12sp',
-                              background_color=(0.4, 0.4, 0.45, 1), background_normal='',
+                              background_color=THEME['muted'], background_normal='',
                               size_hint_x=0.33, color=(1,1,1,1))
         clear_log_btn.bind(on_release=self._clear_debug_log)
         btn_row.add_widget(clear_log_btn)
@@ -3001,6 +3097,7 @@ class MainScreen(Screen):
     def _update_header_rect(self, instance, *args):
         self._header_rect.pos = instance.pos
         self._header_rect.size = instance.size
+        self._header_border.rectangle = (instance.x, instance.y, instance.width, instance.height)
 
     def _show_file_dialog(self, instance):
         """打开系统文件选择器。Android使用SAF(Intent.ACTION_OPEN_DOCUMENT)获取可访问URI，
@@ -3084,6 +3181,8 @@ class MainScreen(Screen):
                 except:
                     pass
 
+                # v3.19.0: 保存 SAF URI，便于备注保存时通过 ContentResolver 写回原始 Excel
+                self._excel_uri = uri_str
                 dest = os.path.join(APP_DIR, "_imported_excel.xlsx")
                 android_copy_uri_to_app_dir(uri_str, dest)
                 Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
@@ -3290,7 +3389,7 @@ class MainScreen(Screen):
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         close_btn = Button(text="关闭", font_size='15sp', size_hint_x=0.5,
-                          background_color=(0.4, 0.4, 0.45, 1), background_normal='', color=(1,1,1,1))
+                          background_color=THEME['muted'], background_normal='', color=(1,1,1,1))
         copy_btn = Button(text="复制日志", font_size='15sp', size_hint_x=0.5,
                          background_color=THEME['accent'], background_normal='', color=(1,1,1,1))
         btn_row.add_widget(close_btn)
@@ -3406,7 +3505,7 @@ class MainScreen(Screen):
 
                 PhotoProcessor.add_watermark(
                     photo_path, config_data,
-                    time_str=datetime_str, address=place_name,
+                    time_str=get_date_display(), address=place_name,
                     lat=lat, lng=lng,
                 )
 
@@ -3422,7 +3521,25 @@ class MainScreen(Screen):
                         while os.path.exists(new_path):
                             new_path = os.path.join(APP_DIR, "%s-%d%s" % (name_base, suffix, ext if ext else '.jpg'))
                             suffix += 1
-                    os.rename(photo_path, new_path)
+                    # v3.19.0: os.rename 跨设备会失败，改用 shutil.move 并兜底删除原文件
+                    import shutil as _shutil
+                    try:
+                        os.rename(photo_path, new_path)
+                    except Exception:
+                        try:
+                            _shutil.move(photo_path, new_path)
+                        except Exception:
+                            _shutil.copy2(photo_path, new_path)
+                            try:
+                                os.remove(photo_path)
+                            except:
+                                pass
+                    # 兜底：确保 capture_xxx 临时文件被清理
+                    try:
+                        if photo_path != new_path and os.path.exists(photo_path):
+                            os.remove(photo_path)
+                    except:
+                        pass
 
                 PhotoProcessor.save_to_gallery(new_path)
                 self.progress_mgr.mark_photo(key, new_path, photo_type)
@@ -3535,7 +3652,7 @@ class MainScreen(Screen):
         save_btn = Button(text="保存", font_size='16sp', bold=True,
                          background_color=THEME['success'], background_normal='')
         cancel_btn = Button(text="取消", font_size='16sp',
-                           background_color=(0.5, 0.5, 0.6, 1), background_normal='')
+                           background_color=THEME['muted'], background_normal='')
         btn_row.add_widget(save_btn)
         btn_row.add_widget(cancel_btn)
         layout.add_widget(btn_row)
@@ -3565,8 +3682,17 @@ class MainScreen(Screen):
             # 保存到 Excel E 列
             if self.excel_path:
                 import threading
+                excel_uri = getattr(self, '_excel_uri', None)
                 def _save_excel():
+                    # v3.19.0: 先写入 APP_DIR 私有副本（一定成功），再通过 SAF URI 写回原始 Excel
                     ok, msg = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
+                    if ok and excel_uri and excel_uri.startswith('content://'):
+                        # 通过 ContentResolver 写回用户选择的原始 Excel 文件
+                        ok2, msg2 = ExcelWriter.write_back_to_uri(excel_uri, self.excel_path)
+                        if ok2:
+                            msg = "已保存到原始 Excel"
+                        else:
+                            msg = f"app内部已保存；{msg2}"
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
                         self.camera_mgr._dbg(f"✓ {msg} 行{rw.excel_row_index}", show_toast=True)
@@ -3621,6 +3747,7 @@ class AIScreen(Screen):
             color=(1, 1, 1, 1), bold=True,
         )
         back_btn.bind(on_release=self._go_back)
+        bind_press_animation(back_btn)
         top_bar.add_widget(back_btn)
 
         title = Label(
@@ -3631,7 +3758,7 @@ class AIScreen(Screen):
 
         clear_btn = Button(
             text="清空", font_size='14sp', size_hint_x=0.2,
-            background_color=(0.5, 0.5, 0.6, 1), background_normal='',
+            background_color=THEME['muted'], background_normal='',
             color=(1, 1, 1, 1),
         )
         clear_btn.bind(on_release=self._clear_chat)
