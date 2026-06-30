@@ -34,7 +34,7 @@ C_CARD_BG  = RGBColor(0xFA, 0xFB, 0xFC)
 
 FONT = '微软雅黑'
 IMG_DIR = r'd:\hermes\loan_photo_app\ppt_images'
-DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.19.5.pptx'
+DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.19.6.pptx'
 
 # ============================================================
 # 辅助函数
@@ -191,7 +191,7 @@ add_text(slide, Inches(0.8), Inches(3.0), Inches(5.2), Inches(0.6),
          "使用说明书", font_size=24, color=C_WHITE)
 # 版本
 add_text(slide, Inches(0.8), Inches(3.8), Inches(5.2), Inches(0.5),
-         "v3.19.5", font_size=18, color=C_WHITE)
+         "v3.19.6", font_size=18, color=C_WHITE)
 # 底部署名
 add_text(slide, Inches(0.8), Inches(5.5), Inches(5.2), Inches(0.8),
          ["抚顺银行风险管理部", "2026年6月"], font_size=14, color=C_WHITE)
@@ -367,7 +367,7 @@ add_text(slide, wx + Inches(1.8), wy + Inches(0.8), Inches(2.0), Inches(0.8),
 add_text(slide, wx + Inches(0.3), wy + Inches(1.7), ww - Inches(0.6), Inches(0.5),
          "资产盘点专项拍照工具", font_size=15, bold=True, color=C_TEXT, align=PP_ALIGN.CENTER)
 add_text(slide, wx + Inches(0.3), wy + Inches(2.2), ww - Inches(0.6), Inches(0.35),
-         "v3.19.3", font_size=10, color=C_TEXT_DIM, align=PP_ALIGN.CENTER)
+         "v3.19.6", font_size=10, color=C_TEXT_DIM, align=PP_ALIGN.CENTER)
 # 功能列表
 features = [
     "四类拍照引导（远景/近景/内部/瑕疵）",
@@ -782,10 +782,10 @@ add_title_bar(slide, 10, "日报表生成功能")
 
 # 流程图
 steps = [
-    ("1", "收集数据", "汇总客户名称\n地址、类型、备注\n拍照数量"),
-    ("2", "AI生成", "调用AI模型\n为每位客户撰写\n抵押物情况\n现状描述\n风险备注"),
-    ("3", "填充模板", "填入内置日报表\n模板（含序号\n日期、签字栏）"),
-    ("4", "选择保存", "弹出系统文件\n对话框\n用户选择保存位置"),
+    ("1", "收集数据", "仅对有外访照片的\n客户汇总名称\n地址、类型、备注\n拍照数量"),
+    ("2", "DeepSeek生成", "调用DeepSeek\n为已外访客户撰写\n抵押物情况\n现状描述\n风险备注"),
+    ("3", "填充模板+汇总", "填入内置日报表模板\n末尾追加汇总说明\n（基于XX文件生成\n共计XX户/外访XX户）"),
+    ("4", "自动命名保存", "默认文件名：\n抵押物、抵债资产\n现场勘查日报表\nYYYYMMDD.xlsx"),
 ]
 step_w = Inches(2.8)
 step_gap = Inches(0.25)
@@ -823,7 +823,7 @@ add_rect(slide, rpt_x, rpt_y, rpt_w, rpt_h, C_WHITE, C_BORDER, Pt(1.5), radius=0
 # 表头
 add_rect(slide, rpt_x, rpt_y, rpt_w, Inches(0.35), C_ACCENT)
 add_text(slide, rpt_x, rpt_y, rpt_w, Inches(0.35),
-         "现场勘查日报表", font_size=11, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+         "抵押物、抵债资产现场勘查日报表", font_size=9, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 # 表格行
 rpt_headers = ["序号", "贷款人", "抵押物情况", "风险"]
 rpt_col_w = [Inches(0.6), Inches(1.4), Inches(1.7), Inches(0.8)]
@@ -848,6 +848,12 @@ for r, row in enumerate(rpt_data):
         add_text(slide, cx, ry, cw, Inches(0.35),
                  val, font_size=8, color=risk_color, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
         cx += cw
+# 汇总说明行（合并整行，紧接数据末尾）
+sum_y = rpt_y + Inches(1.75)
+add_rect(slide, rpt_x, sum_y, rpt_w, Inches(0.3), RGBColor(0xE3, 0xF2, 0xFD), C_BORDER, Pt(0.5))
+add_text(slide, rpt_x + Inches(0.05), sum_y, rpt_w - Inches(0.1), Inches(0.3),
+         "本次基于客户清单.xlsx生成，共计4户/外访3户已生成报告",
+         font_size=7, bold=True, color=C_ACCENT_D, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 # 签字栏
 add_text(slide, rpt_x + Inches(0.1), rpt_y + rpt_h - Inches(0.4), rpt_w - Inches(0.2), Inches(0.3),
          "填报人：____  日期：2026-06-30", font_size=8, color=C_TEXT_DIM)
@@ -855,12 +861,13 @@ add_text(slide, rpt_x + Inches(0.1), rpt_y + rpt_h - Inches(0.4), rpt_w - Inches
 # 注意事项
 add_card(slide, Inches(5.5), Inches(4.5), Inches(7.2), Inches(2.5), "注意事项")
 add_bullet_list(slide, Inches(5.7), Inches(5.0), Inches(6.8), Inches(1.8), [
+    "仅对有外访照片的客户生成报告行（未外访客户不计入）",
+    "末尾自动追加汇总说明：基于XX文件生成，共计XX户/外访XX户",
+    "自动命名「抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx」",
+    "内置DeepSeek(deepseek-v4-flash)模型，无需额外配置",
+    "点击后按钮显示「正在生成中…」避免重复点击",
     "AI生成内容仅供参考，建议人工审核后使用",
-    "备注信息越详细，日报表质量越高",
-    "模板已内置在App中，无需单独下载",
-    "生成后自动填入当天日期与序号",
-    "支持保存到任意文件夹或云盘",
-], font_size=12)
+], font_size=11)
 
 add_page_num(slide, 12)
 
@@ -877,7 +884,7 @@ add_bullet_list(slide, Inches(0.6), Inches(1.6), Inches(5.6), Inches(4.8), [
     "  - 今天拍了多少照片？",
     "  - 某某公司拍了没有？",
     "  - 远景拍了多少张？",
-    "内置免费模型，无需额外配置即可使用",
+    "内置DeepSeek(deepseek-v4-flash)模型，无需额外配置即可使用",
     "也可在设置页面自定义API地址和模型",
     "AI助手帮助快速查询盘点进度，无需手动统计",
 ], font_size=15)
@@ -949,7 +956,7 @@ for i, (q, a) in enumerate(faqs):
 # 底部联系信息
 add_rect(slide, Inches(0.4), faq_y + Inches(0.1), Inches(12.5), Inches(0.55), C_ACCENT, radius=0.05)
 add_text(slide, Inches(0.5), faq_y + Inches(0.1), Inches(12.3), Inches(0.55),
-         "抚顺银行风险管理部    |    资产盘点专项拍照工具 v3.19.3",
+         "抚顺银行风险管理部    |    资产盘点专项拍照工具 v3.19.6",
          font_size=14, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 
 add_page_num(slide, 14)

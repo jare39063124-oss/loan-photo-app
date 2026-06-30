@@ -2,7 +2,7 @@ $repo = "jare39063124-oss/loan-photo-app"
 $apiBase = "https://api.github.com/repos/$repo"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $projectDir = "D:\hermes\loan_photo_app"
-$finalApkName = "loan-photo-tool-v3.19.5.apk"
+$finalApkName = "loan-photo-tool-v3.19.6.apk"
 $destPath = Join-Path $desktop $finalApkName
 
 Write-Host "=== Step 1: Git Push (retry every 60s) ===" -ForegroundColor Cyan
@@ -92,8 +92,8 @@ while ($true) {
 
 Write-Host ""
 Write-Host "=== Step 4: Downloading APK via nightly.link ===" -ForegroundColor Cyan
-$tempZip = Join-Path $env:TEMP "loan-apk-v3195.zip"
-$extractDir = Join-Path $env:TEMP "loan-apk-v3195-extract"
+$tempZip = Join-Path $env:TEMP "loan-apk-v3196.zip"
+$extractDir = Join-Path $env:TEMP "loan-apk-v3196-extract"
 $downloadUrl = "https://nightly.link/$repo/actions/runs/$runId/loan-photo-apk.zip"
 if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
 if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }

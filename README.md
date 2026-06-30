@@ -9,7 +9,7 @@
 | 项目 | 内容 |
 |------|------|
 | **项目名称** | 资产盘点专项拍照工具 |
-| **版本** | v3.19.5 |
+| **版本** | v3.19.6 |
 | **适用单位** | 抚顺银行风险管理部 |
 | **本地路径** | `D:\hermes\loan_photo_app\` |
 | **GitHub 仓库** | https://github.com/jare39063124-oss/loan-photo-app |
@@ -26,10 +26,10 @@
 4. **照片水印** — 自动添加水印（日期、客户名、地址、GPS经纬度），字号/位置可配置
 5. **进度持久化** — 按客户名+地址哈希保存进度，跨 Excel 文件可识别
 6. **照片管理** — 按类型分类查看、删除已拍照片，自动同步系统相册
-7. **AI 一键生成日报表** — 根据用户填写的备注 + Excel 数据，调用内置 LLM 按照内置模板生成现场勘查日报表，保存到用户指定位置
+7. **AI 一键生成日报表** — 仅对有外访照片的客户生成报告行；调用 DeepSeek 按内置模板生成现场勘查日报表，末尾追加汇总说明（基于XX文件生成，共计XX户/外访XX户）；自动命名「抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx」
 8. **AI 智能助手** — 查询拍摄进度、客户拍照状态等
 9. **搜索与导航** — 按客户名快速搜索筛选
-10. **双 AI 引擎** — 主用 OpenRouter，备用 DeepSeek（deepseek-v4-flash），主 API 失败自动切换
+10. **DeepSeek AI 引擎** — 内置 deepseek-v4-flash 模型，无需额外配置即可使用
 
 ---
 
@@ -39,7 +39,7 @@
 - **Android 打包**: Buildozer 1.6.0 + python-for-android
 - **图片处理**: Pillow（PIL）— 水印渲染，自动缩放字号
 - **Excel**: openpyxl — 读取客户清单，SAF 写回备注
-- **AI**: OpenRouter API（主）+ DeepSeek API（备用），兼容 OpenAI Chat Completions 格式
+- **AI**: DeepSeek API（deepseek-v4-flash），兼容 OpenAI Chat Completions 格式
 - **定位**: GPS + Android 系统 Geocoder + 百度 API 坐标转换
 - **目标 SDK**: API 35（Android 15）
 - **最低 SDK**: API 26（Android 8.0）
@@ -107,17 +107,17 @@
 ### AI 一键生成日报表
 
 1. 用户在 Excel E 列填写勘查备注
-2. 点击主界面底部「AI 一键生成日报表」按钮
-3. App 收集客户名称、地址、类型、备注、拍照数量
-4. 调用 LLM 为每位客户撰写日报表内容（抵押物情况、现状描述、风险备注）
-5. 填入内置日报表模板（`report_template.xlsx`）
-6. 弹出系统文件对话框，用户选择保存位置
+2. 点击主界面底部「AI 一键生成日报表」按钮，按钮立即显示「正在生成中…」避免重复点击
+3. App 仅对**有外访照片的客户**收集数据（名称、地址、类型、备注、拍照数）
+4. 调用 DeepSeek(deepseek-v4-flash) 为已外访客户撰写日报表内容（抵押物情况、现状描述、风险备注）
+5. 填入内置日报表模板（`report_template.xlsx`），末尾追加汇总说明行：「本次报告基于XX（导入文件名）生成，共计XX个客户，其中有外访XX户已生成报告，XX个客户没有外访未生成报告」
+6. 自动命名「抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx」并弹出系统文件对话框，用户选择保存位置
 
 ### AI 智能助手
 
 - 点击主界面「AI助手」按钮进入聊天界面
 - 可查询：今天拍了多少照片、某公司拍了没有、某类型拍了多少张
-- 双引擎保障：主用 OpenRouter，失败自动切换 DeepSeek（deepseek-v4-flash）
+- 内置 DeepSeek(deepseek-v4-flash) 模型，无需额外配置即可使用
 
 ---
 
@@ -192,6 +192,7 @@ D:\hermes\loan_photo_app\
 | 2026-06-30 | v3.19.3 | 底部日志按钮替换为AI一键生成日报表大按钮 |
 | 2026-06-30 | v3.19.4 | 删除app中所有作者信息 |
 | 2026-06-30 | v3.19.5 | DeepSeek备用API、E列逻辑修正、README更新 |
+| 2026-06-30 | v3.19.6 | 移除OpenRouter仅保留DeepSeek；报告仅生成有外访照片客户+汇总说明行+自动命名；按钮"正在生成中"状态 |
 
 ---
 
@@ -202,13 +203,14 @@ D:\hermes\loan_photo_app\
 3. **SimHei 字体不含 emoji** — 用 ●◆▶ 或纯文字替代 emoji 符号
 4. **拍照后必须删除 MediaStore/DCIM 原件** — 防止一张照片保存两个文件
 5. **DeepSeek 模型名** — 使用 `deepseek-v4-flash`（不带 `deepseek-ai/` 前缀）
-6. **API Key 存储** — 完整未截断，通过 base64 编码存储在代码中
+6. **API Key 存储** — 完整未截断，通过 base64 编码存储在代码中（绕过 GitHub Push Protection）
+7. **报告仅生成有照片客户** — 无外访照片的客户不计入报告行，仅在汇总说明中统计
 
 ---
 
 ## 使用说明书
 
-PPT 格式说明书：`资产盘点拍照工具-使用说明书-v3.19.3.pptx`（桌面）
+PPT 格式说明书：`资产盘点拍照工具-使用说明书-v3.19.6.pptx`（桌面）
 
 生成脚本：`python build_manual_v3193.py`
 

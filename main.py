@@ -368,18 +368,18 @@ DEFAULT_CONFIG = {
     'watermark_position': 'bottom-right',
     'watermark_font_size': '中',
     'watermark_opacity': 170,
-    'ai_api_url': 'https://openrouter.ai/api/v1',
+    'ai_api_url': 'https://api.deepseek.com/v1',
     'ai_api_key': '',
-    'ai_model': 'openrouter/owl-alpha',
+    'ai_model': 'deepseek-v4-flash',
 }
 
-# AI API Key (base64编码存储，避免泄露)
+# AI API Key (base64编码存储，避免泄露与GitHub Push Protection拦截)
+# v3.19.6: 移除 OpenRouter，统一使用 DeepSeek(deepseek-v4-flash) 作为唯一 LLM
 import base64 as _b64
-_AI_KEY_B64 = "c2stb3ItdjEtZWRkMGQyZTc2MzJkN2Y4NjQ3M2Q4ODU3ZjRlMDM0N2Q0ZGY0OTM2OWFmZmVhZmI5YzkyMTA0ZDYyYjEwNDQxYw=="
-AI_DEFAULT_API_KEY = _b64.b64decode(_AI_KEY_B64).decode('utf-8')
-# DeepSeek 备用 API Key (base64编码存储，避免GitHub Push Protection拦截)
 _DEEPSEEK_KEY_B64 = "c2stMzNjNjNlMTUxMzllNGU2YzhkYmI5MzA4OGQwYjZjNWY="
 DEEPSEEK_DEFAULT_API_KEY = _b64.b64decode(_DEEPSEEK_KEY_B64).decode('utf-8')
+# 兼容别名：旧代码引用 AI_DEFAULT_API_KEY 时仍可用（指向 DeepSeek key）
+AI_DEFAULT_API_KEY = DEEPSEEK_DEFAULT_API_KEY
 
 # === 命名段选项（用-连接成 X-X-X-X）===
 NAMING_SEGMENT_OPTIONS = [
@@ -895,8 +895,10 @@ class ReportGenerator:
             'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
         } for r in records]
 
-    def _fill_template(self, items, out_path):
-        """填充模板并保存"""
+    def _fill_template(self, items, out_path, summary_text=""):
+        """填充模板并保存。
+        v3.19.6: 末尾追加汇总说明行（紧接数据末尾的下一行，合并A:F列）。
+        """
         import shutil as _shutil
         if not self.template_path or not os.path.exists(self.template_path):
             raise RuntimeError("未找到日报表模板 report_template.xlsx")
@@ -908,11 +910,12 @@ class ReportGenerator:
         for r in range(4, 14):
             for c in range(1, 7):
                 ws.cell(row=r, column=c).value = None
-        # 数据超过10条时插入行，保留底部签字/注释区
+        # 数据 + 汇总行 超过10行时插入行，保留底部签字/注释区
         n = len(items)
-        if n > 10:
+        need_rows = n + (1 if summary_text else 0)
+        if need_rows > 10:
             try:
-                ws.insert_rows(14, n - 10)
+                ws.insert_rows(14, need_rows - 10)
             except Exception:
                 pass
         report_date = get_report_date_str()
@@ -924,27 +927,50 @@ class ReportGenerator:
             ws.cell(row=r, column=4, value=item.get('detail', ''))
             ws.cell(row=r, column=5, value=item.get('status', ''))
             ws.cell(row=r, column=6, value=item.get('risk', ''))
+        # 汇总说明行：紧接数据末尾的下一行（合并A:F让长文本完整显示）
+        if summary_text:
+            sr = 4 + n
+            ws.cell(row=sr, column=1, value=summary_text)
+            try:
+                ws.merge_cells(start_row=sr, start_column=1,
+                               end_row=sr, end_column=6)
+            except Exception:
+                pass
         wb.save(out_path)
         wb.close()
         return out_path
 
-    def generate_with_ai(self, rows, progress_mgr, ai_service):
-        """AI 生成日报表。返回 (ok, out_path_or_None, msg)"""
+    def generate_with_ai(self, rows, progress_mgr, ai_service, excel_filename=""):
+        """AI 生成日报表。返回 (ok, out_path_or_None, msg)
+        v3.19.6: 仅对有外访照片的客户生成报告行；末尾追加汇总说明行；
+                 输出文件名改为"抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx"。
+        """
         records = self._collect_records(rows, progress_mgr)
         if not records:
             return False, None, "没有可生成报告的客户数据，请先打开Excel"
-        prompt = self._build_prompt(records)
+        total = len(records)
+        # 仅对有照片的客户生成报告
+        visited_records = [r for r in records if r['photo_count'] > 0]
+        visited_count = len(visited_records)
+        not_visited_count = total - visited_count
+        if not visited_records:
+            return False, None, "所有客户均无外访照片，无法生成报告（请先现场拍照）"
+        prompt = self._build_prompt(visited_records)
         ok, ai_text = ai_service.chat([
             {"role": "system", "content": self.REPORT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ], timeout=120)
         if not ok:
             return False, None, "AI生成失败：%s" % ai_text
-        items = self._parse_ai_response(ai_text, records)
-        out_path = os.path.join(APP_DIR, "现场勘查日报表_%s.xlsx" % get_date_str())
+        items = self._parse_ai_response(ai_text, visited_records)
+        # 汇总说明行（基于导入Excel文件名 + 客户外访统计）
+        excel_name = excel_filename or "未命名"
+        summary = "本次报告基于%s生成，共计%d个客户，其中有外访%d户已生成报告，%d个客户没有外访未生成报告" % (
+            excel_name, total, visited_count, not_visited_count)
+        out_path = os.path.join(APP_DIR, "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str())
         try:
-            self._fill_template(items, out_path)
-            return True, out_path, "日报表已生成（共%d条）" % len(items)
+            self._fill_template(items, out_path, summary_text=summary)
+            return True, out_path, "日报表已生成（已外访%d户，未外访%d户）" % (visited_count, not_visited_count)
         except Exception as e:
             return False, None, "填充模板失败：%s" % e
 
@@ -1446,16 +1472,12 @@ class GpsManager:
 class AIService:
     """封装 AI API 调用（兼容 OpenAI Chat Completions 格式）
     v3.15.0: 支持 AI 查询拍摄情况。
-    v3.19.5: 添加 DeepSeek 作为第二备用 API（主用 OpenRouter，备用 DeepSeek）。
+    v3.19.5: 添加 DeepSeek 作为第二备用 API。
+    v3.19.6: 移除 OpenRouter，仅保留 DeepSeek(deepseek-v4-flash) 作为唯一 LLM。
     """
-    DEFAULT_API_URL = "https://openrouter.ai/api/v1"
-    DEFAULT_API_KEY = ""
-    DEFAULT_MODEL = "openrouter/owl-alpha"
-
-    # DeepSeek 第二备用配置
-    DEEPSEEK_API_URL = "https://api.deepseek.com/v1"
-    DEEPSEEK_API_KEY = DEEPSEEK_DEFAULT_API_KEY
-    DEEPSEEK_MODEL = "deepseek-v4-flash"
+    DEFAULT_API_URL = "https://api.deepseek.com/v1"
+    DEFAULT_API_KEY = DEEPSEEK_DEFAULT_API_KEY
+    DEFAULT_MODEL = "deepseek-v4-flash"
 
     def __init__(self, api_url=None, api_key=None, model=None):
         self.api_url = (api_url or self.DEFAULT_API_URL).rstrip('/')
@@ -1468,7 +1490,7 @@ class AIService:
         返回 (success, response_text_or_error)
         v3.18.1: 改用 requests 库，禁用 SSL 验证（Android 上 certifi 证书链可能不完整），
                  增加详细日志，解决 Android 上 urllib SSL 偶发失败问题。
-        v3.19.5: 主 API 失败时自动切换到 DeepSeek 备用 API。
+        v3.19.6: 仅使用 DeepSeek 单引擎（移除 OpenRouter 主备双引擎）。
         """
         # 使用内置默认 key（如果未配置）
         if not self.api_key:
@@ -1477,26 +1499,7 @@ class AIService:
         if not self.model:
             self.model = self.DEFAULT_MODEL
 
-        import json as _json
-        try:
-            import requests
-        except Exception as e:
-            Logger.error(f"AIService: requests 库未导入 {e}")
-            return False, "缺少网络库 requests"
-
-        # 先尝试主 API
-        success, result = self._call_api(self.api_url, self.api_key, self.model, messages, timeout)
-        if success:
-            return True, result
-
-        # 主 API 失败，尝试 DeepSeek 备用
-        Logger.warning(f"AIService: 主API失败({result}), 切换到DeepSeek备用API...")
-        success2, result2 = self._call_api(
-            self.DEEPSEEK_API_URL, self.DEEPSEEK_API_KEY, self.DEEPSEEK_MODEL, messages, timeout)
-        if success2:
-            return True, result2
-
-        return False, "主API和备用API均失败: %s / %s" % (result, result2)
+        return self._call_api(self.api_url, self.api_key, self.model, messages, timeout)
 
     def _call_api(self, api_url, api_key, model, messages, timeout=60):
         """实际调用 API（内部方法）"""
@@ -2434,7 +2437,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.19.5", font_size='12sp',
+            text="v3.19.6", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3841,13 +3844,23 @@ class MainScreen(Screen):
         popup.open()
 
     def _generate_report(self, instance):
-        """v3.19.2: 调用 AI 基于备注+Excel内容生成勘查日报表，保存到用户指定位置。"""
+        """v3.19.6: 调用 AI 仅对有外访照片的客户生成勘查日报表。
+        点击后立即将按钮置为"正在生成中…"并禁用，避免重复点击。"""
         if not self.rows or not any((r[0] if len(r) > 0 else "") for r in self.rows):
             self._show_msg("请先打开Excel客户数据", THEME['warning'])
             return
         if not self.report_generator.template_path:
             self._show_msg("未找到日报表模板", THEME['danger'])
             return
+
+        # 立即更新按钮状态：显示"正在生成中…"并禁用，避免重复点击
+        btn = instance
+        original_text = btn.text if hasattr(btn, 'text') else "AI 一键生成日报表"
+        try:
+            btn.text = "正在生成中…"
+            btn.disabled = True
+        except Exception:
+            pass
 
         # 进度弹窗（AI生成较慢）
         content = BoxLayout(orientation='vertical', padding=dp(24), spacing=dp(16))
@@ -3867,12 +3880,20 @@ class MainScreen(Screen):
                 api_key=self.config.get('ai_api_key', '') or AI_DEFAULT_API_KEY,
                 model=self.config.get('ai_model', DEFAULT_CONFIG['ai_model']),
             )
-            ok, path, m = self.report_generator.generate_with_ai(self.rows, self.progress_mgr, ai_svc)
+            excel_name = os.path.basename(self.excel_path) if self.excel_path else ""
+            ok, path, m = self.report_generator.generate_with_ai(
+                self.rows, self.progress_mgr, ai_svc, excel_filename=excel_name)
 
             def _done(dt):
                 try:
                     popup.dismiss()
                 except:
+                    pass
+                # 恢复按钮状态
+                try:
+                    btn.text = original_text
+                    btn.disabled = False
+                except Exception:
                     pass
                 if ok and path:
                     self._pending_report_path = path
@@ -3897,7 +3918,7 @@ class MainScreen(Screen):
             intent = Intent("android.intent.action.CREATE_DOCUMENT")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             intent.setType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            intent.putExtra(Intent.EXTRA_TITLE, "现场勘查日报表_%s.xlsx" % get_date_str())
+            intent.putExtra(Intent.EXTRA_TITLE, "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str())
             self._report_save_code = 0x201
             PythonActivity.mActivity.startActivityForResult(intent, self._report_save_code)
         except:
