@@ -34,7 +34,7 @@ C_CARD_BG  = RGBColor(0xFA, 0xFB, 0xFC)
 
 FONT = '微软雅黑'
 IMG_DIR = r'd:\hermes\loan_photo_app\ppt_images'
-DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.19.3.pptx'
+DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.19.5.pptx'
 
 # ============================================================
 # 辅助函数
@@ -191,7 +191,7 @@ add_text(slide, Inches(0.8), Inches(3.0), Inches(5.2), Inches(0.6),
          "使用说明书", font_size=24, color=C_WHITE)
 # 版本
 add_text(slide, Inches(0.8), Inches(3.8), Inches(5.2), Inches(0.5),
-         "v3.19.3", font_size=18, color=C_WHITE)
+         "v3.19.5", font_size=18, color=C_WHITE)
 # 底部署名
 add_text(slide, Inches(0.8), Inches(5.5), Inches(5.2), Inches(0.8),
          ["抚顺银行风险管理部", "2026年6月"], font_size=14, color=C_WHITE)
@@ -398,9 +398,9 @@ add_title_bar(slide, 3, "Excel格式规范")
 add_card(slide, Inches(0.4), Inches(1.0), Inches(12.5), Inches(2.2), "格式要求")
 add_bullet_list(slide, Inches(0.6), Inches(1.5), Inches(12.0), Inches(1.6), [
     "仅支持 .xlsx 格式（Excel 2007及以上版本）",
-    "第一行为表头行（A1:D1），数据从第二行开始",
+    "第一行为表头行（A1:E1），数据从第二行开始",
     "列顺序固定：A=客户名, B=地址概(街道+楼栋), C=地址精确(单元房号), D=性质",
-    "E列为备注列，由App自动写入（请勿手动修改）",
+    "E列为备注列，由用户手动填写勘查备注，App读取此列内容用于AI生成日报表",
 ], font_size=15)
 
 # Excel表格模拟
