@@ -409,10 +409,10 @@ WATERMARK_POSITION_LABELS = {'bottom-right': '右下', 'bottom-left': '左下',
                              'top-right': '右上', 'top-left': '左上'}
 WATERMARK_POSITION_LABEL_TO_KEY = {v: k for k, v in WATERMARK_POSITION_LABELS.items()}
 
-# === 作者信息 ===
-AUTHOR_NAME = "抚顺银行风险管理部"
+# === 作者信息（已移除） ===
+AUTHOR_NAME = ""
 AUTHOR_PHONE = ""
-AUTHOR_INFO = "抚顺银行风险管理部"
+AUTHOR_INFO = ""
 
 # === 颜色主题 ===
 # v3.19.0: 全面重新设计为明亮浅色主题，参考2026移动端设计趋势
@@ -2431,14 +2431,6 @@ class WelcomeScreen(Screen):
         # 弹性空间
         root.add_widget(Label(size_hint_y=1))
 
-        # 作者信息
-        author_card = CardWidget(size_hint_y=None, height=dp(80))
-        author_card.add_widget(Label(
-            text=AUTHOR_INFO, font_size='13sp',
-            color=THEME['text_dim'], halign='center', valign='middle',
-        ))
-        root.add_widget(author_card)
-
         # 间距
         root.add_widget(Label(size_hint_y=None, height=dp(12)))
 
@@ -2793,12 +2785,7 @@ class SettingsScreen(Screen):
 
         content.add_widget(ai_card)
 
-        # === 关于 ===
-        about_card = CardWidget(size_hint_y=None, height=dp(140))
-        about_card.add_widget(SectionLabel(text="ℹ️ 关于"))
-        about_card.add_widget(Label(text=AUTHOR_INFO, font_size='14sp',
-                                    color=THEME['text_dim'], halign='center'))
-        content.add_widget(about_card)
+        # === 关于（已移除作者信息） ===
 
         content.add_widget(Label(size_hint_y=None, height=dp(20)))
 
