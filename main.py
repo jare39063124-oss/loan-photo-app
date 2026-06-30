@@ -3101,41 +3101,26 @@ class MainScreen(Screen):
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
-        # v3.19.2: 工具栏拆为两行——上排操作按钮（大尺寸易点击），下排搜索
-        toolbar = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(104), spacing=dp(4),
-                            padding=[dp(10), dp(4), dp(10), dp(4)])
-
-        # 第一行：操作按钮（打开Excel + 生成日报表，各占半宽，文字完整显示）
-        btn_row1 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        open_btn = Button(text="打开Excel", font_size='16sp', size_hint_x=0.5,
+        # v3.19.3: 工具栏恢复单行（打开Excel + 搜索），日报表按钮移至底部醒目位置
+        toolbar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8), padding=[dp(12), dp(6), dp(12), dp(6)])
+        open_btn = Button(text="打开Excel", font_size='16sp', size_hint_x=0.30,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
         bind_press_animation(open_btn)
-        btn_row1.add_widget(open_btn)
+        toolbar.add_widget(open_btn)
 
-        report_btn = Button(text="生成日报表", font_size='16sp', size_hint_x=0.5,
-                          background_color=THEME['success'], background_normal='',
-                          color=(1,1,1,1), bold=True)
-        report_btn.bind(on_release=self._generate_report)
-        bind_press_animation(report_btn)
-        btn_row1.add_widget(report_btn)
-        toolbar.add_widget(btn_row1)
-
-        # 第二行：搜索框 + 搜索按钮
-        search_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.72,
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.42,
                                       foreground_color=THEME['text'], hint_text_color=THEME['text_dim'])
         self.search_input.bind(text=self._on_search)
-        search_row.add_widget(self.search_input)
+        toolbar.add_widget(self.search_input)
 
         search_btn = Button(text="搜索", font_size='15sp', size_hint_x=0.28,
                            background_color=THEME['accent_dark'], background_normal='',
                            color=(1,1,1,1), bold=True)
         search_btn.bind(on_release=self._do_search)
         bind_press_animation(search_btn)
-        search_row.add_widget(search_btn)
-        toolbar.add_widget(search_row)
+        toolbar.add_widget(search_btn)
         parent.add_widget(toolbar)
 
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
@@ -3144,30 +3129,23 @@ class MainScreen(Screen):
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
-        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(52), spacing=dp(4), padding=[dp(10), dp(6), dp(10), dp(6)])
+        # v3.19.3: 底部栏——隐藏日志按钮，替换为醒目的"AI一键生成日报表"大按钮
+        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(60), spacing=dp(4), padding=[dp(12), dp(8), dp(12), dp(8)])
 
-        btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(4))
-        log_btn = Button(text="完整日志", font_size='12sp',
-                             background_color=THEME['accent'], background_normal='',
-                             size_hint_x=0.34, color=(1,1,1,1))
-        log_btn.bind(on_release=self._show_full_log)
-        btn_row.add_widget(log_btn)
+        ai_report_btn = Button(text="AI 一键生成日报表", font_size='18sp',
+                               background_color=THEME['success'], background_normal='',
+                               color=(1,1,1,1), bold=True, size_hint_y=None, height=dp(46))
+        ai_report_btn.bind(on_release=self._generate_report)
+        bind_press_animation(ai_report_btn)
+        footer.add_widget(ai_report_btn)
 
-        self.log_toggle_btn = Button(text="日志:关", font_size='12sp',
+        # 隐藏的日志控件（保留引用避免 _toggle_log_recording 等方法崩溃，但不显示在UI）
+        self.log_toggle_btn = Button(text="日志:关", font_size='1sp',
                               background_color=THEME['muted'], background_normal='',
-                              size_hint_x=0.33, color=(1,1,1,1))
+                              size_hint=(0, 0), opacity=0)
         self.log_toggle_btn.bind(on_release=self._toggle_log_recording)
-        btn_row.add_widget(self.log_toggle_btn)
 
-        clear_log_btn = Button(text="清空日志", font_size='12sp',
-                              background_color=THEME['muted'], background_normal='',
-                              size_hint_x=0.33, color=(1,1,1,1))
-        clear_log_btn.bind(on_release=self._clear_debug_log)
-        btn_row.add_widget(clear_log_btn)
-        footer.add_widget(btn_row)
-
-        # 底部日志显示区已隐藏（v3.16.0），只保留按钮
-        # status_label仍然创建（供代码引用），但不显示在UI中
+        # status_label 仍然创建（供代码引用），但不显示在UI中
         self.status_label = Label(text="", font_size='11sp',
                                   color=THEME['text_dim'],
                                   halign='left', valign='top',
