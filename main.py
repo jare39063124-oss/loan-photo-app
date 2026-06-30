@@ -2401,7 +2401,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.19.2", font_size='12sp',
+            text="v3.19.3", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3101,33 +3101,41 @@ class MainScreen(Screen):
         title_bar.add_widget(self.progress_label)
         parent.add_widget(title_bar)
 
-        toolbar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
-        # v3.19.2: 工具栏纯文字标签（emoji在SimHei字体下显示为方块），新增"日报表"按钮
-        open_btn = Button(text="打开Excel", font_size='15sp', size_hint_x=0.27,
+        # v3.19.2: 工具栏拆为两行——上排操作按钮（大尺寸易点击），下排搜索
+        toolbar = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(104), spacing=dp(4),
+                            padding=[dp(10), dp(4), dp(10), dp(4)])
+
+        # 第一行：操作按钮（打开Excel + 生成日报表，各占半宽，文字完整显示）
+        btn_row1 = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        open_btn = Button(text="打开Excel", font_size='16sp', size_hint_x=0.5,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
         bind_press_animation(open_btn)
-        toolbar.add_widget(open_btn)
+        btn_row1.add_widget(open_btn)
 
-        report_btn = Button(text="生成日报表", font_size='15sp', size_hint_x=0.25,
+        report_btn = Button(text="生成日报表", font_size='16sp', size_hint_x=0.5,
                           background_color=THEME['success'], background_normal='',
                           color=(1,1,1,1), bold=True)
         report_btn.bind(on_release=self._generate_report)
         bind_press_animation(report_btn)
-        toolbar.add_widget(report_btn)
+        btn_row1.add_widget(report_btn)
+        toolbar.add_widget(btn_row1)
 
-        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.28,
+        # 第二行：搜索框 + 搜索按钮
+        search_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.search_input = TextInput(hint_text="搜索客户名…", multiline=False, font_size='15sp', size_hint_x=0.72,
                                       foreground_color=THEME['text'], hint_text_color=THEME['text_dim'])
         self.search_input.bind(text=self._on_search)
-        toolbar.add_widget(self.search_input)
+        search_row.add_widget(self.search_input)
 
-        search_btn = Button(text="搜索", font_size='14sp', size_hint_x=0.20,
+        search_btn = Button(text="搜索", font_size='15sp', size_hint_x=0.28,
                            background_color=THEME['accent_dark'], background_normal='',
                            color=(1,1,1,1), bold=True)
         search_btn.bind(on_release=self._do_search)
         bind_press_animation(search_btn)
-        toolbar.add_widget(search_btn)
+        search_row.add_widget(search_btn)
+        toolbar.add_widget(search_row)
         parent.add_widget(toolbar)
 
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
