@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.18.1
+资产盘点专项拍照工具 App - v3.20.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -357,7 +357,126 @@ except Exception as e:
 
 PROGRESS_FILE = os.path.join(APP_DIR, 'photo_progress.json')
 CONFIG_FILE = os.path.join(APP_DIR, 'app_config.json')
+APP_LOG_FILE = os.path.join(APP_DIR, 'app_debug.log')
 FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'simhei.ttf')
+
+# ============================================================
+# v3.20.0: 全局日志器 — 记录全量 app 日志（Excel/拍照/备注/AI/生命周期等）
+# 轮转策略：文件超过 500KB 时保留最近 256KB
+# ============================================================
+class AppLogger:
+    """v3.20.0: 全量 app 日志记录器，替代仅相机日志的 _dbg 机制"""
+    _instance = None
+
+    def __init__(self, filepath=None, max_size=512 * 1024, keep_size=256 * 1024):
+        self.filepath = filepath or APP_LOG_FILE
+        self.max_size = max_size
+        self.keep_size = keep_size
+        self._lines = []          # 内存缓冲（最近 200 条，供快速预览）
+        self._max_lines = 200
+        self._lock = threading.Lock()
+
+    def log(self, level, tag, msg):
+        """写入一条日志。level: INFO/WARN/ERROR；tag: 模块标签如 EXCEL/PHOTO/AI/APP"""
+        ts = get_system_date().strftime('%Y-%m-%d %H:%M:%S')
+        line = "[%s] [%s] [%s] %s" % (ts, level, tag, msg)
+        with self._lock:
+            self._lines.append(line)
+            if len(self._lines) > self._max_lines:
+                self._lines = self._lines[-self._max_lines:]
+            try:
+                os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+                with open(self.filepath, 'a', encoding='utf-8') as f:
+                    f.write(line + "\n")
+                # 轮转检查
+                self._maybe_rotate()
+            except Exception:
+                pass
+        # 同时输出到 Kivy Logger（控制台可见）
+        try:
+            if level == 'ERROR':
+                Logger.error("APPLOG [%s]: %s", tag, msg)
+            elif level == 'WARN':
+                Logger.warning("APPLOG [%s]: %s", tag, msg)
+            else:
+                Logger.info("APPLOG [%s]: %s", tag, msg)
+        except Exception:
+            pass
+
+    def _maybe_rotate(self):
+        """文件超过 max_size 时截断保留最近 keep_size 字节"""
+        try:
+            if not os.path.exists(self.filepath):
+                return
+            if os.path.getsize(self.filepath) < self.max_size:
+                return
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                f.seek(0, 2)
+                total = f.tell()
+                start = max(0, total - self.keep_size)
+                f.seek(start)
+                data = f.read()
+            # 找到第一个换行，避免截断半行
+            nl = data.find('\n')
+            if nl >= 0:
+                data = data[nl + 1:]
+            with open(self.filepath, 'w', encoding='utf-8') as f:
+                f.write(data)
+        except Exception:
+            pass
+
+    def info(self, tag, msg):
+        self.log('INFO', tag, msg)
+
+    def warn(self, tag, msg):
+        self.log('WARN', tag, msg)
+
+    def error(self, tag, msg):
+        self.log('ERROR', tag, msg)
+
+    def get_log_text(self, max_chars=100000):
+        """读取日志文件全文（截断到 max_chars 防止过大）"""
+        try:
+            if os.path.exists(self.filepath):
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    f.seek(0, 2)
+                    total = f.tell()
+                    if total > max_chars:
+                        f.seek(max(0, total - max_chars))
+                        f.readline()  # 跳过半行
+                    return f.read()
+            return "暂无日志记录"
+        except Exception as e:
+            return "读取日志失败: %s" % e
+
+    def clear(self):
+        """清空日志"""
+        with self._lock:
+            self._lines = []
+            try:
+                if os.path.exists(self.filepath):
+                    os.remove(self.filepath)
+            except Exception:
+                pass
+
+# 全局单例
+app_log = AppLogger()
+
+
+def _normalize_key_part(s):
+    """v3.20.0: 规范化 key 组成部分 — strip 空白 + 数字归一化
+    解决 openpyxl 读取数字时 str(cell) 产生 "123.0" vs "123" 导致 key 不匹配的问题
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    # 归一化浮点数字符串：123.0 -> 123, 123.450 -> 123.45
+    if re.match(r'^-?\d+\.0+$', s):
+        s = s.split('.')[0]
+    elif re.match(r'^-?\d+\.\d*0+$', s):
+        s = s.rstrip('0').rstrip('.')
+    return s
+
 
 # === 默认配置 ===
 # Excel 格式：A=客户名 B=抵押物地址（概） C=抵押物地址（精确门牌号） D=抵押物性质
@@ -371,6 +490,7 @@ DEFAULT_CONFIG = {
     'ai_api_url': 'https://api.deepseek.com/v1',
     'ai_api_key': '',
     'ai_model': 'deepseek-v4-flash',
+    'excel_uri': '',  # v3.20.0: 持久化 SAF Excel URI，重启后可继续写回备注
 }
 
 # AI API Key (base64编码存储，避免泄露与GitHub Push Protection拦截)
@@ -522,7 +642,10 @@ class ProgressManager:
         self.load()
 
     def _make_key(self, borrower, address=""):
-        """基于借款人+地址(A+B+C列)生成持久化key"""
+        """基于借款人+地址(A+B+C列)生成持久化key
+        v3.20.0: 规范化 borrower 和 address，防止 "123" vs "123.0" 导致 key 不匹配"""
+        borrower = _normalize_key_part(borrower)
+        address = _normalize_key_part(address)
         raw = (borrower + "|" + address).strip("|")
         return hashlib.md5(raw.encode('utf-8')).hexdigest()[:16]
 
@@ -872,28 +995,115 @@ class ReportGenerator:
         return "\n".join(lines)
 
     def _parse_ai_response(self, ai_text, records):
-        """解析 AI 返回的 JSON（容错：去掉 markdown 代码块标记）"""
+        """v3.20.0: 解析 AI 返回的 JSON — 强化提取逻辑，fallback 清理特殊字符"""
         import json as _json
+        if not ai_text or not ai_text.strip():
+            return [{
+                'name': r['name'],
+                'detail': "共计盘点1处%s，地址：%s" % (r['property_type'] or '抵押物', r['address']),
+                'status': '现场勘查完成，状态正常',
+                'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
+            } for r in records]
+
         text = ai_text.strip()
-        # 去掉可能的 ```json ... ``` 包裹
-        if text.startswith('```'):
-            text = text.split('\n', 1)[-1] if '\n' in text else text[3:]
-            if text.endswith('```'):
-                text = text[:-3]
-            text = text.strip()
+
+        # 尝试1：去掉 markdown 代码块标记后直接解析
+        clean = text
+        if clean.startswith('```'):
+            # 去掉首行 ```json 或 ```
+            clean = clean.split('\n', 1)[-1] if '\n' in clean else clean[3:]
+            if clean.endswith('```'):
+                clean = clean[:-3]
+            clean = clean.strip()
         try:
-            items = _json.loads(text)
+            items = _json.loads(clean)
             if isinstance(items, list) and len(items) > 0:
-                return items
+                return self._validate_items(items, records)
         except Exception:
             pass
-        # 解析失败：用原始记录兜底，status/risk 留 AI 原文
+
+        # 尝试2：用正则提取 JSON 数组 [...]（AI 可能返回多余文本）
+        try:
+            m = re.search(r'\[.*\]', text, re.DOTALL)
+            if m:
+                items = _json.loads(m.group(0))
+                if isinstance(items, list) and len(items) > 0:
+                    return self._validate_items(items, records)
+        except Exception:
+            pass
+
+        # 尝试3：逐行提取 {name:..., detail:..., ...} 对象
+        try:
+            obj_matches = re.findall(r'\{[^{}]+\}', text, re.DOTALL)
+            if obj_matches:
+                items = []
+                for obj_str in obj_matches:
+                    try:
+                        item = _json.loads(obj_str)
+                        if isinstance(item, dict):
+                            items.append(item)
+                    except Exception:
+                        pass
+                if items:
+                    return self._validate_items(items, records)
+        except Exception:
+            pass
+
+        # 所有解析失败：用结构化模板兜底，清理特殊字符（不使用 AI 原文避免 {} 等符号残留）
+        app_log.warn('AI', 'AI 返回 JSON 解析失败，使用结构化模板兜底')
         return [{
             'name': r['name'],
             'detail': "共计盘点1处%s，地址：%s" % (r['property_type'] or '抵押物', r['address']),
-            'status': ai_text[:120] if ai_text else '现场勘查完成，状态正常',
+            'status': '现场勘查完成，已拍照%d张，整体状态正常。' % r['photo_count'],
             'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
         } for r in records]
+
+    def _validate_items(self, items, records):
+        """v3.20.0: 校验 AI 返回的 items，补全缺失字段，清理特殊字符"""
+        result = []
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            r = records[i] if i < len(records) else records[-1] if records else {}
+            # 确保 name 字段存在
+            name = item.get('name', '') or r.get('name', '')
+            detail = item.get('detail', '') or "共计盘点1处%s，地址：%s" % (r.get('property_type', '抵押物'), r.get('address', ''))
+            status = item.get('status', '') or '现场勘查完成，状态正常'
+            risk = item.get('risk', '') or '经实地走访抵押物，目前整体状态较好，暂无异常情况。'
+            # v3.20.0: 清理残留的 markdown/JSON 特殊字符
+            for field_val in [name, detail, status, risk]:
+                pass  # 清理在下面统一做
+            result.append({
+                'name': self._clean_text(name),
+                'detail': self._clean_text(detail),
+                'status': self._clean_text(status),
+                'risk': self._clean_text(risk),
+            })
+        # 如果解析出的条目少于记录数，补全
+        while len(result) < len(records):
+            r = records[len(result)]
+            result.append({
+                'name': r['name'],
+                'detail': "共计盘点1处%s，地址：%s" % (r['property_type'] or '抵押物', r['address']),
+                'status': '现场勘查完成，状态正常',
+                'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
+            })
+        return result
+
+    @staticmethod
+    def _clean_text(s):
+        """v3.20.0: 清理文本中残留的 markdown/JSON 特殊字符"""
+        if not s:
+            return ""
+        s = str(s).strip()
+        # 去掉 markdown 代码标记
+        s = s.replace('```', '').replace('`', '')
+        # 去掉残留的 JSON 大括号（仅清理首尾的孤立 { }）
+        s = re.sub(r'^[\s{}]+', '', s)
+        s = re.sub(r'[\s{}]+$', '', s)
+        # 去掉 markdown 加粗/斜体标记
+        s = s.replace('**', '').replace('*', '')
+        return s.strip()
 
     def _fill_template(self, items, out_path, summary_text=""):
         """填充模板并保存。
@@ -1175,14 +1385,16 @@ class PhotoProcessor:
 
     @staticmethod
     def save_to_gallery(photo_path):
-        """保存照片到系统相册，确保在相册/微信可见且稳定。
-        v3.18.1: Android 10+ 使用 MediaStore 直接插入 DCIM/Camera（不再设置 is_pending，
-                 避免部分 ROM 清理 pending 文件导致照片消失）；
+        """v3.20.0: 保存照片到系统相册，返回最终保存路径（供 progress_mgr 记录）。
+        成功返回 DCIM/Camera 路径，失败返回 None（调用方保留 APP_DIR 副本）。
+        v3.18.1: Android 10+ 使用 MediaStore 直接插入 DCIM/Camera；
                  Android 9 及以下回退到直接复制；最后使用 MediaScannerConnection 刷新。
         """
         if not IS_ANDROID or not os.path.exists(photo_path):
-            return
+            return None
         fname = os.path.basename(photo_path)
+        # v3.20.0: MediaStore 插入后照片在 DCIM/Camera 目录
+        dcim_path = '/storage/emulated/0/DCIM/Camera/%s' % fname
         inserted_uri = None
         try:
             from jnius import autoclass
@@ -1215,7 +1427,7 @@ class PhotoProcessor:
                 Logger.info(f"save_to_gallery: MediaStore 已插入 DCIM/Camera {fname}")
                 # 使用 MediaScannerConnection 刷新，Android 10+ 比旧广播更稳定。
                 PhotoProcessor._scan_file(photo_path, uri=uri)
-                return
+                return dcim_path
         except Exception as e:
             Logger.error(f"save_to_gallery MediaStore 失败: {e}")
             # 如果已插入但写入失败，尝试删除残留的 pending/空记录
@@ -1242,12 +1454,13 @@ class PhotoProcessor:
                     shutil.copy2(photo_path, dest_path)
                     Logger.info(f"save_to_gallery: 已复制到 {dest_path}")
                     PhotoProcessor._scan_file(dest_path)
-                    return
+                    return dest_path
                 except Exception as e:
                     Logger.error(f"save_to_gallery: 复制到{dcim_dir}失败: {e}")
                     continue
         except Exception as e:
             Logger.error(f"save_to_gallery 直接复制失败: {e}")
+        return None  # v3.20.0: 所有方式均失败
 
     @staticmethod
     def _scan_file(file_path, uri=None):
@@ -1656,19 +1869,21 @@ class CameraManager:
         self._debug_log_path = ""
         self._log_lines = []
         self._max_log_lines = 50
-        self._log_enabled = False  # v3.16.0: 日志记录开关，默认关闭
+        self._log_enabled = True  # v3.20.0: 默认开启，日志统一写入 app_log
 
     def _dbg(self, msg, show_toast=False):
         """Write debug message to log file and update UI status.
         show_toast=True to also show an Android Toast (use sparingly to avoid flashing).
-        v3.16.0: 日志开关关闭时不写日志文件（避免侵占手机空间）"""
+        v3.20.0: 日志统一写入 app_log（全量日志器）"""
         ts = get_system_date().strftime('%H:%M:%S')
         line = f"[{ts}] {msg}"
         Logger.info("CAMDBG: %s", msg)
         self._log_lines.append(line)
         if len(self._log_lines) > self._max_log_lines:
             self._log_lines = self._log_lines[-self._max_log_lines:]
-        # 只在日志开关开启时写入日志文件
+        # v3.20.0: 统一写入 app_log 全量日志
+        app_log.info('PHOTO', msg)
+        # 兼容旧日志文件（仅在开关开启时写 camera_debug.log）
         if self._log_enabled:
             try:
                 if not self._debug_log_path:
@@ -2437,7 +2652,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.19.6", font_size='12sp',
+            text="v3.20.0", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3067,7 +3282,8 @@ class MainScreen(Screen):
         self.config = app_config
         self.excel_path = ""
         # v3.19.0: SAF 选择的原始 Excel content:// URI，用于写回备注到原始文件
-        self._excel_uri = None
+        # v3.20.0: 从 AppConfig 恢复持久化的 URI，重启后仍可写回备注
+        self._excel_uri = app_config.get('excel_uri', '') or None
         # v3.19.2: 日报表生成后待保存到用户指定位置的临时路径
         self._pending_report_path = None
         self._report_save_code = 0x201
@@ -3085,7 +3301,12 @@ class MainScreen(Screen):
         self._current_photo_type = ""
         self._current_key = ""
         self._continuous_shooting = False
+        self._is_paused = False  # v3.20.0: app 后台暂停标志
         self._photos_in_session = 0
+        self._render_token = 0   # v3.20.0: 批量渲染令牌，搜索/重新加载时取消旧的渲染
+        self._loading_label = None  # v3.20.0: 加载进度提示 Label
+        self._photo_session_ctx = None  # v3.20.0: 拍照会话上下文（替代 self._current_* 实例状态）
+        self._photo_session_active = False  # v3.20.0: 拍照会话锁，防止连拍期间切换客户
 
         main = BoxLayout(orientation='vertical')
         self._build_ui(main)
@@ -3152,17 +3373,25 @@ class MainScreen(Screen):
         self.scroll_view.add_widget(self.list_layout)
         parent.add_widget(self.scroll_view)
 
-        # v3.19.3: 底部栏——隐藏日志按钮，替换为醒目的"AI一键生成日报表"大按钮
-        footer = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(60), spacing=dp(4), padding=[dp(12), dp(8), dp(12), dp(8)])
+        # v3.20.0: 底部栏改为水平布局 — 左侧 AI 报表按钮(0.7) + 右侧 日志按钮(0.3)
+        footer = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(12), dp(8), dp(12), dp(8)])
 
-        ai_report_btn = Button(text="AI 一键生成日报表", font_size='18sp',
+        ai_report_btn = Button(text="AI 一键生成日报表", font_size='17sp',
                                background_color=THEME['success'], background_normal='',
-                               color=(1,1,1,1), bold=True, size_hint_y=None, height=dp(46))
+                               color=(1,1,1,1), bold=True, size_hint_x=0.7)
         ai_report_btn.bind(on_release=self._generate_report)
         bind_press_animation(ai_report_btn)
         footer.add_widget(ai_report_btn)
 
-        # 隐藏的日志控件（保留引用避免 _toggle_log_recording 等方法崩溃，但不显示在UI）
+        # v3.20.0: 可见的日志按钮
+        log_btn = Button(text="日志", font_size='15sp',
+                         background_color=THEME['accent_dark'], background_normal='',
+                         color=(1,1,1,1), bold=True, size_hint_x=0.3)
+        log_btn.bind(on_release=self._show_full_log)
+        bind_press_animation(log_btn)
+        footer.add_widget(log_btn)
+
+        # 保留隐藏的 log_toggle_btn 引用（旧代码引用兼容），但不显示
         self.log_toggle_btn = Button(text="日志:关", font_size='1sp',
                               background_color=THEME['muted'], background_normal='',
                               size_hint=(0, 0), opacity=0)
@@ -3294,7 +3523,13 @@ class MainScreen(Screen):
                     pass
 
                 # v3.19.0: 保存 SAF URI，便于备注保存时通过 ContentResolver 写回原始 Excel
+                # v3.20.0: 持久化 URI 到 AppConfig，重启后可继续写回备注
                 self._excel_uri = uri_str
+                try:
+                    self.config.set('excel_uri', uri_str)
+                    app_log.info('EXCEL', '已持久化 Excel URI')
+                except Exception:
+                    pass
                 dest = os.path.join(APP_DIR, "_imported_excel.xlsx")
                 android_copy_uri_to_app_dir(uri_str, dest)
                 Clock.schedule_once(lambda dt: self._load_excel_path(dest), 0)
@@ -3368,64 +3603,144 @@ class MainScreen(Screen):
             return
         self.excel_path = path
         try:
+            app_log.info('EXCEL', '开始加载 Excel: %s' % os.path.basename(path))
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
-            # v3.17.0: 从progress_mgr恢复备注（Excel E列为空时用持久化备注）
+            # v3.20.0: 备注恢复逻辑 — progress_mgr 为单一真相源
+            # 优先用 progress_mgr 中的备注（持久化），仅在 progress_mgr 无记录时用 Excel E 列值
             for i, row in enumerate(self.rows):
                 borrower = row[0] if len(row) > 0 else ""
                 address_general = row[1] if len(row) > 1 else ""
                 address_precise = row[2] if len(row) > 2 else ""
-                remark = row[4] if len(row) > 4 else ""
-                if not remark:
-                    # Excel中没有备注，从progress_mgr恢复
-                    full_addr = (address_general + address_precise).strip()
-                    key = self.progress_mgr._make_key(borrower, full_addr)
-                    saved_remark = self.progress_mgr.get_remark(key)
-                    if saved_remark:
-                        while len(self.rows[i]) < 5:
-                            self.rows[i].append("")
-                        self.rows[i][4] = saved_remark
+                excel_remark = row[4] if len(row) > 4 else ""
+                full_addr = (address_general + address_precise).strip()
+                key = self.progress_mgr._make_key(borrower, full_addr)
+                saved_remark = self.progress_mgr.get_remark(key)
+                # v3.20.0: progress_mgr 优先（持久化数据更可靠）
+                final_remark = saved_remark if saved_remark else excel_remark
+                if final_remark and final_remark != excel_remark:
+                    while len(self.rows[i]) < 5:
+                        self.rows[i].append("")
+                    self.rows[i][4] = final_remark
+            app_log.info('EXCEL', '已加载 %d 条客户记录' % len(self.rows))
             self._show_msg(f"● 已加载 {len(self.rows)} 条客户记录", THEME['success'])
             self._refresh_list()
         except Exception as e:
             err_msg = str(e)
+            app_log.error('EXCEL', '加载失败: %s' % err_msg)
             self._show_msg(f"加载失败: {err_msg[:60]}", THEME['danger'])
             Logger.error("Excel load failed: %s" % traceback.format_exc())
 
-    def _refresh_list(self):
+    def _refresh_list(self, filter_query=""):
+        """v3.20.0: 重建列表，支持分批渲染(大数据量)和搜索过滤(只显示匹配行)。
+        filter_query: 搜索关键词（小写），匹配客户名+地址；为空则显示全部
+        """
+        # 取消之前可能正在进行的批量渲染
+        self._render_token += 1
+        token = self._render_token
+
         self.list_layout.clear_widgets()
         self.row_widgets = []
+        self.scroll_view.scroll_y = 1
 
-        if self.rows:
-            self.list_layout.add_widget(self._build_header_row())
-
+        # 计算匹配的行
+        q = filter_query.lower().strip() if filter_query else ""
+        matched_indices = []
         for i, row in enumerate(self.rows):
-            borrower = row[0] if len(row) > 0 else ""
-            address_general = row[1] if len(row) > 1 else ""
-            address_precise = row[2] if len(row) > 2 else ""
-            property_type = row[3] if len(row) > 3 else ""
-            excel_remark = row[4] if len(row) > 4 else ""
-            full_addr = (address_general + address_precise).strip()
-            pk = self.progress_mgr._make_key(borrower, full_addr)
-            # v3.18.1: 优先从 ProgressManager 恢复备注，防止 Excel 写入失败后备注丢失
-            saved_remark = self.progress_mgr.get_remark(pk)
-            remark = saved_remark if saved_remark else excel_remark
+            if not q:
+                matched_indices.append(i)
+            else:
+                borrower = (row[0] if len(row) > 0 else "").lower()
+                addr = ((row[1] if len(row) > 1 else "") + (row[2] if len(row) > 2 else "")).lower()
+                if q in borrower or q in addr:
+                    matched_indices.append(i)
 
-            rw = RowWidget(
-                row_index=i, borrower=borrower,
-                address_general=address_general, address_precise=address_precise,
-                property_type=property_type,
-                progress_key=pk, progress_mgr=self.progress_mgr,
-                photo_callback=self._on_photo_request,
-                view_photos_callback=self._on_view_photos,
-                remark=remark,
-                remark_callback=self._on_remark_request,
-                excel_row_index=i + 2,  # Excel行号（1=表头，2=第一行数据）
+        if not self.rows:
+            self._show_empty_state()
+            self._update_progress()
+            return
+
+        # 添加表头
+        self.list_layout.add_widget(self._build_header_row())
+
+        # v3.20.0: 搜索结果数提示
+        if q:
+            search_info = Label(
+                text="找到 %d 条匹配" % len(matched_indices),
+                font_size='13sp', color=THEME['accent_dark'],
+                size_hint_y=None, height=dp(28), halign='left', valign='middle',
             )
-            self.list_layout.add_widget(rw)
-            self.row_widgets.append(rw)
+            search_info.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+            self.list_layout.add_widget(search_info)
 
-        self._update_progress()
+        total_matched = len(matched_indices)
+
+        # 数据量小时直接渲染（≤60行），大数据量分批
+        if total_matched <= 60:
+            for idx in matched_indices:
+                self._create_row_widget(idx)
+            self._update_progress()
+            return
+
+        # v3.20.0: 大数据量分批渲染 — 每批 40 行
+        self._loading_label = Label(
+            text="正在加载 0/%d..." % total_matched,
+            font_size='14sp', color=THEME['accent_dark'],
+            size_hint_y=None, height=dp(36), halign='center', valign='middle',
+        )
+        self.list_layout.add_widget(self._loading_label)
+
+        BATCH_SIZE = 40
+        def _render_next(batch_start, _dt=None):
+            # 检查令牌是否过期（被新的 refresh 取消）
+            if token != self._render_token:
+                return
+            batch_end = min(batch_start + BATCH_SIZE, total_matched)
+            for j in range(batch_start, batch_end):
+                self._create_row_widget(matched_indices[j])
+            if self._loading_label:
+                self._loading_label.text = "正在加载 %d/%d..." % (batch_end, total_matched)
+            if batch_end < total_matched:
+                Clock.schedule_once(lambda dt: _render_next(batch_end), 0)
+            else:
+                # 加载完成，移除进度提示
+                if self._loading_label:
+                    try:
+                        self.list_layout.remove_widget(self._loading_label)
+                    except Exception:
+                        pass
+                    self._loading_label = None
+                self._update_progress()
+
+        Clock.schedule_once(lambda dt: _render_next(0), 0)
+
+    def _create_row_widget(self, i):
+        """v3.20.0: 创建单行 RowWidget 并添加到列表"""
+        row = self.rows[i]
+        borrower = row[0] if len(row) > 0 else ""
+        address_general = row[1] if len(row) > 1 else ""
+        address_precise = row[2] if len(row) > 2 else ""
+        property_type = row[3] if len(row) > 3 else ""
+        excel_remark = row[4] if len(row) > 4 else ""
+        full_addr = (address_general + address_precise).strip()
+        pk = self.progress_mgr._make_key(borrower, full_addr)
+        # v3.20.0: progress_mgr 优先恢复备注
+        saved_remark = self.progress_mgr.get_remark(pk)
+        remark = saved_remark if saved_remark else excel_remark
+
+        rw = RowWidget(
+            row_index=i, borrower=borrower,
+            address_general=address_general, address_precise=address_precise,
+            property_type=property_type,
+            progress_key=pk, progress_mgr=self.progress_mgr,
+            photo_callback=self._on_photo_request,
+            view_photos_callback=self._on_view_photos,
+            remark=remark,
+            remark_callback=self._on_remark_request,
+            excel_row_index=i + 2,  # Excel行号（1=表头，2=第一行数据）
+        )
+        self.list_layout.add_widget(rw)
+        self.row_widgets.append(rw)
 
     def _update_progress(self):
         total = len(self.rows)
@@ -3439,15 +3754,9 @@ class MainScreen(Screen):
         self.progress_label.text = "%d/%d" % (done, total)
 
     def _on_search(self, instance, text=None):
-        query = self.search_input.text.lower().strip()
-        for rw in self.row_widgets:
-            if not query or query in rw.borrower.lower():
-                rw.opacity = 1
-                rw.size_hint_y = None
-                Clock.schedule_once(lambda dt, w=rw: w._update_heights(), 0)
-            else:
-                rw.opacity = 0
-                rw.height = 0
+        """v3.20.0: 搜索时重建列表，只显示匹配行（解决隐藏行仍占 GridLayout spacing 的问题）"""
+        query = self.search_input.text.strip()
+        self._refresh_list(filter_query=query)
 
     def _do_search(self, instance):
         self.search_input.focus = False
@@ -3464,6 +3773,7 @@ class MainScreen(Screen):
                 os.remove(self.camera_mgr._debug_log_path)
         except:
             pass
+        app_log.clear()  # v3.20.0: 同时清空全量 app 日志
         self.status_label.text = ""
         self.status_label.color = THEME['text_dim']
         if IS_ANDROID:
@@ -3484,20 +3794,10 @@ class MainScreen(Screen):
                 self.camera_mgr._toast("日志记录已关闭")
 
     def _show_full_log(self, instance):
-        """打开全屏日志记事本，显示完整的调试日志内容"""
-        log_path = self.camera_mgr._debug_log_path if self.camera_mgr._debug_log_path else os.path.join(APP_DIR, "camera_debug.log")
-        log_content = ""
-        if os.path.exists(log_path):
-            try:
-                with open(log_path, 'r', encoding='utf-8') as f:
-                    log_content = f.read()
-            except Exception as e:
-                log_content = f"读取日志文件失败: {e}"
-        else:
-            log_content = "暂无日志记录\n\n拍照操作后会在这里记录详细调试信息。"
-
+        """v3.20.0: 打开全屏日志记事本，显示全量 app 日志（Excel/拍照/备注/AI/生命周期等）"""
+        log_content = app_log.get_log_text()
         if not log_content.strip():
-            log_content = "暂无日志记录\n\n拍照操作后会在这里记录详细调试信息。"
+            log_content = "暂无日志记录\n\n操作后会在这里记录详细日志（Excel加载、拍照、备注保存、AI调用等）。"
 
         from kivy.uix.popup import Popup
         from kivy.uix.boxlayout import BoxLayout
@@ -3510,7 +3810,7 @@ class MainScreen(Screen):
         log_label = Label(
             text=log_content,
             font_size='11sp',
-            color=THEME['warning'],
+            color=THEME['text'],
             halign='left', valign='top',
             size_hint_y=None,
             markup=False,
@@ -3522,15 +3822,18 @@ class MainScreen(Screen):
         content.add_widget(scroll)
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        close_btn = Button(text="关闭", font_size='15sp', size_hint_x=0.5,
+        close_btn = Button(text="关闭", font_size='15sp', size_hint_x=0.34,
                           background_color=THEME['muted'], background_normal='', color=(1,1,1,1))
-        copy_btn = Button(text="复制日志", font_size='15sp', size_hint_x=0.5,
+        copy_btn = Button(text="复制日志", font_size='15sp', size_hint_x=0.33,
                          background_color=THEME['accent'], background_normal='', color=(1,1,1,1))
+        clear_btn = Button(text="清空", font_size='15sp', size_hint_x=0.33,
+                          background_color=THEME['danger'], background_normal='', color=(1,1,1,1))
         btn_row.add_widget(close_btn)
         btn_row.add_widget(copy_btn)
+        btn_row.add_widget(clear_btn)
         content.add_widget(btn_row)
 
-        popup = Popup(title='调试日志（拍照问题请截图此页）',
+        popup = Popup(title='应用日志（问题排查请截图此页）',
                       content=content,
                       size_hint=(0.95, 0.9))
 
@@ -3550,6 +3853,14 @@ class MainScreen(Screen):
                 copy_btn.text = "复制失败"
 
         copy_btn.bind(on_release=_copy)
+
+        def _clear(instance):
+            app_log.clear()
+            log_label.text = "日志已清空"
+            clear_btn.text = "已清空"
+            Clock.schedule_once(lambda dt: setattr(clear_btn, 'text', '清空'), 1.5)
+        clear_btn.bind(on_release=_clear)
+
         popup.open()
 
     def _update_log_label_size(self, instance, value):
@@ -3557,14 +3868,25 @@ class MainScreen(Screen):
 
     def _go_settings(self, instance):
         self._continuous_shooting = False
+        self._photo_session_active = False  # v3.20.0: 解除会话锁
+        self._unlock_photo_buttons()
         self.manager.current = 'settings'
 
     def _go_ai(self, instance):
         """跳转到 AI 助手页面 v3.15.0"""
         self._continuous_shooting = False
+        self._photo_session_active = False  # v3.20.0: 解除会话锁
+        self._unlock_photo_buttons()
         self.manager.current = 'ai'
 
     def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
+        """v3.20.0: 拍照会话入口 — 创建上下文 ctx 并启动会话锁，防止连拍期间切换客户"""
+        # v3.20.0: 会话锁 — 拍照进行中时拒绝新请求
+        if self._photo_session_active:
+            self.camera_mgr._dbg("拍照会话进行中，请先完成当前拍照", show_toast=True)
+            return
+
+        # 兼容旧代码：仍更新 self._current_*（键盘处理等仍引用）
         self._current_row = row_index
         self._current_borrower = borrower
         self._current_addr_general = address_general
@@ -3572,15 +3894,63 @@ class MainScreen(Screen):
         self._current_property_type = property_type
         self._current_key = self.progress_mgr._make_key(borrower, (address_general + address_precise).strip())
         self._photos_in_session = 0
+
+        # v3.20.0: 创建拍照会话上下文（通过闭包传递，不依赖实例状态）
+        self._photo_session_ctx = {
+            'row_index': row_index,
+            'borrower': borrower,
+            'addr_general': address_general,
+            'addr_precise': address_precise,
+            'property_type': property_type,
+            'photo_type': '',  # 在 _on_photo_type_selected 中设置
+            'key': self._current_key,
+        }
+
         popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
         popup.open()
 
     def _on_photo_type_selected(self, photo_type):
-        self._current_photo_type = photo_type
+        """v3.20.0: 选择拍照类型后启动相机，通过闭包绑定 ctx"""
+        ctx = self._photo_session_ctx
+        if not ctx:
+            return
+        ctx['photo_type'] = photo_type
+        self._current_photo_type = photo_type  # 兼容旧代码
         self._continuous_shooting = True
+        self._photo_session_active = True  # v3.20.0: 激活会话锁
         self._photos_in_session = 0
-        self.camera_mgr._dbg(f"选择拍照类型: {photo_type}")
-        Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.3)
+
+        # v3.20.0: 锁定其他行的拍照按钮
+        self._lock_photo_buttons(exclude_row=ctx['row_index'])
+
+        self.camera_mgr._dbg(f"开始为【{ctx['borrower']}】拍照，类型: {photo_type}", show_toast=True)
+        app_log.info('PHOTO', '拍照会话开始: 客户=%s, 类型=%s, 行=%d' % (ctx['borrower'], photo_type, ctx['row_index']))
+
+        # v3.20.0: 通过闭包绑定 ctx，不依赖 self._current_*（修复命名错乱根因）
+        Clock.schedule_once(
+            lambda dt: self.camera_mgr.take_photo(
+                lambda path: self._on_photo_done_with_context(path, ctx),
+                self._camera_status_update
+            ), 0.3)
+
+    def _lock_photo_buttons(self, exclude_row=None):
+        """v3.20.0: 拍照会话期间禁用其他行的拍照按钮"""
+        for rw in self.row_widgets:
+            if rw.row_index != exclude_row:
+                try:
+                    rw.photo_btn.disabled = True
+                    rw.photo_btn.opacity = 0.5
+                except Exception:
+                    pass
+
+    def _unlock_photo_buttons(self):
+        """v3.20.0: 拍照会话结束后恢复所有行的拍照按钮"""
+        for rw in self.row_widgets:
+            try:
+                rw.photo_btn.disabled = False
+                rw.photo_btn.opacity = 1
+            except Exception:
+                pass
 
     def _camera_status_update(self, msg):
         """CameraManager回调：更新UI状态显示调试信息（多行日志）"""
@@ -3599,26 +3969,35 @@ class MainScreen(Screen):
         except:
             pass
 
-    def _launch_next_photo(self):
-        """拍完一张后立即重新调起相机，继续拍摄同一类型，用户按快门拍下一张。"""
-        if self._continuous_shooting:
-            self.camera_mgr._dbg(f"准备拍摄下一张（{self._current_photo_type}）…")
-            Clock.schedule_once(lambda dt: self.camera_mgr.take_photo(self._on_photo_done, self._camera_status_update), 0.5)
+    def _launch_next_photo(self, ctx=None):
+        """v3.20.0: 拍完一张后立即重新调起相机，通过闭包传递同一 ctx。"""
+        ctx = ctx or self._photo_session_ctx
+        if self._continuous_shooting and ctx:
+            self.camera_mgr._dbg(f"准备拍摄下一张（{ctx['photo_type']}）…")
+            Clock.schedule_once(
+                lambda dt: self.camera_mgr.take_photo(
+                    lambda path: self._on_photo_done_with_context(path, ctx),
+                    self._camera_status_update
+                ), 0.5)
 
-    def _on_photo_done(self, photo_path):
+    def _on_photo_done_with_context(self, photo_path, ctx):
+        """v3.20.0: 拍照完成回调 — 使用闭包绑定的 ctx，不依赖 self._current_*（修复命名错乱）"""
         if photo_path is None:
             self._continuous_shooting = False
+            self._photo_session_active = False
+            self._unlock_photo_buttons()
             self.camera_mgr._dbg("拍照已取消")
-            self._refresh_row_done(self._current_row)
+            self._refresh_row_done(ctx['row_index'])
             return
 
-        row_index = self._current_row
-        borrower = self._current_borrower
-        addr_general = self._current_addr_general
-        addr_precise = self._current_addr_precise
-        property_type = self._current_property_type
-        photo_type = self._current_photo_type
-        key = self._current_key
+        # 从 ctx 读取客户信息（不再从 self._current_* 读取，防止被覆盖）
+        row_index = ctx['row_index']
+        borrower = ctx['borrower']
+        addr_general = ctx['addr_general']
+        addr_precise = ctx['addr_precise']
+        property_type = ctx['property_type']
+        photo_type = ctx['photo_type']
+        key = ctx['key']
 
         self._photos_in_session += 1
         seq = self.progress_mgr.get_next_photo_index(key) + 1
@@ -3628,6 +4007,7 @@ class MainScreen(Screen):
         datetime_str = get_datetime_str()
 
         self.camera_mgr._dbg("照片处理中...")
+        app_log.info('PHOTO', '处理照片: 客户=%s, 类型=%s, 序号=%d' % (borrower, photo_type, seq))
 
         config_data = self.config.data
         naming_segments = self.config.get('naming_segments', DEFAULT_CONFIG['naming_segments'])
@@ -3675,26 +4055,44 @@ class MainScreen(Screen):
                     except:
                         pass
 
-                PhotoProcessor.save_to_gallery(new_path)
-                self.progress_mgr.mark_photo(key, new_path, photo_type)
-                Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename), 0)
+                # v3.20.0: save_to_gallery 返回最终保存路径，删除 APP_DIR 临时副本
+                saved_path = PhotoProcessor.save_to_gallery(new_path)
+                if not saved_path:
+                    saved_path = new_path  # save_to_gallery 失败时用 APP_DIR 副本
+                else:
+                    # save_to_gallery 成功，删除 APP_DIR 临时副本节省存储
+                    try:
+                        if saved_path != new_path and os.path.exists(new_path):
+                            os.remove(new_path)
+                    except Exception:
+                        pass
+
+                self.progress_mgr.mark_photo(key, saved_path, photo_type)
+                Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename, ctx), 0)
             except Exception as e:
                 Logger.error("MainScreen._on_photo_done: %s" % e)
                 Logger.error(traceback.format_exc())
                 err_msg = str(e)
+                app_log.error('PHOTO', '照片处理失败: %s' % err_msg)
                 Clock.schedule_once(lambda dt: self._on_photo_failed(err_msg), 0)
 
         threading.Thread(target=_process, daemon=True).start()
 
     @mainthread
-    def _on_photo_saved(self, row_index, filename):
+    def _on_photo_saved(self, row_index, filename, ctx=None):
         self._refresh_row_done(row_index)
         self.camera_mgr._dbg(f"[OK] 已保存: {filename}", show_toast=True)
-        self._launch_next_photo()
+        # v3.20.0: 连拍下一张时传递同一 ctx
+        if ctx:
+            self._launch_next_photo(ctx)
+        else:
+            self._launch_next_photo()
 
     @mainthread
     def _on_photo_failed(self, err_msg):
         self._continuous_shooting = False
+        self._photo_session_active = False  # v3.20.0: 解除会话锁
+        self._unlock_photo_buttons()
         self.camera_mgr._dbg(f"保存失败: {err_msg[:60]}", show_toast=True)
 
     def _refresh_row_done(self, row_index):
@@ -3802,6 +4200,7 @@ class MainScreen(Screen):
                     self.rows[row_index].append("")
                 self.rows[row_index][4] = remark_text
             # v3.17.0: 保存到progress_mgr（持久化到JSON，确保退出app后不丢失）
+            # v3.20.0: progress_mgr 是备注的单一真相源，始终保存
             try:
                 row = self.rows[row_index]
                 borrower = row[0] if len(row) > 0 else ""
@@ -3810,8 +4209,9 @@ class MainScreen(Screen):
                 full_addr = (address_general + address_precise).strip()
                 key = self.progress_mgr._make_key(borrower, full_addr)
                 self.progress_mgr.save_remark(key, remark_text)
-                self.camera_mgr._dbg(f"备注已保存到持久化存储(key={key})", show_toast=False)
+                app_log.info('REMARK', '备注已保存到持久化存储: 客户=%s, key=%s' % (borrower, key))
             except Exception as e:
+                app_log.error('REMARK', '备注保存到progress_mgr失败: %s' % e)
                 Logger.error(f"备注保存到progress_mgr失败: {e}")
             # 保存到 Excel E 列
             if self.excel_path:
@@ -3825,13 +4225,16 @@ class MainScreen(Screen):
                         ok2, msg2 = ExcelWriter.write_back_to_uri(excel_uri, self.excel_path)
                         if ok2:
                             msg = "已保存到原始 Excel"
+                            app_log.info('REMARK', '备注已写回原始 Excel: 行%d' % rw.excel_row_index)
                         else:
                             msg = f"app内部已保存；{msg2}"
+                            app_log.warn('REMARK', '写回原始Excel失败: %s' % msg2)
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
                         self.camera_mgr._dbg(f"[OK] {msg} 行{rw.excel_row_index}", show_toast=True)
                     else:
                         Logger.error("备注保存失败 行%d" % rw.excel_row_index)
+                        app_log.error('REMARK', 'Excel保存失败 行%d: %s' % (rw.excel_row_index, msg))
                         self.camera_mgr._dbg(f"[WARN] {msg}，但已保存到app内部 行{rw.excel_row_index}", show_toast=True)
                 threading.Thread(target=_save_excel, daemon=True).start()
             else:
@@ -3864,8 +4267,8 @@ class MainScreen(Screen):
 
         # 进度弹窗（AI生成较慢）
         content = BoxLayout(orientation='vertical', padding=dp(24), spacing=dp(16))
-        msg = Label(text="正在通过 AI 生成日报表，请稍候…", font_size='16sp', color=THEME['text'],
-                    size_hint_y=None, height=dp(40))
+        msg = Label(text="正在通过 AI 生成日报表，请稍候…", font_size='18sp', bold=True,
+                    color=THEME['text'], size_hint_y=None, height=dp(44))
         content.add_widget(msg)
         from kivy.uix.progressbar import ProgressBar
         pb = ProgressBar(size_hint_y=None, height=dp(8))
@@ -3904,7 +4307,8 @@ class MainScreen(Screen):
             Clock.schedule_once(_done, 0)
 
         import threading
-        threading.Thread(target=_run, daemon=True).start()
+        # v3.20.0: 延迟 0.1s 启动线程，确保弹窗先渲染到屏幕（防止低端机弹窗未绘制就阻塞）
+        Clock.schedule_once(lambda dt: threading.Thread(target=_run, daemon=True).start(), 0.1)
 
     def _save_report_to_user(self, src_path):
         """通过 SAF 让用户选择日报表保存位置"""
@@ -4156,6 +4560,8 @@ class LoanPhotoApp(App):
 
         # 拦截Android返回键：边缘滑动不直接退出App，而是返回上一页面
         Window.bind(on_keyboard=self._on_keyboard)
+        # v3.20.0: 绑定 on_restore/on_draw，处理 app 从后台恢复时 GL 上下文丢失
+        Window.bind(on_restore=self._on_window_restore)
 
         self.config = AppConfig()
 
@@ -4167,6 +4573,29 @@ class LoanPhotoApp(App):
         sm.add_widget(AIScreen(app_config=self.config, name='ai'))
         sm.current = 'welcome'
         return sm
+
+    def _on_window_restore(self, *args):
+        """v3.20.0: app 从后台恢复时，强制重绘所有 canvas，防止 GL 上下文丢失导致卡死"""
+        try:
+            app_log.info('APP', 'on_window_restore: 恢复GL上下文')
+            for screen_name in ['welcome', 'main', 'settings', 'ai']:
+                try:
+                    sc = self.sm.get_screen(screen_name)
+                    if sc:
+                        sc.canvas.ask_update()
+                except Exception:
+                    pass
+            # 刷新主界面进度
+            main_screen = self.sm.get_screen('main') if self.sm else None
+            if main_screen:
+                main_screen._is_paused = False
+                main_screen._update_progress()
+                try:
+                    main_screen.canvas.ask_update()
+                except Exception:
+                    pass
+        except Exception as e:
+            app_log.error('APP', 'on_window_restore 失败: %s' % e)
 
     def _on_keyboard(self, window, key, scancode, codepoint, modifier):
         if key == 27:
@@ -4181,6 +4610,8 @@ class LoanPhotoApp(App):
                 main_screen = self.sm.get_screen('main')
                 if getattr(main_screen, '_continuous_shooting', False):
                     main_screen._continuous_shooting = False
+                    main_screen._photo_session_active = False  # v3.20.0: 解除会话锁
+                    main_screen._unlock_photo_buttons()
                     main_screen.camera_mgr._dbg("已结束连续拍照", show_toast=True)
                     return True
                 self.sm.current = 'welcome'
@@ -4247,10 +4678,48 @@ class LoanPhotoApp(App):
             pass
 
     def on_pause(self):
+        # v3.20.0: 切后台时停止连续拍照、保存进度、清除相机 pending 状态，防止恢复时卡死
+        try:
+            main_screen = self.sm.get_screen('main') if self.sm else None
+            if main_screen:
+                if getattr(main_screen, '_continuous_shooting', False):
+                    main_screen._continuous_shooting = False
+                    app_log.info('APP', 'on_pause: 停止连续拍照')
+                main_screen._is_paused = True
+                # 清除可能死锁的相机 pending 回调
+                if main_screen.camera_mgr and main_screen.camera_mgr._camera_launched:
+                    main_screen.camera_mgr._camera_launched = False
+                # 保存进度
+                try:
+                    main_screen.progress_mgr.save()
+                except Exception:
+                    pass
+            app_log.info('APP', 'on_pause: app 切入后台')
+        except Exception as e:
+            app_log.error('APP', 'on_pause 异常: %s' % e)
         return True
 
     def on_resume(self):
-        pass
+        # v3.20.0: 从后台恢复时刷新 UI 状态
+        try:
+            app_log.info('APP', 'on_resume: app 从后台恢复')
+            main_screen = self.sm.get_screen('main') if self.sm else None
+            if main_screen:
+                main_screen._is_paused = False
+                # 刷新进度显示和列表高度
+                main_screen._update_progress()
+                for rw in getattr(main_screen, 'row_widgets', []):
+                    try:
+                        rw._update_heights()
+                    except Exception:
+                        pass
+                # 强制重绘 canvas
+                try:
+                    main_screen.canvas.ask_update()
+                except Exception:
+                    pass
+        except Exception as e:
+            app_log.error('APP', 'on_resume 异常: %s' % e)
 
 
 if __name__ == '__main__':
