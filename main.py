@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.20.0
+资产盘点专项拍照工具 App - v3.21.0
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -361,6 +361,32 @@ APP_LOG_FILE = os.path.join(APP_DIR, 'app_debug.log')
 FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'simhei.ttf')
 
 # ============================================================
+# v3.21.0: RoundedButton — 圆角按钮，改善 GUI 观感
+# 使用 canvas.before 绘制 RoundedRectangle 替代 Kivy 默认硬直角矩形
+# ============================================================
+class RoundedButton(Button):
+    """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle"""
+
+    def __init__(self, radius=(8, 8, 8, 8), **kwargs):
+        super().__init__(**kwargs)
+        self._radius = list(radius)
+        self.background_normal = ''
+        self.bind(pos=self._draw_bg, size=self._draw_bg,
+                  background_color=self._draw_bg, state=self._draw_bg)
+        self._draw_bg()
+
+    def _draw_bg(self, *args):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            # state='down' 时变暗，提供按压视觉反馈
+            r, g, b, a = self.background_color
+            if self.state == 'down':
+                r, g, b = r * 0.85, g * 0.85, b * 0.85
+            Color(r, g, b, a)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=self._radius)
+
+
+# ============================================================
 # v3.20.0: 全局日志器 — 记录全量 app 日志（Excel/拍照/备注/AI/生命周期等）
 # 轮转策略：文件超过 500KB 时保留最近 256KB
 # ============================================================
@@ -639,6 +665,7 @@ class ProgressManager:
     def __init__(self, filepath=None):
         self.filepath = filepath or PROGRESS_FILE
         self.data = {}
+        self._lock = threading.RLock()  # v3.21.0: 线程安全，防止并发写入损坏 JSON
         self.load()
 
     def _make_key(self, borrower, address=""):
@@ -658,72 +685,83 @@ class ProgressManager:
                 self.data = {}
 
     def save(self):
-        try:
-            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-            with open(self.filepath, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            Logger.info(f"ProgressManager.save: 已保存 {len(self.data)} 条记录到 {self.filepath}")
-        except Exception as e:
-            Logger.error(f"ProgressManager.save: 保存失败 {e}")
+        with self._lock:
+            try:
+                os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+                # v3.21.0: 原子写 — 先写临时文件再 os.replace，防止并发写入损坏 JSON
+                tmp = self.filepath + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.filepath)
+                Logger.info(f"ProgressManager.save: 已保存 {len(self.data)} 条记录到 {self.filepath}")
+            except Exception as e:
+                Logger.error(f"ProgressManager.save: 保存失败 {e}")
 
     def mark_photo(self, key, photo_path, photo_type=""):
         """key = _make_key(borrower, address_general, address_precise)"""
-        if key not in self.data:
-            self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
-        # 验证并保存完整路径
-        self.data[key]["photos"].append(os.path.abspath(photo_path))
-        if photo_type:
-            self.data[key]["types"][photo_type] = True
-        self.data[key]["timestamp"] = get_full_datetime_str()
-        self.save()
+        with self._lock:
+            if key not in self.data:
+                self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
+            # 验证并保存完整路径
+            self.data[key]["photos"].append(os.path.abspath(photo_path))
+            if photo_type:
+                self.data[key]["types"][photo_type] = True
+            self.data[key]["timestamp"] = get_full_datetime_str()
+            self.save()
 
     def save_remark(self, key, remark_text):
         """保存备注到持久化存储（v3.17.0）"""
-        if key not in self.data:
-            self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
-        self.data[key]["remark"] = remark_text
-        self.save()
+        with self._lock:
+            if key not in self.data:
+                self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
+            self.data[key]["remark"] = remark_text
+            self.save()
 
     def get_remark(self, key):
         """获取备注（v3.17.0）"""
-        if key not in self.data:
-            return ""
-        return self.data[key].get("remark", "")
+        with self._lock:
+            if key not in self.data:
+                return ""
+            return self.data[key].get("remark", "")
 
     def delete_photo(self, key, photo_index):
-        if key in self.data and photo_index < len(self.data[key]["photos"]):
-            self.data[key]["photos"].pop(photo_index)
-            if not self.data[key]["photos"]:
-                # 保留remark字段，不删除整个entry（v3.17.0）
-                self.data[key]["photos"] = []
-                self.data[key]["types"] = {}
-            self.save()
+        with self._lock:
+            if key in self.data and photo_index < len(self.data[key]["photos"]):
+                self.data[key]["photos"].pop(photo_index)
+                if not self.data[key]["photos"]:
+                    # 保留remark字段，不删除整个entry（v3.17.0）
+                    self.data[key]["photos"] = []
+                    self.data[key]["types"] = {}
+                self.save()
 
     def delete_all_photos(self, key):
-        if key in self.data:
-            # 保留remark字段（v3.17.0）
-            self.data[key]["photos"] = []
-            self.data[key]["types"] = {}
-            self.save()
+        with self._lock:
+            if key in self.data:
+                # 保留remark字段（v3.17.0）
+                self.data[key]["photos"] = []
+                self.data[key]["types"] = {}
+                self.save()
 
     def is_photographed(self, key):
-        return key in self.data and len(self.data[key].get("photos", [])) > 0
+        with self._lock:
+            return key in self.data and len(self.data[key].get("photos", [])) > 0
 
     def get_photos(self, key):
         """返回存在的照片路径列表（过滤掉已删除的）"""
-        if key not in self.data:
-            return []
-        valid = []
-        for p in self.data[key].get("photos", []):
-            if os.path.exists(p):
-                valid.append(p)
-        # 清理失效路径
-        if len(valid) != len(self.data[key].get("photos", [])):
-            self.data[key]["photos"] = valid
-            self.save()
-        return valid
+        with self._lock:
+            if key not in self.data:
+                return []
+            valid = []
+            for p in self.data[key].get("photos", []):
+                if os.path.exists(p):
+                    valid.append(p)
+            # 清理失效路径
+            if len(valid) != len(self.data[key].get("photos", [])):
+                self.data[key]["photos"] = valid
+                self.save()
+            return valid
 
     def get_photo_count(self, key):
         return len(self.get_photos(key))
@@ -733,9 +771,10 @@ class ProgressManager:
         return sum(1 for b, a in keys if self.is_photographed(self._make_key(b, a)))
 
     def get_next_photo_index(self, key):
-        if key in self.data:
-            return len(self.data[key]["photos"])
-        return 0
+        with self._lock:
+            if key in self.data:
+                return len(self.data[key]["photos"])
+            return 0
 
     def get_next_type_index(self, key, photo_type):
         """返回该客户指定类型的下一个照片编号（01开始，跨会话连续）。
@@ -758,7 +797,8 @@ class ProgressManager:
         return max_idx + 1
 
     def get_photo_types(self, key):
-        return self.data.get(key, {}).get("types", {})
+        with self._lock:
+            return self.data.get(key, {}).get("types", {})
 
     def get_photo_type_summary(self, key):
         types = self.get_photo_types(key)
@@ -791,6 +831,9 @@ class ExcelReader:
             if i == 0:
                 self.headers = cells
             else:
+                # v3.21.0: 跳过 A-D 列全空的行（Excel 尾部常见空行）
+                if not any(cells[:4]):
+                    continue
                 self.rows.append(cells)
         wb.close()
         # 自动判断表头
@@ -815,6 +858,7 @@ class ExcelWriter:
         os.makedirs(os.path.dirname(work_copy), exist_ok=True)
 
         # 方式1：直接写入原文件（临时文件放在 APP_DIR，避免外部目录不可写）
+        wb = None
         try:
             wb = openpyxl.load_workbook(file_path)
             ws = wb.active
@@ -822,13 +866,21 @@ class ExcelWriter:
             tmp = os.path.join(APP_DIR, 'excel_work', os.path.basename(file_path) + '.tmp')
             wb.save(tmp)
             wb.close()
+            wb = None
             shutil.move(tmp, file_path)
             Logger.info(f"save_remark: 直接写入成功 行{row_index}")
             return True, "已保存到 Excel"
         except Exception as e1:
             Logger.error(f"save_remark直接写入失败: {e1}")
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
         # 方式2：复制到 app 私有目录再写入，然后尝试复制回原路径
+        wb = None
         try:
             shutil.copy2(file_path, work_copy)
             wb = openpyxl.load_workbook(work_copy)
@@ -836,6 +888,7 @@ class ExcelWriter:
             ws.cell(row=row_index, column=5, value=remark_text)
             wb.save(work_copy)
             wb.close()
+            wb = None
             try:
                 shutil.copy2(work_copy, file_path)
                 Logger.info(f"save_remark: 通过工作副本写入成功 行{row_index}")
@@ -846,6 +899,12 @@ class ExcelWriter:
         except Exception as e2:
             Logger.error(f"save_remark工作副本写入也失败: {e2}")
             return False, f"Excel 保存失败：{e2}"
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def save_all_remarks(file_path, remarks):
@@ -914,11 +973,9 @@ class ExcelWriter:
             out.close()
             Logger.info(f"write_back_to_uri: 已写回原始 Excel URI")
             return True, "已写回原始 Excel"
-        except:
-            import sys as _sys
-            e = _sys.exc_info()[1]
+        except Exception as e:
             Logger.error(f"write_back_to_uri 失败: {e}")
-            return False, f"写回原始文件失败: {str(e)[:40] if e else ''}"
+            return False, f"写回原始文件失败: {str(e)[:40]}"
 
 # ============================================================
 # 报告生成器
@@ -2652,7 +2709,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.20.0", font_size='12sp',
+            text="v3.21.0", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -2686,7 +2743,7 @@ class WelcomeScreen(Screen):
         root.add_widget(Label(size_hint_y=None, height=dp(12)))
 
         # 进入按钮 - 大尺寸适合手指点击
-        start_btn = Button(
+        start_btn = RoundedButton(
             text="开 始 使 用", font_size='22sp',
             size_hint_y=None, height=dp(64),
             background_color=THEME['accent'],
@@ -2720,7 +2777,7 @@ class PhotoTypePopup(Popup):
         layout.add_widget(Label(text="请选择本次拍摄的照片类型：", font_size='16sp', size_hint_y=None, height=dp(40)))
 
         for type_name, type_desc in PHOTO_TYPES:
-            btn = Button(
+            btn = RoundedButton(
                 text=f"{type_name}\n{type_desc}", font_size='16sp',
                 size_hint_y=None, height=dp(72),
                 background_color=THEME['accent'], background_normal='',
@@ -2729,7 +2786,7 @@ class PhotoTypePopup(Popup):
             btn.bind(on_release=lambda x, t=type_name: self._select(t))
             layout.add_widget(btn)
 
-        cancel_btn = Button(text="取消", font_size='16sp', size_hint_y=None, height=dp(52),
+        cancel_btn = RoundedButton(text="取消", font_size='16sp', size_hint_y=None, height=dp(52),
                            background_color=THEME['muted'], background_normal='',
                            color=(1,1,1,1))
         cancel_btn.bind(on_release=self.dismiss)
@@ -2771,7 +2828,7 @@ class PhotoViewerPopup(Popup):
                                       text_size=(0, None))
             name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
             info_box.add_widget(name_label)
-            del_btn = Button(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
+            del_btn = RoundedButton(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
             del_btn.bind(on_release=lambda x, idx=i: self._confirm_delete(idx))
@@ -2782,13 +2839,13 @@ class PhotoViewerPopup(Popup):
         scroll.add_widget(list_layout)
         main_layout.add_widget(scroll)
 
-        del_all_btn = Button(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
+        del_all_btn = RoundedButton(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
         del_all_btn.bind(on_release=self._confirm_delete_all)
         main_layout.add_widget(del_all_btn)
 
-        close_btn = Button(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
+        close_btn = RoundedButton(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
                           background_color=THEME['accent'], background_normal='',
                           color=(1,1,1,1), bold=True)
         close_btn.bind(on_release=self.dismiss)
@@ -2802,9 +2859,9 @@ class PhotoViewerPopup(Popup):
                                  font_size='16sp', color=THEME['text'], halign='center'))
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
         popup = Popup(title="确认删除", size_hint=(0.8, 0.35), auto_dismiss=True)
-        yes_btn = Button(text="确认删除", font_size='16sp', background_color=THEME['danger'],
+        yes_btn = RoundedButton(text="确认删除", font_size='16sp', background_color=THEME['danger'],
                          background_normal='', color=(1,1,1,1), bold=True)
-        no_btn = Button(text="取消", font_size='16sp', background_color=THEME['accent'],
+        no_btn = RoundedButton(text="取消", font_size='16sp', background_color=THEME['accent'],
                         background_normal='', color=(1,1,1,1), bold=True)
         def _do_delete(instance):
             popup.dismiss()
@@ -2825,9 +2882,9 @@ class PhotoViewerPopup(Popup):
                                  font_size='16sp', color=THEME['danger'], halign='center'))
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
         popup = Popup(title="危险操作确认", size_hint=(0.85, 0.35), auto_dismiss=True)
-        yes_btn = Button(text="全部删除", font_size='16sp', background_color=THEME['danger'],
+        yes_btn = RoundedButton(text="全部删除", font_size='16sp', background_color=THEME['danger'],
                          background_normal='', color=(1,1,1,1), bold=True)
-        no_btn = Button(text="取消", font_size='16sp', background_color=THEME['accent'],
+        no_btn = RoundedButton(text="取消", font_size='16sp', background_color=THEME['accent'],
                         background_normal='', color=(1,1,1,1), bold=True)
         def _do_delete_all(instance):
             popup.dismiss()
@@ -2859,7 +2916,7 @@ class SettingsScreen(Screen):
 
         # 标题栏 - 增大高度和按钮
         title_bar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8))
-        back_btn = Button(text="返回", font_size='18sp', size_hint_x=0.28,
+        back_btn = RoundedButton(text="返回", font_size='18sp', size_hint_x=0.28,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True,
                          size_hint_y=None, height=dp(52))
@@ -2905,7 +2962,7 @@ class SettingsScreen(Screen):
                                           color=THEME['text_dim'], size_hint_y=None, height=dp(28))
         naming_card.add_widget(self.naming_preview_label)
 
-        save_naming_btn = Button(text="保存命名规则", font_size='16sp', size_hint_y=None, height=dp(52),
+        save_naming_btn = RoundedButton(text="保存命名规则", font_size='16sp', size_hint_y=None, height=dp(52),
                                 background_color=THEME['accent'], background_normal='',
                                 color=(1,1,1,1), bold=True)
         save_naming_btn.bind(on_release=self._save_naming)
@@ -2975,7 +3032,7 @@ class SettingsScreen(Screen):
         font_size_box.add_widget(self.font_spinner)
         watermark_card.add_widget(font_size_box)
 
-        save_wm_btn = Button(text="保存水印设置", font_size='16sp', size_hint_y=None, height=dp(52),
+        save_wm_btn = RoundedButton(text="保存水印设置", font_size='16sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['accent'], background_normal='',
                             color=(1,1,1,1), bold=True)
         save_wm_btn.bind(on_release=self._save_watermark)
@@ -3028,7 +3085,7 @@ class SettingsScreen(Screen):
         ai_hint.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
         ai_card.add_widget(ai_hint)
 
-        save_ai_btn = Button(text="保存AI设置", font_size='16sp', size_hint_y=None, height=dp(52),
+        save_ai_btn = RoundedButton(text="保存AI设置", font_size='16sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['success'], background_normal='',
                             color=(1,1,1,1), bold=True)
         save_ai_btn.bind(on_release=self._save_ai_settings)
@@ -3103,7 +3160,8 @@ class SettingsScreen(Screen):
 class RowWidget(BoxLayout):
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
                  progress_key, progress_mgr, photo_callback, view_photos_callback,
-                 remark="", remark_callback=None, excel_row_index=None, **kwargs):
+                 remark="", remark_callback=None, excel_row_index=None,
+                 **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
         self.size_hint_y = None
@@ -3174,7 +3232,7 @@ class RowWidget(BoxLayout):
         # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数）
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
 
-        self.photo_btn = Button(
+        self.photo_btn = RoundedButton(
             text="拍照", font_size='16sp',
             size_hint_x=0.26,
             background_color=THEME['success'] if self.done else THEME['accent'],
@@ -3185,7 +3243,7 @@ class RowWidget(BoxLayout):
         bind_press_animation(self.photo_btn)
         btn_row.add_widget(self.photo_btn)
 
-        self.view_btn = Button(
+        self.view_btn = RoundedButton(
             text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
             font_size='15sp', size_hint_x=0.34,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else THEME['muted'],
@@ -3197,7 +3255,7 @@ class RowWidget(BoxLayout):
         btn_row.add_widget(self.view_btn)
 
         # 备注按钮 v3.15.0
-        self.remark_btn = Button(
+        self.remark_btn = RoundedButton(
             text="备注●" if self.remark else "备注",
             font_size='15sp', size_hint_x=0.22,
             background_color=THEME['warning'] if self.remark else THEME['muted'],
@@ -3292,6 +3350,7 @@ class MainScreen(Screen):
         self.progress_mgr = ProgressManager()
         self.camera_mgr = CameraManager()
         self.report_generator = ReportGenerator()
+        self._excel_save_lock = threading.Lock()  # v3.21.0: 串行化 Excel 写入，防止并发覆盖
         self.row_widgets = []
         self._current_row = 0
         self._current_borrower = ""
@@ -3305,6 +3364,7 @@ class MainScreen(Screen):
         self._photos_in_session = 0
         self._render_token = 0   # v3.20.0: 批量渲染令牌，搜索/重新加载时取消旧的渲染
         self._loading_label = None  # v3.20.0: 加载进度提示 Label
+        self._search_debounce = None  # v3.21.0: 搜索防抖定时器
         self._photo_session_ctx = None  # v3.20.0: 拍照会话上下文（替代 self._current_* 实例状态）
         self._photo_session_active = False  # v3.20.0: 拍照会话锁，防止连拍期间切换客户
 
@@ -3319,21 +3379,21 @@ class MainScreen(Screen):
         title_bar = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(14), dp(6), dp(14), dp(6)])
         with title_bar.canvas.before:
             Color(*THEME['card'])
-            self._titlebar_rect = RoundedRectangle(pos=title_bar.pos, size=title_bar.size, radius=[0])
+            self._titlebar_rect = RoundedRectangle(pos=title_bar.pos, size=title_bar.size, radius=[0, 0, 8, 8])
             Color(*THEME['card_border'])
             self._titlebar_border = Line(rectangle=(title_bar.x, title_bar.y, title_bar.width, title_bar.height), width=1)
         title_bar.bind(pos=self._update_titlebar_rect, size=self._update_titlebar_rect)
         title_bar.add_widget(Label(text="资产盘点拍照", font_size='19sp', bold=True, color=THEME['accent_dark'],
                                    size_hint_x=0.46, halign='left', valign='middle'))
 
-        ai_btn = Button(text="AI助手", font_size='15sp', size_hint_x=0.16,
+        ai_btn = RoundedButton(text="AI助手", font_size='15sp', size_hint_x=0.16,
                        background_color=THEME['success'], background_normal='',
                        color=(1,1,1,1), bold=True)
         ai_btn.bind(on_release=self._go_ai)
         bind_press_animation(ai_btn)
         title_bar.add_widget(ai_btn)
 
-        settings_btn = Button(text="设置", font_size='15sp', size_hint_x=0.20,
+        settings_btn = RoundedButton(text="设置", font_size='15sp', size_hint_x=0.20,
                              background_color=THEME['accent'], background_normal='',
                              color=(1,1,1,1), bold=True)
         settings_btn.bind(on_release=self._go_settings)
@@ -3347,7 +3407,7 @@ class MainScreen(Screen):
 
         # v3.19.3: 工具栏恢复单行（打开Excel + 搜索），日报表按钮移至底部醒目位置
         toolbar = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(8), padding=[dp(12), dp(6), dp(12), dp(6)])
-        open_btn = Button(text="打开Excel", font_size='16sp', size_hint_x=0.30,
+        open_btn = RoundedButton(text="打开Excel", font_size='16sp', size_hint_x=0.30,
                          background_color=THEME['accent'], background_normal='',
                          color=(1,1,1,1), bold=True)
         open_btn.bind(on_release=self._show_file_dialog)
@@ -3359,7 +3419,7 @@ class MainScreen(Screen):
         self.search_input.bind(text=self._on_search)
         toolbar.add_widget(self.search_input)
 
-        search_btn = Button(text="搜索", font_size='15sp', size_hint_x=0.28,
+        search_btn = RoundedButton(text="搜索", font_size='15sp', size_hint_x=0.28,
                            background_color=THEME['accent_dark'], background_normal='',
                            color=(1,1,1,1), bold=True)
         search_btn.bind(on_release=self._do_search)
@@ -3376,7 +3436,7 @@ class MainScreen(Screen):
         # v3.20.0: 底部栏改为水平布局 — 左侧 AI 报表按钮(0.7) + 右侧 日志按钮(0.3)
         footer = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(60), spacing=dp(8), padding=[dp(12), dp(8), dp(12), dp(8)])
 
-        ai_report_btn = Button(text="AI 一键生成日报表", font_size='17sp',
+        ai_report_btn = RoundedButton(text="AI 一键生成日报表", font_size='17sp',
                                background_color=THEME['success'], background_normal='',
                                color=(1,1,1,1), bold=True, size_hint_x=0.7)
         ai_report_btn.bind(on_release=self._generate_report)
@@ -3384,7 +3444,7 @@ class MainScreen(Screen):
         footer.add_widget(ai_report_btn)
 
         # v3.20.0: 可见的日志按钮
-        log_btn = Button(text="日志", font_size='15sp',
+        log_btn = RoundedButton(text="日志", font_size='15sp',
                          background_color=THEME['accent_dark'], background_normal='',
                          color=(1,1,1,1), bold=True, size_hint_x=0.3)
         log_btn.bind(on_release=self._show_full_log)
@@ -3392,7 +3452,7 @@ class MainScreen(Screen):
         footer.add_widget(log_btn)
 
         # 保留隐藏的 log_toggle_btn 引用（旧代码引用兼容），但不显示
-        self.log_toggle_btn = Button(text="日志:关", font_size='1sp',
+        self.log_toggle_btn = RoundedButton(text="日志:关", font_size='1sp',
                               background_color=THEME['muted'], background_normal='',
                               size_hint=(0, 0), opacity=0)
         self.log_toggle_btn.bind(on_release=self._toggle_log_recording)
@@ -3575,7 +3635,7 @@ class MainScreen(Screen):
         path_input = TextInput(text=self.excel_path, multiline=False, font_size='13sp',
                                size_hint_y=None, height=dp(40))
         content.add_widget(path_input)
-        load_btn = Button(text="加载", size_hint_y=None, height=dp(44),
+        load_btn = RoundedButton(text="加载", size_hint_y=None, height=dp(44),
                          background_color=THEME['accent'], background_normal='',
                          font_size='16sp', color=(1,1,1,1))
         popup = Popup(title='选择 Excel 文件', content=content, size_hint=(0.9, 0.35),
@@ -3701,7 +3761,7 @@ class MainScreen(Screen):
             if self._loading_label:
                 self._loading_label.text = "正在加载 %d/%d..." % (batch_end, total_matched)
             if batch_end < total_matched:
-                Clock.schedule_once(lambda dt: _render_next(batch_end), 0)
+                Clock.schedule_once(lambda dt: _render_next(batch_end), 0.03)
             else:
                 # 加载完成，移除进度提示
                 if self._loading_label:
@@ -3712,7 +3772,7 @@ class MainScreen(Screen):
                     self._loading_label = None
                 self._update_progress()
 
-        Clock.schedule_once(lambda dt: _render_next(0), 0)
+        Clock.schedule_once(lambda dt: _render_next(0), 0.05)
 
     def _create_row_widget(self, i):
         """v3.20.0: 创建单行 RowWidget 并添加到列表"""
@@ -3753,18 +3813,28 @@ class MainScreen(Screen):
         done = self.progress_mgr.get_done_count(keys)
         self.progress_label.text = "%d/%d" % (done, total)
 
+    def _deferred_update_heights(self, dt):
+        """v3.21.0: 延迟更新所有行高度，避免 on_resume 时同步执行导致卡顿"""
+        for rw in getattr(self, 'row_widgets', []):
+            try:
+                rw._update_heights()
+            except Exception:
+                pass
+
     def _on_search(self, instance, text=None):
-        """v3.20.0: 搜索时重建列表，只显示匹配行（解决隐藏行仍占 GridLayout spacing 的问题）"""
-        query = self.search_input.text.strip()
-        self._refresh_list(filter_query=query)
+        """v3.21.0: 搜索防抖 — 350ms 内连续输入仅触发一次重建，避免每键全量重建导致卡死"""
+        if self._search_debounce:
+            self._search_debounce.cancel()
+        self._search_debounce = Clock.schedule_once(
+            lambda dt: self._refresh_list(filter_query=self.search_input.text.strip()), 0.35)
 
     def _do_search(self, instance):
         self.search_input.focus = False
         self._on_search(None)
 
     def _clear_search(self, instance):
+        # v3.21.0: 仅清空 text，由 text 绑定触发 _on_search（防抖延迟避免闪烁）
         self.search_input.text = ""
-        self._on_search(None, "")
 
     def _clear_debug_log(self, instance):
         self.camera_mgr._log_lines = []
@@ -3822,11 +3892,11 @@ class MainScreen(Screen):
         content.add_widget(scroll)
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        close_btn = Button(text="关闭", font_size='15sp', size_hint_x=0.34,
+        close_btn = RoundedButton(text="关闭", font_size='15sp', size_hint_x=0.34,
                           background_color=THEME['muted'], background_normal='', color=(1,1,1,1))
-        copy_btn = Button(text="复制日志", font_size='15sp', size_hint_x=0.33,
+        copy_btn = RoundedButton(text="复制日志", font_size='15sp', size_hint_x=0.33,
                          background_color=THEME['accent'], background_normal='', color=(1,1,1,1))
-        clear_btn = Button(text="清空", font_size='15sp', size_hint_x=0.33,
+        clear_btn = RoundedButton(text="清空", font_size='15sp', size_hint_x=0.33,
                           background_color=THEME['danger'], background_normal='', color=(1,1,1,1))
         btn_row.add_widget(close_btn)
         btn_row.add_widget(copy_btn)
@@ -4095,9 +4165,20 @@ class MainScreen(Screen):
         self._unlock_photo_buttons()
         self.camera_mgr._dbg(f"保存失败: {err_msg[:60]}", show_toast=True)
 
+    def _get_row_widget(self, row_index):
+        """v3.21.0: 根据原始行号查找对应的 RowWidget。
+        搜索过滤后 row_widgets 按匹配顺序排列，位置下标与原始行号错位，
+        必须用此方法遍历匹配，避免高亮/备注指向错误客户。
+        """
+        for rw in self.row_widgets:
+            if getattr(rw, 'row_index', -1) == row_index:
+                return rw
+        return None
+
     def _refresh_row_done(self, row_index):
-        if 0 <= row_index < len(self.row_widgets):
-            self.row_widgets[row_index].mark_done()
+        rw = self._get_row_widget(row_index)
+        if rw:
+            rw.mark_done()
         self._update_progress()
 
     def _on_view_photos(self, row_index):
@@ -4153,43 +4234,56 @@ class MainScreen(Screen):
 
     def _on_remark_request(self, row_index):
         """打开备注输入弹窗 v3.15.0"""
-        if row_index >= len(self.row_widgets):
+        rw = self._get_row_widget(row_index)
+        if not rw:
             return
-        rw = self.row_widgets[row_index]
         current_remark = rw.remark or ""
 
+        # v3.21.0: 弹窗顶部对齐 + 临时切换 softinput_mode 为 resize，
+        # 避免 'pan' 模式上移窗口导致标题出屏
+        _prev_mode = Window.softinput_mode
+        Window.softinput_mode = 'resize'
         popup = Popup(title="添加备注（保存到Excel E列）",
-                      size_hint=(0.9, 0.6), auto_dismiss=False)
+                      size_hint=(0.9, None), height=dp(420),
+                      pos_hint={'top': 0.95}, auto_dismiss=False)
         layout = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(16))
 
         info_label = Label(
             text="客户：%s\n地址：%s" % (rw.borrower, (rw.address_general + rw.address_precise).strip()),
-            font_size='14sp', color=THEME['text'], size_hint_y=0.2,
+            font_size='14sp', color=THEME['text'],
+            size_hint_y=None, height=dp(50),
             halign='left', valign='top',
         )
         info_label.bind(size=lambda inst, val: setattr(inst, 'text_size', val))
         layout.add_widget(info_label)
 
         from kivy.uix.textinput import TextInput
+        # v3.21.0: TextInput 包裹 ScrollView，键盘遮挡时可滚动查看长文本
+        scroll = ScrollView(size_hint_y=None, height=dp(220))
         text_input = TextInput(
             text=current_remark,
             font_size='16sp',
             multiline=True,
-            size_hint_y=0.6,
+            size_hint_y=None, height=dp(200),
             hint_text="请输入备注内容...",
         )
-        layout.add_widget(text_input)
+        scroll.add_widget(text_input)
+        layout.add_widget(scroll)
 
-        btn_row = BoxLayout(size_hint_y=0.2, spacing=dp(10))
-        save_btn = Button(text="保存", font_size='16sp', bold=True,
+        btn_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        save_btn = RoundedButton(text="保存", font_size='16sp', bold=True,
                          background_color=THEME['success'], background_normal='')
-        cancel_btn = Button(text="取消", font_size='16sp',
+        cancel_btn = RoundedButton(text="取消", font_size='16sp',
                            background_color=THEME['muted'], background_normal='')
         btn_row.add_widget(save_btn)
         btn_row.add_widget(cancel_btn)
         layout.add_widget(btn_row)
 
         popup.content = layout
+
+        def _restore_mode(*args):
+            Window.softinput_mode = _prev_mode
+        popup.bind(on_dismiss=_restore_mode)
 
         def do_save(instance):
             remark_text = text_input.text.strip()
@@ -4201,11 +4295,11 @@ class MainScreen(Screen):
                 self.rows[row_index][4] = remark_text
             # v3.17.0: 保存到progress_mgr（持久化到JSON，确保退出app后不丢失）
             # v3.20.0: progress_mgr 是备注的单一真相源，始终保存
+            # v3.21.0: 改用 rw 的数据，避免 row_index 越界导致备注丢失
             try:
-                row = self.rows[row_index]
-                borrower = row[0] if len(row) > 0 else ""
-                address_general = row[1] if len(row) > 1 else ""
-                address_precise = row[2] if len(row) > 2 else ""
+                borrower = rw.borrower or ""
+                address_general = rw.address_general or ""
+                address_precise = rw.address_precise or ""
                 full_addr = (address_general + address_precise).strip()
                 key = self.progress_mgr._make_key(borrower, full_addr)
                 self.progress_mgr.save_remark(key, remark_text)
@@ -4218,17 +4312,19 @@ class MainScreen(Screen):
                 import threading
                 excel_uri = getattr(self, '_excel_uri', None)
                 def _save_excel():
-                    # v3.19.0: 先写入 APP_DIR 私有副本（一定成功），再通过 SAF URI 写回原始 Excel
-                    ok, msg = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
-                    if ok and excel_uri and excel_uri.startswith('content://'):
-                        # 通过 ContentResolver 写回用户选择的原始 Excel 文件
-                        ok2, msg2 = ExcelWriter.write_back_to_uri(excel_uri, self.excel_path)
-                        if ok2:
-                            msg = "已保存到原始 Excel"
-                            app_log.info('REMARK', '备注已写回原始 Excel: 行%d' % rw.excel_row_index)
-                        else:
-                            msg = f"app内部已保存；{msg2}"
-                            app_log.warn('REMARK', '写回原始Excel失败: %s' % msg2)
+                    # v3.21.0: 串行化 Excel 写入，防止并发覆盖
+                    # （多个备注同时保存时，后写入的线程会用旧数据覆盖先写入的修改）
+                    with self._excel_save_lock:
+                        ok, msg = ExcelWriter.save_remark(self.excel_path, rw.excel_row_index, remark_text)
+                        if ok and excel_uri and excel_uri.startswith('content://'):
+                            # 通过 ContentResolver 写回用户选择的原始 Excel 文件
+                            ok2, msg2 = ExcelWriter.write_back_to_uri(excel_uri, self.excel_path)
+                            if ok2:
+                                msg = "已保存到原始 Excel"
+                                app_log.info('REMARK', '备注已写回原始 Excel: 行%d' % rw.excel_row_index)
+                            else:
+                                msg = f"app内部已保存；{msg2}"
+                                app_log.warn('REMARK', '写回原始Excel失败: %s' % msg2)
                     if ok:
                         Logger.info("备注已保存到Excel E列 行%d" % rw.excel_row_index)
                         self.camera_mgr._dbg(f"[OK] {msg} 行{rw.excel_row_index}", show_toast=True)
@@ -4357,7 +4453,7 @@ class AIScreen(Screen):
 
         # 顶部标题栏
         top_bar = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(8))
-        back_btn = Button(
+        back_btn = RoundedButton(
             text="返回", font_size='16sp', size_hint_x=0.2,
             background_color=THEME['accent'], background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -4372,7 +4468,7 @@ class AIScreen(Screen):
         )
         top_bar.add_widget(title)
 
-        clear_btn = Button(
+        clear_btn = RoundedButton(
             text="清空", font_size='14sp', size_hint_x=0.2,
             background_color=THEME['muted'], background_normal='',
             color=(1, 1, 1, 1),
@@ -4407,7 +4503,7 @@ class AIScreen(Screen):
         self.input_field.bind(on_text_validate=self._on_send)
         input_row.add_widget(self.input_field)
 
-        send_btn = Button(
+        send_btn = RoundedButton(
             text="发送", font_size='16sp', bold=True,
             size_hint_x=0.22,
             background_color=THEME['success'], background_normal='',
@@ -4678,17 +4774,12 @@ class LoanPhotoApp(App):
             pass
 
     def on_pause(self):
-        # v3.20.0: 切后台时停止连续拍照、保存进度、清除相机 pending 状态，防止恢复时卡死
+        # v3.21.0: 切后台时仅保存进度，保留 _camera_launched 和 _continuous_shooting 状态
+        # （v3.20.0 清除这两者导致 on_camera_result 早返回，照片绕过正常回调流程存到错误客户）
         try:
             main_screen = self.sm.get_screen('main') if self.sm else None
             if main_screen:
-                if getattr(main_screen, '_continuous_shooting', False):
-                    main_screen._continuous_shooting = False
-                    app_log.info('APP', 'on_pause: 停止连续拍照')
                 main_screen._is_paused = True
-                # 清除可能死锁的相机 pending 回调
-                if main_screen.camera_mgr and main_screen.camera_mgr._camera_launched:
-                    main_screen.camera_mgr._camera_launched = False
                 # 保存进度
                 try:
                     main_screen.progress_mgr.save()
@@ -4701,18 +4792,16 @@ class LoanPhotoApp(App):
 
     def on_resume(self):
         # v3.20.0: 从后台恢复时刷新 UI 状态
+        # v3.21.0: 延迟执行 _update_heights，避免行数多时阻塞 UI 恢复
         try:
             app_log.info('APP', 'on_resume: app 从后台恢复')
             main_screen = self.sm.get_screen('main') if self.sm else None
             if main_screen:
                 main_screen._is_paused = False
-                # 刷新进度显示和列表高度
+                # 刷新进度显示
                 main_screen._update_progress()
-                for rw in getattr(main_screen, 'row_widgets', []):
-                    try:
-                        rw._update_heights()
-                    except Exception:
-                        pass
+                # v3.21.0: 延迟执行 _update_heights，分散负载避免卡顿
+                Clock.schedule_once(main_screen._deferred_update_heights, 0.1)
                 # 强制重绘 canvas
                 try:
                     main_screen.canvas.ask_update()

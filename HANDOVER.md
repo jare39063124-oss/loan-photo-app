@@ -1,10 +1,10 @@
 # 资产盘点拍照工具 - 交接文档
 
-> **交接日期**: 2026-07-01
-> **当前版本**: v3.20.0 (已提交 + 已构建 APK)
+> **交接日期**: 2026-07-02
+> **当前版本**: v3.21.0 (已提交 + 已构建 APK)
 > **项目路径**: `d:\hermes\loan_photo_app\`
 > **Git 仓库**: `jare39063124-oss/loan-photo-app` (GitHub Actions 自动构建)
-> **最新 APK**: `C:\Users\Administrator\Desktop\loan-photo-tool-v3.20.0.apk`
+> **最新 APK**: `C:\Users\Administrator\Desktop\loan-photo-tool-v3.21.0.apk`
 
 ---
 
