@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.3
+资产盘点专项拍照工具 App - v3.22.4
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -367,15 +367,19 @@ FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.a
 class RoundedButton(Button):
     """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle
     v3.22.2: radius 单位修正为 dp（原 14px 在高密度屏倒角微弱不可见）
-    v3.22.3: radius 增大到 dp(12)（dp(8) 在多机型仍偏小不可见），并补画边框增强倒角辨识"""
+    v3.22.3: radius 增大到 dp(12)，并补画边框增强倒角辨识
+    v3.22.4: radius 增大到 dp(16)（多机型实测 dp(12) 仍不明显），
+             补设 background_down=''（原仅设 background_normal，按压时默认纹理覆盖圆角），
+             边框透明度 0.12→0.35、width 1→1.5 增强可见性"""
 
     def __init__(self, radius=None, **kwargs):
         super().__init__(**kwargs)
-        # v3.22.3: radius 默认 dp(12)，更明显的倒角（Material Design 按钮倒角上限）
+        # v3.22.4: radius 默认 dp(16)，倒角更明显
         if radius is None:
-            radius = [dp(12)] * 4
+            radius = [dp(16)] * 4
         self._radius = list(radius)
         self.background_normal = ''
+        self.background_down = ''  # v3.22.4: 必须同时清空，否则按压时默认纹理覆盖圆角
         self.bind(pos=self._draw_bg, size=self._draw_bg,
                   background_color=self._draw_bg, state=self._draw_bg)
         self._draw_bg()
@@ -389,10 +393,10 @@ class RoundedButton(Button):
                 r, g, b = r * 0.85, g * 0.85, b * 0.85
             Color(r, g, b, a)
             RoundedRectangle(pos=self.pos, size=self.size, radius=self._radius)
-            # v3.22.3: 补画一圈细边框（半透明深色），让圆角边界清晰可辨
-            Color(0, 0, 0, 0.12)
-            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius[0] if self._radius else dp(12)),
-                 width=1)
+            # v3.22.4: 边框透明度 0.12→0.35、width 1→1.5，让圆角边界清晰可辨
+            Color(0, 0, 0, 0.35)
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius[0] if self._radius else dp(16)),
+                 width=1.5)
 
 
 # ============================================================
@@ -1130,13 +1134,16 @@ class ReportGenerator:
         "你是银行抵押物、抵债资产现场勘查日报表撰写助手。"
         "根据勘查人员提供的客户名称、抵押物地址、抵押物类型、备注与拍照情况，"
         "为每位客户撰写日报表中的三列内容：\n"
-        "1. 抵押物情况(detail)：概括盘点了几处、什么类型的抵押物及地址位置，20-40字\n"
+        "1. 抵押物情况(detail)：概括盘点了几处、什么类型的抵押物及地址位置\n"
         "2. 现状描述(status)：客观描述抵押物当前使用状态(自用/出租/闲置)、位置楼层、"
-        "装修、维护情况等，50-120字\n"
+        "装修、维护情况等\n"
         "3. 风险备注(risk)：评估是否存在风险(如闲置、渗水裂缝、价格波动、用途变更等)，"
-        "给出关注建议；无风险则说明整体状态良好暂无异常，30-80字\n"
+        "给出关注建议；无风险则说明整体状态良好暂无异常\n"
         "要求：语言专业、简洁，符合银行风控用语；严格基于勘查人员提供的备注内容填写，"
         "严禁编造备注中未提及的信息；备注为「无」或为空时，仅客观描述抵押物类型与地址，不得杜撰现状或风险。\n"
+        "【重要】严禁使用「等」字省略信息！备注中提及的所有人名、地址、使用人、"
+        "使用情况必须完整列出，不得遗漏。例如备注写「抵押物由张三、李四、王五使用」，"
+        "报告中必须写「由张三、李四、王五使用」，不得简写为「由张三等人使用」。\n"
         "仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。"
         "格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]"
     )
@@ -1160,7 +1167,9 @@ class ReportGenerator:
         """
         from collections import OrderedDict
         groups = OrderedDict()
-        for row in rows:
+        # v3.22.4 P0 修复: 必须用 enumerate 获取行号 i，否则下方
+        # get_remark_by_row(i) 的 i 未定义 → NameError → 线程崩溃 → 报表弹窗永不关闭（卡住）
+        for i, row in enumerate(rows):
             borrower = row[1] if len(row) > 1 else ""
             if not borrower:
                 continue
@@ -1225,6 +1234,8 @@ class ReportGenerator:
         lines.append("2. 「抵押物/抵债资产具体情况」字段：当客户有多处时表述为「共计盘点 N 处，位置为 XX、XX…」；仅1处时直接写地址。")
         lines.append("3. 「现状描述」「备注」字段必须严格基于上述「勘查备注」内容填写，严禁编造未提供的信息；备注为「无」时留空或写「无」。")
         lines.append("4. 请按 JSON 数组返回，每个元素含 name/detail/status/risk 四字段，顺序与客户一致。")
+        lines.append("5. 【重要】严禁使用「等」字省略！备注和地址中提及的所有人名、地点、使用人必须完整列出。")
+        lines.append("   例如备注「抵押物由张三、李四、王五使用」→报告中写「由张三、李四、王五使用」，禁止「由张三等人使用」。")
         return "\n".join(lines)
 
     def _fallback_detail(self, r):
@@ -2910,7 +2921,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.3", font_size='12sp',
+            text="v3.22.4", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3377,13 +3388,13 @@ class SettingsScreen(Screen):
         self.ai_model_input = TextInput(
             text=self.config.get('ai_model', ''),
             font_size='14sp', multiline=False, size_hint_x=0.78,
-            hint_text="如: owl-alpha",
+            hint_text="如: deepseek-v4-flash",
         )
         ai_model_row.add_widget(self.ai_model_input)
         ai_card.add_widget(ai_model_row)
 
         ai_hint = Label(
-            text="提示：模型ID请填入OpenRouter上的完整模型标识\nowl alpha是免费的",
+            text="提示：模型ID请填入DeepSeek平台的模型标识（默认 deepseek-v4-flash）",
             font_size='12sp', color=THEME['text_dim'],
             size_hint_y=None, height=dp(36), halign='left',
         )
@@ -3493,9 +3504,9 @@ class RowWidget(BoxLayout):
 
         with self.canvas.before:
             Color(*THEME['card'])
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(16)])
             Color(*THEME['card_border'])
-            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)), width=1.2)
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(16)), width=1.5)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         full_address = (address_general + address_precise).strip()
@@ -3610,20 +3621,21 @@ class RowWidget(BoxLayout):
     def _update_bg(self, *args):
         # v3.22.2: 高亮态切换底色与边色，重绘整个 canvas.before
         # v3.22.3: 倒角 dp(8)→dp(12)，边框 width 1→1.2 增强可见性
+        # v3.22.4: 倒角 dp(12)→dp(16)，边框 width 1.2→1.5 进一步增强可见性
         if getattr(self, '_highlighted', False):
             bg_color = THEME['highlight_bg']
             border_color = THEME['highlight_border']
-            border_width = 2
+            border_width = 2.5
         else:
             bg_color = THEME['card']
             border_color = THEME['card_border']
-            border_width = 1.2
+            border_width = 1.5
         self.canvas.before.clear()
         with self.canvas.before:
             Color(*bg_color)
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(16)])
             Color(*border_color)
-            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(16)),
                                   width=border_width)
 
     def set_highlight(self, on):
@@ -4307,10 +4319,13 @@ class MainScreen(Screen):
         self.progress_label.text = "%d/%d" % (done, total)
 
     def _deferred_update_heights(self, dt):
-        """v3.21.0: 延迟更新所有行高度，避免 on_resume 时同步执行导致卡顿"""
+        """v3.21.0: 延迟更新所有行高度，避免 on_resume 时同步执行导致卡顿
+        v3.22.4: 同时强制重绘 _update_bg，修复从相机返回后高亮消失
+        （OpenGL 上下文丢失清空 canvas，height 不变则不触发 size 绑定 → _update_bg 不被调用）"""
         for rw in getattr(self, 'row_widgets', []):
             try:
                 rw._update_heights()
+                rw._update_bg()
             except Exception:
                 pass
 
@@ -4696,6 +4711,11 @@ class MainScreen(Screen):
             self._unlock_photo_buttons()
             self.camera_mgr._dbg("拍照已取消")
             self._refresh_row_done(ctx['row_index'])
+            # v3.22.4: 会话结束后重新确认高亮，确保用户能看到当前拍摄条目
+            # （相机返回后 canvas 可能被清空，需重绘高亮）
+            rw = self._get_row_widget(ctx['row_index'])
+            if rw:
+                rw.set_highlight(True)
             return
 
         # 从 ctx 读取客户信息（不再从 self._current_* 读取，防止被覆盖）
@@ -4763,19 +4783,17 @@ class MainScreen(Screen):
                     except:
                         pass
 
-                # v3.20.0: save_to_gallery 返回最终保存路径，删除 APP_DIR 临时副本
-                saved_path = PhotoProcessor.save_to_gallery(new_path)
-                if not saved_path:
-                    saved_path = new_path  # save_to_gallery 失败时用 APP_DIR 副本
-                else:
-                    # save_to_gallery 成功，删除 APP_DIR 临时副本节省存储
-                    try:
-                        if saved_path != new_path and os.path.exists(new_path):
-                            os.remove(new_path)
-                    except Exception:
-                        pass
-
-                self.progress_mgr.mark_photo(key, saved_path, photo_type)
+                # v3.22.4: 始终保留 APP_DIR 副本，progress_mgr 记录 APP_DIR 路径。
+                # 原逻辑: save_to_gallery 成功后删除 APP_DIR 副本、记录 DCIM 路径；
+                # 但 Android 10+ scoped storage 下 os.path.exists(DCIM路径) 返回 False，
+                # 导致 get_photos 过滤掉所有照片 → 查看已拍无反应。
+                # 现逻辑: APP_DIR 路径（app 私有目录，始终可访问）作为真相源，
+                # save_to_gallery 仅为方便用户在系统相册查看（失败不影响功能）。
+                try:
+                    PhotoProcessor.save_to_gallery(new_path)
+                except Exception as e:
+                    app_log.error('PHOTO', 'save_to_gallery 失败(不影响拍照保存): %s' % e)
+                self.progress_mgr.mark_photo(key, new_path, photo_type)
                 Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename, ctx), 0)
             except Exception as e:
                 Logger.error("MainScreen._on_photo_done: %s" % e)
@@ -4923,6 +4941,16 @@ class MainScreen(Screen):
         scroll.add_widget(text_input)
         layout.add_widget(scroll)
 
+        # v3.22.4 P0 修复: 备注显示不全——TextInput 设长文本时光标自动到末尾，
+        # 视图滚到末尾导致只显示后段内容且可见字数不固定。
+        # 将光标移到开头，TextInput 自动滚动到顶部显示全文起始处。
+        def _reset_cursor_to_start(dt):
+            try:
+                text_input.cursor = (0, 0)
+            except Exception:
+                pass
+        Clock.schedule_once(_reset_cursor_to_start, 0.05)
+
         btn_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
         save_btn = RoundedButton(text="保存", font_size='16sp', bold=True,
                          background_color=THEME['success'], background_normal='')
@@ -5036,14 +5064,19 @@ class MainScreen(Screen):
         popup.open()
 
         def _run():
-            ai_svc = AIService(
-                api_url=self.config.get('ai_api_url', DEFAULT_CONFIG['ai_api_url']),
-                api_key=self.config.get('ai_api_key', '') or AI_DEFAULT_API_KEY,
-                model=self.config.get('ai_model', DEFAULT_CONFIG['ai_model']),
-            )
-            excel_name = os.path.basename(self.excel_path) if self.excel_path else ""
-            ok, path, m = self.report_generator.generate_with_ai(
-                self.rows, self.progress_mgr, ai_svc, excel_filename=excel_name)
+            # v3.22.4: 整体 try/except，任何异常都能关闭弹窗并恢复按钮，避免卡死
+            try:
+                ai_svc = AIService(
+                    api_url=self.config.get('ai_api_url', DEFAULT_CONFIG['ai_api_url']),
+                    api_key=self.config.get('ai_api_key', '') or AI_DEFAULT_API_KEY,
+                    model=self.config.get('ai_model', DEFAULT_CONFIG['ai_model']),
+                )
+                excel_name = os.path.basename(self.excel_path) if self.excel_path else ""
+                ok, path, m = self.report_generator.generate_with_ai(
+                    self.rows, self.progress_mgr, ai_svc, excel_filename=excel_name)
+            except Exception as e:
+                ok, path, m = False, None, "生成报告时出错：%s" % str(e)[:100]
+                app_log.error('REPORT', '生成报告异常: %s' % traceback.format_exc())
 
             def _done(dt):
                 try:
@@ -5304,7 +5337,7 @@ class AIScreen(Screen):
             self._add_message("assistant", "错误: " + response)
             # 如果是未配置模型，提示去设置
             if "未配置" in response:
-                self._add_message("assistant", "请到「设置」页面填写 AI 模型 ID（如 owl-alpha）")
+                self._add_message("assistant", "请到「设置」页面填写 AI 模型 ID（如 deepseek-v4-flash）")
 
         self._sending = False
 
