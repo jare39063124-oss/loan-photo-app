@@ -5,7 +5,7 @@
 > **项目路径**: `d:\hermes\loan_photo_app\`
 > **Git 仓库**: `jare39063124-oss/loan-photo-app` (GitHub Actions 自动构建)
 > **最新 APK**: `C:\Users\Administrator\Desktop\loan-photo-tool-v3.22.2.apk`
-> **最新 PPT**: `C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.22.0.pptx` (15 页)
+> **最新 PPT**: `C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.22.2.pptx` (16 页)
 
 ---
 

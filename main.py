@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.2
+资产盘点专项拍照工具 App - v3.22.3
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -366,13 +366,14 @@ FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.a
 # ============================================================
 class RoundedButton(Button):
     """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle
-    v3.22.2: radius 单位修正为 dp（原 14px 在高密度屏倒角微弱不可见）"""
+    v3.22.2: radius 单位修正为 dp（原 14px 在高密度屏倒角微弱不可见）
+    v3.22.3: radius 增大到 dp(12)（dp(8) 在多机型仍偏小不可见），并补画边框增强倒角辨识"""
 
     def __init__(self, radius=None, **kwargs):
         super().__init__(**kwargs)
-        # v3.22.2: radius 默认 dp(8)，参考 Material/Fluent 倒角规范（按钮 4-8dp）
+        # v3.22.3: radius 默认 dp(12)，更明显的倒角（Material Design 按钮倒角上限）
         if radius is None:
-            radius = [dp(8)] * 4
+            radius = [dp(12)] * 4
         self._radius = list(radius)
         self.background_normal = ''
         self.bind(pos=self._draw_bg, size=self._draw_bg,
@@ -388,6 +389,10 @@ class RoundedButton(Button):
                 r, g, b = r * 0.85, g * 0.85, b * 0.85
             Color(r, g, b, a)
             RoundedRectangle(pos=self.pos, size=self.size, radius=self._radius)
+            # v3.22.3: 补画一圈细边框（半透明深色），让圆角边界清晰可辨
+            Color(0, 0, 0, 0.12)
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius[0] if self._radius else dp(12)),
+                 width=1)
 
 
 # ============================================================
@@ -422,6 +427,7 @@ class AppLogger:
             return
         ts = get_system_date().strftime('%Y-%m-%d %H:%M:%S')
         line = "[%s] [%s] [%s] %s" % (ts, level, tag, msg)
+        file_ok = True
         with self._lock:
             self._lines.append(line)
             if len(self._lines) > self._max_lines:
@@ -432,8 +438,13 @@ class AppLogger:
                     f.write(line + "\n")
                 # 轮转检查
                 self._maybe_rotate()
-            except Exception:
-                pass
+            except Exception as e:
+                # v3.22.3: 文件写入失败时记录到内存缓冲（用户查看日志仍能看到内容）
+                file_ok = False
+                err_line = "[%s] [WARN] [APPLOG] 日志文件写入失败: %s（仅内存缓冲可见）" % (ts, str(e)[:60])
+                self._lines.append(err_line)
+                if len(self._lines) > self._max_lines:
+                    self._lines = self._lines[-self._max_lines:]
         # 同时输出到 Kivy Logger（控制台可见）
         try:
             if level == 'ERROR':
@@ -477,8 +488,10 @@ class AppLogger:
         self.log('ERROR', tag, msg)
 
     def get_log_text(self, max_chars=100000):
-        """读取日志文件全文（截断到 max_chars 防止过大）"""
+        """读取日志文件全文（截断到 max_chars 防止过大）
+        v3.22.3: 文件不存在或为空时回退到内存缓冲 _lines，避免用户开启日志后查看到空内容"""
         try:
+            file_content = ""
             if os.path.exists(self.filepath):
                 with open(self.filepath, 'r', encoding='utf-8') as f:
                     f.seek(0, 2)
@@ -486,8 +499,14 @@ class AppLogger:
                     if total > max_chars:
                         f.seek(max(0, total - max_chars))
                         f.readline()  # 跳过半行
-                    return f.read()
-            return "暂无日志记录"
+                    file_content = f.read()
+            if file_content.strip():
+                return file_content
+            # v3.22.3: 文件为空，回退到内存缓冲
+            with self._lock:
+                if self._lines:
+                    return "\n".join(self._lines)
+            return "暂无日志记录\n\n可能原因：\n1. 日志刚开启，尚未产生日志\n2. app存储目录不可写（请检查存储权限）\n3. 日志文件被系统清理"
         except Exception as e:
             return "读取日志失败: %s" % e
 
@@ -719,8 +738,14 @@ class ProgressManager:
             try:
                 with open(self.filepath, 'r', encoding='utf-8') as f:
                     self.data = json.load(f)
+                # v3.22.3: 兼容旧数据（无 _row_remarks 字段时初始化为空字典）
+                if not isinstance(self.data.get('_row_remarks'), dict):
+                    self.data['_row_remarks'] = {}
             except Exception:
                 self.data = {}
+                self.data['_row_remarks'] = {}
+        else:
+            self.data['_row_remarks'] = {}
 
     def save(self):
         with self._lock:
@@ -736,6 +761,22 @@ class ProgressManager:
                 Logger.info(f"ProgressManager.save: 已保存 {len(self.data)} 条记录到 {self.filepath}")
             except Exception as e:
                 Logger.error(f"ProgressManager.save: 保存失败 {e}")
+
+    def save_remark_by_row(self, row_index, remark_text):
+        """v3.22.3: 按行号独立存储备注，避免同一客户多行(共享 borrower+address key)
+        的备注互相覆盖。row_index = self.rows 中的索引，稳定不受搜索过滤影响。"""
+        with self._lock:
+            if '_row_remarks' not in self.data:
+                self.data['_row_remarks'] = {}
+            self.data['_row_remarks'][str(row_index)] = remark_text or ""
+            self.save()
+
+    def get_remark_by_row(self, row_index):
+        """v3.22.3: 按行号读取备注"""
+        with self._lock:
+            if '_row_remarks' not in self.data:
+                return ""
+            return self.data['_row_remarks'].get(str(row_index), "")
 
     def mark_photo(self, key, photo_path, photo_type=""):
         """key = _make_key(borrower, address_general, address_precise)"""
@@ -1130,9 +1171,9 @@ class ReportGenerator:
             full_addr = (addr_general + addr_precise).strip()
             pk = progress_mgr._make_key(borrower, full_addr)
             saved_remark = progress_mgr.get_remark(pk)
-            # v3.22.1: Excel 备注优先（用户最新权威输入），与 _load_excel_path 一致。
-            # 修复备注覆盖 P0：避免日报表使用 progress_mgr 旧值而非 Excel 当前备注。
-            remark = excel_remark if excel_remark else saved_remark
+            # v3.22.3 P0 修复: 优先按行号读取备注（行号独立），回退 Excel，回退旧 progress_key。
+            row_remark = progress_mgr.get_remark_by_row(i) if hasattr(progress_mgr, 'get_remark_by_row') else ""
+            remark = row_remark if row_remark else (excel_remark if excel_remark else saved_remark)
             photo_info = progress_mgr.get_photo_types(pk) if hasattr(progress_mgr, 'get_photo_types') else {}
             photo_count = sum(photo_info.values()) if isinstance(photo_info, dict) else 0
             g = groups.setdefault(borrower, {
@@ -2869,7 +2910,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.2", font_size='12sp',
+            text="v3.22.3", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3452,9 +3493,9 @@ class RowWidget(BoxLayout):
 
         with self.canvas.before:
             Color(*THEME['card'])
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
             Color(*THEME['card_border'])
-            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)), width=1)
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)), width=1.2)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         full_address = (address_general + address_precise).strip()
@@ -3568,6 +3609,7 @@ class RowWidget(BoxLayout):
 
     def _update_bg(self, *args):
         # v3.22.2: 高亮态切换底色与边色，重绘整个 canvas.before
+        # v3.22.3: 倒角 dp(8)→dp(12)，边框 width 1→1.2 增强可见性
         if getattr(self, '_highlighted', False):
             bg_color = THEME['highlight_bg']
             border_color = THEME['highlight_border']
@@ -3575,13 +3617,13 @@ class RowWidget(BoxLayout):
         else:
             bg_color = THEME['card']
             border_color = THEME['card_border']
-            border_width = 1
+            border_width = 1.2
         self.canvas.before.clear()
         with self.canvas.before:
             Color(*bg_color)
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
             Color(*border_color)
-            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),
                                   width=border_width)
 
     def set_highlight(self, on):
@@ -4102,12 +4144,10 @@ class MainScreen(Screen):
                 full_addr = (address_general + address_precise).strip()
                 key = self.progress_mgr._make_key(borrower, full_addr)
                 saved_remark = self.progress_mgr.get_remark(key)
-                # v3.22.1: Excel 备注优先（用户在桌面端编辑的最新权威输入）；
-                # 仅当 Excel 为空时回退 progress_mgr（覆盖 SAF 写回失败致 Excel 缺失的场景）。
-                # 修复 P0「编辑备注后覆盖原备注」: progress_mgr 优先会
-                # ①用旧值覆盖用户外部编辑过的 Excel 备注；②同一客户多行(共享 borrower+address key)
-                # 编辑一行后，另一行刷新读到共享 key 新值，覆盖其自身原备注。
-                final_remark = excel_remark if excel_remark else saved_remark
+                # v3.22.3 P0 修复: 优先按行号读取备注（行号独立，不会因共享 key 互相覆盖），
+                # 回退 Excel，再回退旧 progress_key 备注。
+                row_remark = self.progress_mgr.get_remark_by_row(i)
+                final_remark = row_remark if row_remark else (excel_remark if excel_remark else saved_remark)
                 if final_remark and final_remark != excel_remark:
                     while len(self.rows[i]) < 6:
                         self.rows[i].append("")
@@ -4231,10 +4271,11 @@ class MainScreen(Screen):
             excel_remark = row[5] if len(row) > 5 else ""
             full_addr = (address_general + address_precise).strip()
             pk = self.progress_mgr._make_key(borrower, full_addr)
-            # v3.22.1: Excel 备注优先（用户最新权威输入），progress_mgr 仅作 Excel 为空时回退。
-            # 修复备注覆盖 P0（详见 _load_excel_path 同名注释）。
+            # v3.22.3 P0 修复: 优先按行号读取备注（避免共享 key 互相覆盖），
+            # 回退 Excel，再回退旧 progress_key 备注（向后兼容 v3.22.2 前数据）。
+            row_remark = self.progress_mgr.get_remark_by_row(i)
             saved_remark = self.progress_mgr.get_remark(pk)
-            remark = excel_remark if excel_remark else saved_remark
+            remark = row_remark if row_remark else (excel_remark if excel_remark else saved_remark)
 
             rw = RowWidget(
                 row_index=i, borrower=borrower,
@@ -4518,6 +4559,7 @@ class MainScreen(Screen):
         self._continuous_shooting = False
         self._photo_session_active = False  # v3.20.0: 解除会话锁
         self._unlock_photo_buttons()
+        self._clear_all_highlights()  # v3.22.3: 跳转页面时清除高亮
         self.manager.current = 'settings'
 
     def _go_ai(self, instance):
@@ -4525,6 +4567,7 @@ class MainScreen(Screen):
         self._continuous_shooting = False
         self._photo_session_active = False  # v3.20.0: 解除会话锁
         self._unlock_photo_buttons()
+        self._clear_all_highlights()  # v3.22.3: 跳转页面时清除高亮
         self.manager.current = 'ai'
 
     def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
@@ -4568,6 +4611,9 @@ class MainScreen(Screen):
         self._photo_session_active = True  # v3.20.0: 激活会话锁
         self._photos_in_session = 0
 
+        # v3.22.3: 切换客户时先清除所有行的高亮（旧高亮自动消失），再设置当前行高亮
+        # 这样拍完远景退出相机后高亮保持，下次点其他客户拍照才清除旧高亮
+        self._clear_all_highlights()
         # v3.20.0: 锁定其他行的拍照按钮
         self._lock_photo_buttons(exclude_row=ctx['row_index'])
         # v3.22.2: 高亮当前拍摄行（浅蓝底+蓝边）
@@ -4597,12 +4643,20 @@ class MainScreen(Screen):
 
     def _unlock_photo_buttons(self):
         """v3.20.0: 拍照会话结束后恢复所有行的拍照按钮
-        v3.22.2: 同时清除所有行的高亮"""
+        v3.22.3: 不再清除高亮（高亮在会话期间保持，让用户退出相机准备拍下一类时仍能找到当前条目）。
+        高亮改由 _clear_all_highlights 统一管理，在切换客户/跳转页面时调用。"""
         for rw in self.row_widgets:
             try:
                 rw.photo_btn.disabled = False
                 rw.photo_btn.opacity = 1
-                rw.set_highlight(False)  # v3.22.2: 清除高亮
+            except Exception:
+                pass
+
+    def _clear_all_highlights(self):
+        """v3.22.3: 清除所有行的高亮（切换客户/跳转页面时调用）"""
+        for rw in self.row_widgets:
+            try:
+                rw.set_highlight(False)
             except Exception:
                 pass
 
@@ -4900,7 +4954,9 @@ class MainScreen(Screen):
                 full_addr = (address_general + address_precise).strip()
                 key = self.progress_mgr._make_key(borrower, full_addr)
                 self.progress_mgr.save_remark(key, remark_text)
-                app_log.info('REMARK', '备注已保存到持久化存储: 客户=%s, key=%s' % (borrower, key))
+                # v3.22.3 P0: 同时按行号存储备注（行号独立，避免共享 key 互相覆盖）
+                self.progress_mgr.save_remark_by_row(row_index, remark_text)
+                app_log.info('REMARK', '备注已保存到持久化存储: 客户=%s, key=%s, 行=%d' % (borrower, key[:8], row_index))
             except Exception as e:
                 app_log.error('REMARK', '备注保存到progress_mgr失败: %s' % e)
                 Logger.error(f"备注保存到progress_mgr失败: {e}")
@@ -5013,7 +5069,9 @@ class MainScreen(Screen):
         Clock.schedule_once(lambda dt: threading.Thread(target=_run, daemon=True).start(), 0.1)
 
     def _save_report_to_user(self, src_path):
-        """通过 SAF 让用户选择日报表保存位置"""
+        """通过 SAF 让用户选择日报表保存位置
+        v3.22.3: 用 JString 显式转换 putExtra 参数类型，
+        修复 jnius 方法重载选择错误导致 EXTRA_TITLE 不生效（默认文件名缺失）"""
         if not IS_ANDROID:
             self._show_msg("日报表已保存：%s" % src_path, THEME['success'])
             return
@@ -5021,13 +5079,20 @@ class MainScreen(Screen):
             from jnius import autoclass
             Intent = autoclass('android.content.Intent')
             PythonActivity = autoclass('org.kivy.android.PythonActivity')
-            intent = Intent("android.intent.action.CREATE_DOCUMENT")
+            JString = autoclass('java.lang.String')
+            intent = Intent()
+            # 用 setAction 替代构造函数传参，避免 jnius 反射 Intent(String) 失败
+            intent.setAction(JString("android.intent.action.CREATE_DOCUMENT"))
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-            intent.setType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            intent.putExtra(Intent.EXTRA_TITLE, "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str())
+            intent.setType(JString("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+            # v3.22.3: 显式用 JString 包装，确保 putExtra(String, String) 重载被选中
+            default_name = "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str()
+            intent.putExtra(Intent.EXTRA_TITLE, JString(default_name))
             self._report_save_code = 0x201
             PythonActivity.mActivity.startActivityForResult(intent, self._report_save_code)
-        except:
+            app_log.info('REPORT', '已发起 SAF 保存请求，默认文件名: %s' % default_name)
+        except Exception as e:
+            app_log.error('REPORT', 'SAF 保存请求失败: %s' % e)
             self._show_msg("已保存到app内部：%s" % src_path, THEME['success'])
 
 
