@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.1
+资产盘点专项拍照工具 App - v3.22.2
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -365,10 +365,14 @@ FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.a
 # 使用 canvas.before 绘制 RoundedRectangle 替代 Kivy 默认硬直角矩形
 # ============================================================
 class RoundedButton(Button):
-    """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle"""
+    """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle
+    v3.22.2: radius 单位修正为 dp（原 14px 在高密度屏倒角微弱不可见）"""
 
-    def __init__(self, radius=(14, 14, 14, 14), **kwargs):
+    def __init__(self, radius=None, **kwargs):
         super().__init__(**kwargs)
+        # v3.22.2: radius 默认 dp(8)，参考 Material/Fluent 倒角规范（按钮 4-8dp）
+        if radius is None:
+            radius = [dp(8)] * 4
         self._radius = list(radius)
         self.background_normal = ''
         self.bind(pos=self._draw_bg, size=self._draw_bg,
@@ -609,6 +613,9 @@ THEME = {
     'text': (0.12, 0.13, 0.15, 1),       # 近黑文字 #1F2126
     'text_dim': (0.42, 0.45, 0.50, 1),   # 中灰副文本 #6B7380
     'muted': (0.62, 0.65, 0.70, 1),      # 禁用/次要按钮 #9EA6B3
+    # v3.22.2: 当前拍摄行高亮配色（浅蓝底 + 蓝色边）
+    'highlight_bg': (0.89, 0.95, 0.99, 1),     # 浅蓝底 #E3F2FD（与白卡对比清晰）
+    'highlight_border': (0.13, 0.59, 0.95, 1), # 活力蓝边 #2196F3（= accent）
 }
 
 # === 拍照类型 ===
@@ -2862,7 +2869,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.1", font_size='12sp',
+            text="v3.22.2", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3422,7 +3429,7 @@ class RowWidget(BoxLayout):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
         self.size_hint_y = None
-        self._base_height = dp(190)
+        self._base_height = dp(90)  # v3.22.2: 删除竖版计数器(100dp) 后下调
         self.height = self._base_height
         self.padding = [dp(10), dp(8), dp(10), dp(8)]
         self.spacing = dp(4)
@@ -3445,9 +3452,9 @@ class RowWidget(BoxLayout):
 
         with self.canvas.before:
             Color(*THEME['card'])
-            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[8])
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
             Color(*THEME['card_border'])
-            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, 8), width=1)
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)), width=1)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         full_address = (address_general + address_precise).strip()
@@ -3489,12 +3496,13 @@ class RowWidget(BoxLayout):
         # 间隔
         self.add_widget(Label(size_hint_y=None, height=dp(4)))
 
-        # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数）
+        # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数横排）
+        # v3.22.2: 计数器从竖排 5 行改为横排单 label，并入按钮行末尾，节省屏幕空间
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
 
         self.photo_btn = RoundedButton(
             text="拍照", font_size='16sp',
-            size_hint_x=0.30,
+            size_hint_x=0.20,
             background_color=THEME['success'] if self.done else THEME['accent'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -3505,7 +3513,7 @@ class RowWidget(BoxLayout):
 
         self.view_btn = RoundedButton(
             text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
-            font_size='15sp', size_hint_x=0.40,
+            font_size='14sp', size_hint_x=0.28,
             background_color=THEME['accent_dark'] if self.photo_count > 0 else THEME['muted'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -3517,7 +3525,7 @@ class RowWidget(BoxLayout):
         # 备注按钮 v3.15.0
         self.remark_btn = RoundedButton(
             text="备注●" if self.remark else "备注",
-            font_size='15sp', size_hint_x=0.30,
+            font_size='14sp', size_hint_x=0.20,
             background_color=THEME['warning'] if self.remark else THEME['muted'],
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -3526,21 +3534,20 @@ class RowWidget(BoxLayout):
         bind_press_animation(self.remark_btn)
         btn_row.add_widget(self.remark_btn)
 
-        self.add_widget(btn_row)
+        # v3.22.2: 横排类型计数器（markup 单 label，5 类一行显示）
+        # 格式: 远景:2 近景:1 内部:0 瑕疵:0 其他:3（已拍绿色加粗）
+        self.type_status_label = Label(
+            text="",
+            font_size='12sp',
+            size_hint_x=0.32,
+            color=THEME['text_dim'],
+            markup=True,
+            halign='left', valign='middle',
+        )
+        self.type_status_label.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        btn_row.add_widget(self.type_status_label)
 
-        # v3.22.0: 竖版类型计数器 — 5 行，每行 [☐/☑] [类型名] [张数]
-        # ☐ = 尚未拍摄，☑ = 已拍摄，后面跟该类型照片张数
-        self.type_status_box = BoxLayout(orientation='vertical', size_hint_y=None,
-                                         height=dp(5 * 20), spacing=dp(0))
-        self.type_labels = []
-        for _label in PHOTO_TYPE_LABELS:
-            lbl = Label(text="☐ %s 0" % _label, font_size='13sp',
-                        color=THEME['text_dim'], size_hint_y=None, height=dp(20),
-                        halign='left', valign='middle')
-            lbl.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
-            self.type_status_box.add_widget(lbl)
-            self.type_labels.append(lbl)
-        self.add_widget(self.type_status_box)
+        self.add_widget(btn_row)
 
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
@@ -3556,26 +3563,44 @@ class RowWidget(BoxLayout):
         addr_h = self.addr_label.texture_size[1] if self.addr_label.texture_size else dp(20)
         self.name_label.height = max(dp(24), name_h + dp(4))
         self.addr_label.height = max(dp(20), addr_h + dp(4))
-        # v3.22.0: 高度含竖版类型计数器（5行 × 20dp = 100dp）+ btn_row 52dp
-        self.height = self.name_label.height + self.addr_label.height + dp(52) + dp(100) + dp(16) + dp(4)
+        # v3.22.2: 移除竖版计数器(100dp)，仅含 btn_row 52dp
+        self.height = self.name_label.height + self.addr_label.height + dp(52) + dp(16) + dp(4)
 
     def _update_bg(self, *args):
-        self.bg_rect.pos = self.pos
-        self.bg_rect.size = self.size
-        self.bg_border.rounded_rectangle = (self.x, self.y, self.width, self.height, 8)
+        # v3.22.2: 高亮态切换底色与边色，重绘整个 canvas.before
+        if getattr(self, '_highlighted', False):
+            bg_color = THEME['highlight_bg']
+            border_color = THEME['highlight_border']
+            border_width = 2
+        else:
+            bg_color = THEME['card']
+            border_color = THEME['card_border']
+            border_width = 1
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*bg_color)
+            self.bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
+            Color(*border_color)
+            self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
+                                  width=border_width)
+
+    def set_highlight(self, on):
+        """v3.22.2: 标记/取消当前拍摄行高亮（浅蓝底 + 蓝边）"""
+        self._highlighted = bool(on)
+        self._update_bg()
 
     def _update_type_status(self):
-        # v3.22.0: 竖版显示 5 类照片状态 [☐/☑] [类型名] [张数]
-        # ☐ = 尚未拍摄，☑ = 已拍摄
+        # v3.22.2: 横排单行显示 5 类照片状态 [类型:张数 ...]，已拍加绿色加粗
         counts = self.progress_mgr.get_photo_count_by_type(self.progress_key)
-        done_types = 0
-        for i, label in enumerate(PHOTO_TYPE_LABELS):
+        parts = []
+        for label in PHOTO_TYPE_LABELS:
             cnt = counts.get(label, 0)
-            mark = "☑" if cnt > 0 else "☐"
-            self.type_labels[i].text = "%s  %s  %d" % (mark, label, cnt)
-            self.type_labels[i].color = THEME['success'] if cnt > 0 else THEME['text_dim']
             if cnt > 0:
-                done_types += 1
+                # markup 绿色加粗
+                parts.append("[color=33B35C][b]%s:%d[/b][/color]" % (label, cnt))
+            else:
+                parts.append("[color=9EA6B3]%s:0[/color]" % label)
+        self.type_status_label.text = "  ".join(parts)
 
     def _on_photo(self, instance):
         self.photo_callback(self.row_index, self.borrower, self.address_general,
@@ -3694,11 +3719,17 @@ class MainScreen(Screen):
         bind_press_animation(open_btn)
         toolbar.add_widget(open_btn)
 
-        # v3.22.0: 搜索类型选择器（序号/客户名/地址概/地址详/备注）
+        # v3.22.0: 搜索类型选择器（序号/客户名/地址/备注）
+        # v3.22.2: 合并 '地址(概)'/'地址(详)' 为 '地址'，同时匹配概+详
         _cur_field = self.config.get('search_field', '客户名') or '客户名'
+        # v3.22.2: 旧值 '地址(概)'/'地址(详)' 自动迁移为 '地址'
+        if _cur_field in ('地址(概)', '地址(详)'):
+            _cur_field = '地址'
+            self.config.set('search_field', '地址')
+            self.config.save()
         self.search_field_spinner = Spinner(
             text=_cur_field,
-            values=['客户名', '序号', '地址(概)', '地址(详)', '备注'],
+            values=['客户名', '序号', '地址', '备注'],
             font_size='13sp', size_hint_x=0.20,
             background_color=THEME['accent_dark'], background_normal='',
             color=(1, 1, 1, 1), bold=True,
@@ -3738,13 +3769,13 @@ class MainScreen(Screen):
         bind_press_animation(ai_report_btn)
         footer.add_widget(ai_report_btn)
 
-        # v3.22.0: 可见的日志按钮 — 短按切换开关 / 长按查看日志
+        # v3.22.2: 日志入口按钮 — 短按开二级弹窗（开关/查看/复制/清除）
         _log_on = app_log.is_enabled()
-        log_btn = RoundedButton(text=("日志:开" if _log_on else "日志:关"), font_size='15sp',
-                         background_color=(THEME['success'] if _log_on else THEME['accent_dark']),
+        log_btn = RoundedButton(text="日志", font_size='15sp',
+                         background_color=THEME['accent_dark'],
                          background_normal='',
                          color=(1,1,1,1), bold=True, size_hint_x=0.3)
-        log_btn.bind(on_press=self._on_log_press, on_release=self._on_log_release)
+        log_btn.bind(on_release=self._on_log_entry)
         bind_press_animation(log_btn)
         footer.add_widget(log_btn)
         self.log_btn = log_btn  # v3.22.0: 保留引用，切换开关时更新文字/颜色
@@ -3787,8 +3818,8 @@ class MainScreen(Screen):
                 uri = item.get('uri', '')
                 name = item.get('name', 'Excel文件')
                 btn = RoundedButton(
-                    text=name, font_size='14sp',
-                    size_hint_y=None, height=dp(42),
+                    text=name, font_size='17sp',  # v3.22.2: 14sp → 17sp 加大
+                    size_hint_y=None, height=dp(50),  # v3.22.2: 42 → 50 配合字体
                     background_color=THEME['bg'],
                     color=THEME['accent_dark'],
                     background_normal='',
@@ -4037,7 +4068,8 @@ class MainScreen(Screen):
         popup.open()
 
     def _show_msg(self, msg, color=None, toast=True):
-        """在日志区域追加一条消息，同时可选显示Toast。用于非相机状态提示。"""
+        """在日志区域追加一条消息，同时可选显示Toast。用于非相机状态提示。
+        v3.22.2: 同步写入 app_log 全量日志（开关开启时入文件），保证 UI 交互可追溯。"""
         ts = get_system_date().strftime('%H:%M:%S')
         line = f"[{ts}] {msg}"
         self.camera_mgr._log_lines.append(line)
@@ -4046,6 +4078,8 @@ class MainScreen(Screen):
         log_text = '\n'.join(self.camera_mgr._log_lines[-12:])
         self.status_label.text = log_text
         self.status_label.color = color if color else THEME['text_dim']
+        # v3.22.2: 同步入全量 app 日志（开关开启时落盘）
+        app_log.info('UI', msg)
         if toast and IS_ANDROID:
             self.camera_mgr._toast(msg)
 
@@ -4104,19 +4138,25 @@ class MainScreen(Screen):
         self.scroll_view.scroll_y = 1
 
         # 计算匹配的行 — v3.22.0: 按搜索类型选择器过滤
+        # v3.22.2: 合并 '地址' 字段（同时匹配 row[2]概 + row[3]详）
         q = filter_query.lower().strip() if filter_query else ""
         field = (self.config.get('search_field', '客户名') or '客户名') if hasattr(self, 'config') else '客户名'
-        field_map = {'序号': 0, '客户名': 1, '地址(概)': 2, '地址(详)': 3, '备注': 5}
+        # v3.22.2: 兼容旧配置值
+        if field in ('地址(概)', '地址(详)'):
+            field = '地址'
+        field_map = {'序号': 0, '客户名': 1, '地址': 2, '备注': 5}
         idx = field_map.get(field, 1)
         matched_indices = []
         for i, row in enumerate(self.rows):
             if not q:
                 matched_indices.append(i)
             else:
-                val = (row[idx] if len(row) > idx else "").lower()
-                # 地址(概)/(详) 始终合并搜索以容错
-                addr_all = ((row[2] if len(row) > 2 else "") + (row[3] if len(row) > 3 else "")).lower()
-                if q in val or (field in ('地址(概)', '地址(详)') and q in addr_all):
+                if field == '地址':
+                    # v3.22.2: 地址同时匹配 row[2](概) 和 row[3](详)
+                    val = ((row[2] if len(row) > 2 else "") + (row[3] if len(row) > 3 else "")).lower()
+                else:
+                    val = (row[idx] if len(row) > idx else "").lower()
+                if q in val:
                     matched_indices.append(i)
 
         if not self.rows:
@@ -4274,39 +4314,124 @@ class MainScreen(Screen):
         if IS_ANDROID:
             self.camera_mgr._toast("日志已清空")
 
-    def _on_log_press(self, instance):
-        """v3.22.0: 日志按钮按下 — 启动长按定时器（0.6s 触发查看日志）"""
-        self._log_long_press = Clock.schedule_once(
-            lambda dt: self._fire_long_press(instance), 0.6)
+    def _on_log_entry(self, instance):
+        """v3.22.2: 日志入口按钮 — 打开二级弹窗（开关/查看/复制/清除）
+        替代 v3.22.0 的"短按切换开关/长按查看日志"（长按难发现）"""
+        from kivy.uix.popup import Popup
+        from kivy.uix.boxlayout import BoxLayout
 
-    def _on_log_release(self, instance):
-        """v3.22.0: 日志按钮释放 — 短按则切换开关，长按已触发则不切换"""
-        if self._log_long_press:
-            self._log_long_press.cancel()
-            self._log_long_press = None
-            self._toggle_log_recording(instance)  # 短按：切换开关
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(14))
+        with content.canvas.before:
+            Color(*THEME['card'])
+            _bg = Rectangle(pos=content.pos, size=content.size)
+        content.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
+                     size=lambda i, v: setattr(_bg, 'size', v))
 
-    def _fire_long_press(self, instance):
-        """v3.22.0: 长按触发 — 打开日志查看 Popup"""
-        self._log_long_press = None
-        self._show_full_log(instance)
+        # 标题
+        title = Label(text="日志管理", font_size='18sp', bold=True,
+                      color=THEME['accent_dark'], size_hint_y=None, height=dp(36),
+                      halign='left', valign='middle')
+        title.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        content.add_widget(title)
 
-    def _toggle_log_recording(self, instance):
-        """v3.22.0: 切换日志记录开关（短按触发）— 持久化到 config 并更新按钮状态"""
-        new_state = not app_log.is_enabled()
-        app_log.set_enabled(new_state)
-        self.config.set('log_enabled', new_state)
-        self.config.save()
-        if hasattr(self, 'log_btn') and self.log_btn:
-            self.log_btn.text = "日志:开" if new_state else "日志:关"
-            self.log_btn.background_color = THEME['success'] if new_state else THEME['accent_dark']
-        # 旧隐藏按钮同步（兼容旧引用）
-        if hasattr(self, 'log_toggle_btn') and self.log_toggle_btn:
-            self.log_toggle_btn.text = "日志:开" if new_state else "日志:关"
-            self.log_toggle_btn.background_color = THEME['success'] if new_state else THEME['muted']
-        if IS_ANDROID:
-            self.camera_mgr._toast("日志记录已开启" if new_state else "日志记录已关闭")
-        app_log.info('APP', '日志开关: %s' % ('开' if new_state else '关'))
+        # 状态显示
+        _cur_on = app_log.is_enabled()
+        status_label = Label(
+            text=("当前状态: [color=33B35C][b]已开启[/b][/color]" if _cur_on
+                  else "当前状态: [color=9EA6B3][b]已关闭[/b][/color]"),
+            font_size='14sp', markup=True, color=THEME['text'],
+            size_hint_y=None, height=dp(28), halign='left', valign='middle')
+        status_label.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        content.add_widget(status_label)
+
+        # 4 按钮网格 2x2
+        btn_grid = BoxLayout(orientation='vertical', spacing=dp(8), size_hint_y=None, height=dp(108))
+        row1 = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(50))
+        row2 = BoxLayout(spacing=dp(8), size_hint_y=None, height=dp(50))
+
+        toggle_btn = RoundedButton(
+            text=("关闭日志记录" if _cur_on else "开启日志记录"),
+            font_size='15sp',
+            background_color=(THEME['danger'] if _cur_on else THEME['success']),
+            background_normal='', color=(1,1,1,1), bold=True)
+        view_btn = RoundedButton(text="查看日志", font_size='15sp',
+            background_color=THEME['accent'], background_normal='',
+            color=(1,1,1,1), bold=True)
+        copy_btn = RoundedButton(text="复制日志", font_size='15sp',
+            background_color=THEME['accent_dark'], background_normal='',
+            color=(1,1,1,1), bold=True)
+        clear_btn = RoundedButton(text="清空日志", font_size='15sp',
+            background_color=THEME['warning'], background_normal='',
+            color=(1,1,1,1), bold=True)
+
+        row1.add_widget(toggle_btn)
+        row1.add_widget(view_btn)
+        row2.add_widget(copy_btn)
+        row2.add_widget(clear_btn)
+        btn_grid.add_widget(row1)
+        btn_grid.add_widget(row2)
+        content.add_widget(btn_grid)
+
+        # 关闭按钮
+        close_btn = RoundedButton(text="关闭", font_size='15sp',
+            background_color=THEME['muted'], background_normal='',
+            color=(1,1,1,1), size_hint_y=None, height=dp(44))
+        content.add_widget(close_btn)
+
+        popup = Popup(title='日志管理',
+                      title_color=THEME['accent_dark'],
+                      separator_color=THEME['card_border'],
+                      content=content,
+                      size_hint=(0.85, 0.5))
+
+        def _toggle(inst):
+            new_state = not app_log.is_enabled()
+            app_log.set_enabled(new_state)
+            self.config.set('log_enabled', new_state)
+            self.config.save()
+            toggle_btn.text = "关闭日志记录" if new_state else "开启日志记录"
+            toggle_btn.background_color = THEME['danger'] if new_state else THEME['success']
+            status_label.text = ("当前状态: [color=33B35C][b]已开启[/b][/color]" if new_state
+                                 else "当前状态: [color=9EA6B3][b]已关闭[/b][/color]")
+            if IS_ANDROID:
+                self.camera_mgr._toast("日志记录已开启" if new_state else "日志记录已关闭")
+            app_log.info('APP', '日志开关: %s' % ('开' if new_state else '关'))
+
+        def _view(inst):
+            popup.dismiss()
+            self._show_full_log(None)
+
+        def _copy(inst):
+            try:
+                from kivy.core.clipboard import Clipboard
+                text = app_log.get_log_text()
+                Clipboard.copy(text)
+                copy_btn.text = "已复制！"
+                copy_btn.background_color = THEME['success']
+                Clock.schedule_once(lambda dt: setattr(copy_btn, 'text', '复制日志'), 1.5)
+                Clock.schedule_once(lambda dt: setattr(copy_btn, 'background_color', THEME['accent_dark']), 1.5)
+                if IS_ANDROID:
+                    self.camera_mgr._toast("日志已复制到剪贴板")
+            except Exception as e:
+                copy_btn.text = "复制失败"
+                app_log.error('APP', '复制日志失败: %s' % e)
+
+        def _clear(inst):
+            app_log.clear()
+            clear_btn.text = "已清空"
+            clear_btn.background_color = THEME['success']
+            Clock.schedule_once(lambda dt: setattr(clear_btn, 'text', '清空日志'), 1.5)
+            Clock.schedule_once(lambda dt: setattr(clear_btn, 'background_color', THEME['warning']), 1.5)
+            if IS_ANDROID:
+                self.camera_mgr._toast("日志已清空")
+
+        toggle_btn.bind(on_release=_toggle)
+        view_btn.bind(on_release=_view)
+        copy_btn.bind(on_release=_copy)
+        clear_btn.bind(on_release=_clear)
+        close_btn.bind(on_release=lambda x: popup.dismiss())
+
+        popup.open()
 
     def _show_full_log(self, instance):
         """v3.20.0: 打开全屏日志记事本，显示全量 app 日志（Excel/拍照/备注/AI/生命周期等）"""
@@ -4445,6 +4570,10 @@ class MainScreen(Screen):
 
         # v3.20.0: 锁定其他行的拍照按钮
         self._lock_photo_buttons(exclude_row=ctx['row_index'])
+        # v3.22.2: 高亮当前拍摄行（浅蓝底+蓝边）
+        rw = self._get_row_widget(ctx['row_index'])
+        if rw:
+            rw.set_highlight(True)
 
         self.camera_mgr._dbg(f"开始为【{ctx['borrower']}】拍照，类型: {photo_type}", show_toast=True)
         app_log.info('PHOTO', '拍照会话开始: 客户=%s, 类型=%s, 行=%d' % (ctx['borrower'], photo_type, ctx['row_index']))
@@ -4467,11 +4596,13 @@ class MainScreen(Screen):
                     pass
 
     def _unlock_photo_buttons(self):
-        """v3.20.0: 拍照会话结束后恢复所有行的拍照按钮"""
+        """v3.20.0: 拍照会话结束后恢复所有行的拍照按钮
+        v3.22.2: 同时清除所有行的高亮"""
         for rw in self.row_widgets:
             try:
                 rw.photo_btn.disabled = False
                 rw.photo_btn.opacity = 1
+                rw.set_highlight(False)  # v3.22.2: 清除高亮
             except Exception:
                 pass
 
@@ -4635,21 +4766,29 @@ class MainScreen(Screen):
         self._update_progress()
 
     def _on_view_photos(self, row_index):
-        if row_index >= len(self.rows):
+        # v3.22.2 P0 修复: 直接用 RowWidget 持有的 progress_key（构造时算好），
+        # 避免用 self.rows[row_index] 重算 key 时与 widget 不一致导致"无反应"。
+        # 同时加 try/except，避免任何异常静默失败。
+        rw = self._get_row_widget(row_index)
+        if rw is None:
+            app_log.error('UI', '查看已拍失败: 未找到 row_index=%d 的 widget' % row_index)
+            self._show_msg("无法打开此客户的照片（行数据丢失）", THEME['danger'])
             return
-        row = self.rows[row_index]
-        borrower = row[1] if len(row) > 1 else ""
-        address_general = row[2] if len(row) > 2 else ""
-        address_precise = row[3] if len(row) > 3 else ""
-        full_addr = (address_general + address_precise).strip()
-        key = self.progress_mgr._make_key(borrower, full_addr)
-        photos = self.progress_mgr.get_photos(key)
-        if not photos:
-            self._show_msg("该客户暂无照片", THEME['warning'])
-            return
-        popup = PhotoViewerPopup(row_index=row_index, photos=photos,
-                                 delete_callback=self._on_delete_photo)
-        popup.open()
+        try:
+            key = rw.progress_key
+            photos = self.progress_mgr.get_photos(key)
+            app_log.info('PHOTO', '查看已拍: 客户=%s, key=%s, 照片数=%d' % (
+                rw.borrower, key[:8], len(photos)))
+            if not photos:
+                self._show_msg("该客户暂无照片（或照片文件已被系统清理）", THEME['warning'])
+                return
+            popup = PhotoViewerPopup(row_index=row_index, photos=photos,
+                                     delete_callback=self._on_delete_photo)
+            popup.open()
+        except Exception as e:
+            app_log.error('UI', '查看已拍异常 row=%d: %s' % (row_index, e))
+            traceback.print_exc()
+            self._show_msg("打开照片列表失败: %s" % str(e)[:40], THEME['danger'])
 
     def _on_delete_photo(self, row_index, photo_index):
         if row_index >= len(self.rows):
