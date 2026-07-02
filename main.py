@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.0
+资产盘点专项拍照工具 App - v3.22.1
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -809,17 +809,23 @@ class ProgressManager:
 
     def get_next_type_index(self, key, photo_type):
         """返回该客户指定类型的下一个照片编号（01开始，跨会话连续）。
-        统计已有照片中文件名包含_{type}_NN模式的最大编号+1。
+        统计已有照片中文件名包含 -{type}-NN 模式的最大编号+1。
+        v3.22.1: 修复分隔符bug——照片文件名用短横线分隔(如 远景-01)，
+        检测原用下划线(_远景_)导致永不匹配、序号永远从1开始(可能文件名冲突)。
+        兼容历史下划线格式。
         """
         if key not in self.data:
             return 1
         max_idx = 0
-        type_tag = "_%s_" % photo_type
+        # 兼容短横线(当前)与下划线(历史)两种分隔符
+        seps = ("-%s-" % photo_type, "_%s_" % photo_type)
         for p in self.data[key].get("photos", []):
             basename = os.path.basename(p)
-            if type_tag in basename:
+            tag = next((s for s in seps if s in basename), None)
+            if tag:
                 try:
-                    idx_str = basename.split(type_tag)[-1].split('.')[0].split('_')[0]
+                    idx_str = basename.split(tag)[-1].split('.')[0]
+                    idx_str = idx_str.split('-')[0].split('_')[0]
                     idx = int(idx_str)
                     if idx > max_idx:
                         max_idx = idx
@@ -838,8 +844,10 @@ class ProgressManager:
 
     def get_photo_count_by_type(self, key):
         """v3.22.0: 返回各拍照类型的照片张数字典 {类型: 张数}
-        基于实际照片文件名统计（文件名含 _{类型}_ 模式），
+        基于实际照片文件名统计（文件名含 -{类型}- 模式），
         而非仅 types 标记（types 只标记是否拍过，不记张数）。
+        v3.22.1: 修复分隔符bug——照片文件名用短横线(-远景-)，
+        检测原用下划线(_远景_)导致计数永远为0、竖列不更新。兼容历史下划线格式。
         """
         result = {label: 0 for label in PHOTO_TYPE_LABELS}
         with self._lock:
@@ -852,7 +860,8 @@ class ProgressManager:
                 continue
             basename = os.path.basename(p)
             for label in PHOTO_TYPE_LABELS:
-                if ("_%s_" % label) in basename:
+                # 兼容短横线(当前)与下划线(历史)两种分隔符
+                if ("-%s-" % label) in basename or ("_%s_" % label) in basename:
                     result[label] += 1
                     break
         return result
@@ -1114,7 +1123,9 @@ class ReportGenerator:
             full_addr = (addr_general + addr_precise).strip()
             pk = progress_mgr._make_key(borrower, full_addr)
             saved_remark = progress_mgr.get_remark(pk)
-            remark = saved_remark if saved_remark else excel_remark
+            # v3.22.1: Excel 备注优先（用户最新权威输入），与 _load_excel_path 一致。
+            # 修复备注覆盖 P0：避免日报表使用 progress_mgr 旧值而非 Excel 当前备注。
+            remark = excel_remark if excel_remark else saved_remark
             photo_info = progress_mgr.get_photo_types(pk) if hasattr(progress_mgr, 'get_photo_types') else {}
             photo_count = sum(photo_info.values()) if isinstance(photo_info, dict) else 0
             g = groups.setdefault(borrower, {
@@ -2851,7 +2862,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.0", font_size='12sp',
+            text="v3.22.1", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -4057,8 +4068,12 @@ class MainScreen(Screen):
                 full_addr = (address_general + address_precise).strip()
                 key = self.progress_mgr._make_key(borrower, full_addr)
                 saved_remark = self.progress_mgr.get_remark(key)
-                # v3.20.0: progress_mgr 优先（持久化数据更可靠）
-                final_remark = saved_remark if saved_remark else excel_remark
+                # v3.22.1: Excel 备注优先（用户在桌面端编辑的最新权威输入）；
+                # 仅当 Excel 为空时回退 progress_mgr（覆盖 SAF 写回失败致 Excel 缺失的场景）。
+                # 修复 P0「编辑备注后覆盖原备注」: progress_mgr 优先会
+                # ①用旧值覆盖用户外部编辑过的 Excel 备注；②同一客户多行(共享 borrower+address key)
+                # 编辑一行后，另一行刷新读到共享 key 新值，覆盖其自身原备注。
+                final_remark = excel_remark if excel_remark else saved_remark
                 if final_remark and final_remark != excel_remark:
                     while len(self.rows[i]) < 6:
                         self.rows[i].append("")
@@ -4176,9 +4191,10 @@ class MainScreen(Screen):
             excel_remark = row[5] if len(row) > 5 else ""
             full_addr = (address_general + address_precise).strip()
             pk = self.progress_mgr._make_key(borrower, full_addr)
-            # v3.20.0: progress_mgr 优先恢复备注
+            # v3.22.1: Excel 备注优先（用户最新权威输入），progress_mgr 仅作 Excel 为空时回退。
+            # 修复备注覆盖 P0（详见 _load_excel_path 同名注释）。
             saved_remark = self.progress_mgr.get_remark(pk)
-            remark = saved_remark if saved_remark else excel_remark
+            remark = excel_remark if excel_remark else saved_remark
 
             rw = RowWidget(
                 row_index=i, borrower=borrower,
