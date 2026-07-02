@@ -112,6 +112,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.behaviors import ButtonBehavior  # v3.22.5: RoundedButton 基类（替代 Button）
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
@@ -127,6 +128,7 @@ from kivy.core.window import Window
 from kivy.utils import platform
 from kivy.graphics import Color, Rectangle, Line, RoundedRectangle
 from kivy.metrics import dp, sp
+from kivy.properties import ListProperty  # v3.22.5: RoundedButton.background_color 可观察属性
 from kivy.storage.jsonstore import JsonStore
 from kivy.core.text import LabelBase
 from kivy.resources import resource_find, resource_add_path
@@ -364,22 +366,45 @@ FONT_PATH = _FONT_PATH if _FONT_PATH else os.path.join(os.path.dirname(os.path.a
 # v3.21.0: RoundedButton — 圆角按钮，改善 GUI 观感
 # 使用 canvas.before 绘制 RoundedRectangle 替代 Kivy 默认硬直角矩形
 # ============================================================
-class RoundedButton(Button):
+class RoundedButton(ButtonBehavior, Label):
     """v3.21.0: 圆角按钮，canvas.before 绘制 RoundedRectangle
     v3.22.2: radius 单位修正为 dp（原 14px 在高密度屏倒角微弱不可见）
     v3.22.3: radius 增大到 dp(12)，并补画边框增强倒角辨识
     v3.22.4: radius 增大到 dp(16)（多机型实测 dp(12) 仍不明显），
              补设 background_down=''（原仅设 background_normal，按压时默认纹理覆盖圆角），
-             边框透明度 0.12→0.35、width 1→1.5 增强可见性"""
+             边框透明度 0.12→0.35、width 1→1.5 增强可见性
+    v3.22.5: 改基类为 ButtonBehavior+Label。根因：Kivy style.kv 的 <-Button> 规则
+             在主 canvas 用 BorderImage 画直角实心矩形，覆盖 canvas.before 的 RoundedRectangle，
+             导致 radius/border 均不可见。Label 无此 KV 规则，圆角得以正常显示。
+             background_color 改为 ListProperty，以支持运行时改色自动重绘。"""
+
+    # v3.22.5: 作为 Kivy 可观察属性，便于 bind 与运行时改色触发重绘
+    # （原 Button.background_color 是 ListProperty；Label 无此属性，此处自定义）
+    background_color = ListProperty([0.13, 0.59, 0.95, 1])
 
     def __init__(self, radius=None, **kwargs):
+        # v3.22.5: 兼容旧 Button API —— 从 kwargs 提取 Button 专有属性，避免传给 Label 报错
+        bg_color = kwargs.pop('background_color', None)
+        bg_normal = kwargs.pop('background_normal', None)
+        bg_down = kwargs.pop('background_down', None)
+
+        # 调用 Label.__init__（ButtonBehavior 无 __init__）
         super().__init__(**kwargs)
+
         # v3.22.4: radius 默认 dp(16)，倒角更明显
         if radius is None:
             radius = [dp(16)] * 4
         self._radius = list(radius)
-        self.background_normal = ''
-        self.background_down = ''  # v3.22.4: 必须同时清空，否则按压时默认纹理覆盖圆角
+
+        # 应用调用方传入的 background_color（覆盖 ListProperty 默认值）
+        if bg_color is not None:
+            self.background_color = bg_color
+
+        # v3.22.5: 接受赋值但不使用（保持与旧 Button API 兼容，Label 无背景纹理）
+        self.background_normal = bg_normal if bg_normal is not None else ''
+        self.background_down = bg_down if bg_down is not None else ''
+
+        # 绑定重绘：pos/size 变化、state 按压、background_color 运行时改色
         self.bind(pos=self._draw_bg, size=self._draw_bg,
                   background_color=self._draw_bg, state=self._draw_bg)
         self._draw_bg()
@@ -393,7 +418,7 @@ class RoundedButton(Button):
                 r, g, b = r * 0.85, g * 0.85, b * 0.85
             Color(r, g, b, a)
             RoundedRectangle(pos=self.pos, size=self.size, radius=self._radius)
-            # v3.22.4: 边框透明度 0.12→0.35、width 1→1.5，让圆角边界清晰可辨
+            # v3.22.4: 边框透明度 0.35、width 1.5，让圆角边界清晰可辨
             Color(0, 0, 0, 0.35)
             Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius[0] if self._radius else dp(16)),
                  width=1.5)
@@ -840,11 +865,44 @@ class ProgressManager:
             for p in self.data[key].get("photos", []):
                 if os.path.exists(p):
                     valid.append(p)
-            # 清理失效路径
-            if len(valid) != len(self.data[key].get("photos", [])):
-                self.data[key]["photos"] = valid
-                self.save()
+            # v3.22.5: 不再回写过滤后的列表，避免失效路径导致旧照片记录永久丢失
             return valid
+
+    def migrate_photo_paths(self):
+        """v3.22.5: 启动时迁移失效照片路径到 APP_DIR 同名文件"""
+        try:
+            migrated = False
+            with self._lock:
+                for key, info in self.data.items():
+                    if not isinstance(info, dict): continue
+                    photos = info.get("photos", [])
+                    if not photos: continue
+                    new_photos = []
+                    changed = False
+                    for p in photos:
+                        if p and os.path.exists(p):
+                            new_photos.append(p)
+                        elif p:
+                            # 尝试在 APP_DIR 中查找同名文件
+                            basename = os.path.basename(p)
+                            candidate = os.path.join(APP_DIR, basename)
+                            if os.path.exists(candidate):
+                                new_photos.append(candidate)
+                                changed = True
+                                migrated = True
+                                app_log.info('PHOTO', '迁移照片路径: %s -> %s' % (p, candidate))
+                            else:
+                                # 保留原路径（不删除记录）
+                                new_photos.append(p)
+                        else:
+                            new_photos.append(p)
+                    if changed:
+                        info["photos"] = new_photos
+            if migrated:
+                self.save()
+                app_log.info('PHOTO', '照片路径迁移完成，已保存')
+        except Exception as e:
+            app_log.error('PHOTO', 'migrate_photo_paths 异常: %s' % e)
 
     def get_photo_count(self, key):
         return len(self.get_photos(key))
@@ -2921,7 +2979,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.4", font_size='12sp',
+            text="v3.22.5", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3704,6 +3762,7 @@ class MainScreen(Screen):
         self.headers = []
         self.rows = []  # [borrower, address_general, address_precise, property_type]
         self.progress_mgr = ProgressManager()
+        self.progress_mgr.migrate_photo_paths()
         self.camera_mgr = CameraManager()
         self.report_generator = ReportGenerator()
         self._excel_save_lock = threading.Lock()  # v3.21.0: 串行化 Excel 写入，防止并发覆盖
@@ -3819,7 +3878,7 @@ class MainScreen(Screen):
         ai_report_btn = RoundedButton(text="AI 一键生成日报表", font_size='17sp',
                                background_color=THEME['success'], background_normal='',
                                color=(1,1,1,1), bold=True, size_hint_x=0.7)
-        ai_report_btn.bind(on_release=self._generate_report)
+        ai_report_btn.bind(on_release=self._show_report_confirm)  # v3.22.5: 改为二次确认弹窗
         bind_press_animation(ai_report_btn)
         footer.add_widget(ai_report_btn)
 
@@ -4146,6 +4205,14 @@ class MainScreen(Screen):
             app_log.info('EXCEL', '开始加载 Excel: %s' % os.path.basename(path))
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
+            # v3.22.5: 切换 Excel 时清理行号备注，使新 Excel F 列为备注唯一真相源
+            try:
+                if '_row_remarks' in self.progress_mgr.data:
+                    self.progress_mgr.data['_row_remarks'] = {}
+                    self.progress_mgr.save()
+                    app_log.info('EXCEL', '切换 Excel 已清理 _row_remarks')
+            except Exception as e:
+                app_log.error('EXCEL', '清理 _row_remarks 异常: %s' % e)
             # v3.20.0: 备注恢复逻辑 — progress_mgr 为单一真相源
             # 优先用 progress_mgr 中的备注（持久化），仅在 progress_mgr 无记录时用 Excel E 列值
             for i, row in enumerate(self.rows):
@@ -5021,6 +5088,95 @@ class MainScreen(Screen):
 
         save_btn.bind(on_release=do_save)
         cancel_btn.bind(on_release=popup.dismiss)
+        popup.open()
+
+    def _show_report_confirm(self, instance):
+        """v3.22.5: AI报表二次确认弹窗，展示外访进度"""
+        # 空数据检查（保留原有保护逻辑）
+        if not self.rows or not any(r for r in self.rows if r and len(r) > 1 and r[1]):
+            self._show_msg("请先打开Excel客户数据", THEME['warning'])
+            return
+
+        # 统计外访进度
+        try:
+            records = self._collect_records(self.rows, self.progress_mgr)
+            total = len(records)
+            visited_count = sum(1 for r in records if r.get('photo_count', 0) > 0)
+            not_visited_count = total - visited_count
+        except Exception as e:
+            app_log.error('REPORT', '统计外访进度异常: %s' % e)
+            # 异常时直接进入生成流程
+            self._generate_report(instance)
+            return
+
+        # 构建确认弹窗
+        content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(15))
+
+        # 标题
+        title_label = Label(
+            text="生成日报表确认",
+            font_size=dp(20), bold=True,
+            color=THEME.get('text', (0.1, 0.1, 0.1, 1)),
+            size_hint_y=None, height=dp(40)
+        )
+        content.add_widget(title_label)
+
+        # 进度信息
+        msg = "今日外访进度 %d/%d，尚有%d户未完成，\n是否立即生成报告？" % (
+            visited_count, total, not_visited_count)
+        info_label = Label(
+            text=msg,
+            font_size=dp(16),
+            color=THEME.get('text_dim', (0.4, 0.4, 0.4, 1)),
+            halign='center', valign='middle',
+            size_hint_y=None, height=dp(80)
+        )
+        info_label.bind(width=lambda s, w: setattr(s, 'text_size', (w, None)))
+        content.add_widget(info_label)
+
+        # 按钮容器
+        btn_box = BoxLayout(orientation='horizontal', spacing=dp(15), size_hint_y=None, height=dp(48))
+
+        btn_generate = RoundedButton(
+            text="生成",
+            size_hint_x=0.5,
+            background_color=THEME.get('success', (0.2, 0.7, 0.36, 1))
+        )
+        btn_cancel = RoundedButton(
+            text="取消",
+            size_hint_x=0.5,
+            background_color=THEME.get('border', (0.86, 0.88, 0.91, 1))
+        )
+        btn_box.add_widget(btn_generate)
+        btn_box.add_widget(btn_cancel)
+        content.add_widget(btn_box)
+
+        popup = Popup(
+            title="",
+            content=content,
+            size_hint=(0.85, None),
+            height=dp(280),
+            auto_dismiss=False,  # 防止点外部关闭
+            separator_color=THEME.get('primary', (0.13, 0.59, 0.95, 1))
+        )
+
+        # 绑定按钮事件
+        def on_generate(_btn):
+            try:
+                popup.dismiss()
+            except Exception:
+                pass
+            self._generate_report(instance)
+
+        def on_cancel(_btn):
+            try:
+                popup.dismiss()
+            except Exception:
+                pass
+
+        btn_generate.bind(on_release=on_generate)
+        btn_cancel.bind(on_release=on_cancel)
+
         popup.open()
 
     def _generate_report(self, instance):

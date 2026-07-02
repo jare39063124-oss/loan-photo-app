@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-资产盘点拍照工具 使用说明书 v3.22.4
+资产盘点拍照工具 使用说明书 v3.22.5
 从零重建 PPTX —— 简约明亮配色，修复排版问题
 """
 import os
@@ -34,7 +34,7 @@ C_CARD_BG  = RGBColor(0xFA, 0xFB, 0xFC)
 
 FONT = '微软雅黑'
 IMG_DIR = r'd:\hermes\loan_photo_app\ppt_images'
-DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.22.4.pptx'
+DST = r'C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.22.5.pptx'
 
 # ============================================================
 # 辅助函数
@@ -191,7 +191,7 @@ add_text(slide, Inches(0.8), Inches(3.0), Inches(5.2), Inches(0.6),
          "使用说明书", font_size=24, color=C_WHITE)
 # 版本
 add_text(slide, Inches(0.8), Inches(3.8), Inches(5.2), Inches(0.5),
-         "v3.22.4", font_size=18, color=C_WHITE)
+         "v3.22.5", font_size=18, color=C_WHITE)
 # 底部署名
 add_text(slide, Inches(0.8), Inches(5.5), Inches(5.2), Inches(0.8),
          ["抚顺银行风险管理部", "2026年6月"], font_size=14, color=C_WHITE)
@@ -367,7 +367,7 @@ add_text(slide, wx + Inches(1.8), wy + Inches(0.8), Inches(2.0), Inches(0.8),
 add_text(slide, wx + Inches(0.3), wy + Inches(1.7), ww - Inches(0.6), Inches(0.5),
          "资产盘点专项拍照工具", font_size=15, bold=True, color=C_TEXT, align=PP_ALIGN.CENTER)
 add_text(slide, wx + Inches(0.3), wy + Inches(2.2), ww - Inches(0.6), Inches(0.35),
-         "v3.22.4", font_size=10, color=C_TEXT_DIM, align=PP_ALIGN.CENTER)
+         "v3.22.5", font_size=10, color=C_TEXT_DIM, align=PP_ALIGN.CENTER)
 # 功能列表
 features = [
     "四类拍照引导（远景/近景/内部/瑕疵）",
@@ -404,7 +404,7 @@ start_y = Inches(1.1)
 
 steps = [
     ("1", "微信接收文件",
-     "通过微信接收同事发送的 APK 安装文件\n（loan-photo-tool-v3.22.4.apk），\n在微信聊天中点击该文件。"),
+     "通过微信接收同事发送的 APK 安装文件\n（loan-photo-tool-v3.22.5.apk），\n在微信聊天中点击该文件。"),
     ("2", "打开文件菜单",
      "在微信中打开 APK 文件预览，\n点击右上角「三个点」图标，\n弹出操作菜单。"),
     ("3", "保存到手机",
@@ -1072,7 +1072,7 @@ for i, (q, a) in enumerate(faqs):
 # 底部联系信息
 add_rect(slide, Inches(0.4), faq_y + Inches(0.1), Inches(12.5), Inches(0.55), C_ACCENT, radius=0.05)
 add_text(slide, Inches(0.5), faq_y + Inches(0.1), Inches(12.3), Inches(0.55),
-         "抚顺银行风险管理部    |    资产盘点专项拍照工具 v3.22.4",
+         "抚顺银行风险管理部    |    资产盘点专项拍照工具 v3.22.5",
          font_size=14, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 
 add_page_num(slide, 16)
