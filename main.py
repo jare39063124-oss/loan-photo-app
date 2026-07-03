@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.6
+资产盘点专项拍照工具 App - v3.22.7
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -429,7 +429,9 @@ class RoundedButton(ButtonBehavior, Label):
 # 轮转策略：文件超过 500KB 时保留最近 256KB
 # ============================================================
 class AppLogger:
-    """v3.20.0: 全量 app 日志记录器，替代仅相机日志的 _dbg 机制"""
+    """v3.20.0: 全量 app 日志记录器，替代仅相机日志的 _dbg 机制
+    v3.22.7: 文件写入改为异步 — log() 仅追加内存缓冲，后台 daemon 线程批量落盘，
+    避免主线程同步 IO 阻塞导致卡顿。"""
     _instance = None
 
     def __init__(self, filepath=None, max_size=512 * 1024, keep_size=256 * 1024):
@@ -440,40 +442,85 @@ class AppLogger:
         self._max_lines = 200
         self._lock = threading.Lock()
         self._enabled = False    # v3.22.0: 日志开关，默认关闭
+        # v3.22.7: 异步落盘缓冲与后台线程
+        self._pending = []          # 待写入文件的日志行
+        self._flush_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._flush_thread = None
 
     def set_enabled(self, enabled):
-        """v3.22.0: 设置日志开关"""
+        """v3.22.0: 设置日志开关
+        v3.22.7: 开启时启动后台落盘线程；关闭时立即 flush 剩余缓冲。"""
         self._enabled = bool(enabled)
+        if self._enabled:
+            self._start_flush_thread()
+        else:
+            # 关闭时立即落盘剩余缓冲（确保日志不丢失）
+            self._do_flush()
+
+    def _start_flush_thread(self):
+        """v3.22.7: 启动后台 daemon 落盘线程（进程退出时自动结束）"""
+        if self._flush_thread and self._flush_thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flush_thread.start()
+
+    def _flush_loop(self):
+        """v3.22.7: 后台循环 — 等待信号或 0.5s 超时后批量落盘"""
+        while not self._stop_event.is_set():
+            self._flush_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
+            self._flush_event.clear()
+            try:
+                self._do_flush()
+            except Exception:
+                pass
+
+    def _do_flush(self):
+        """v3.22.7: 将 _pending 批量写入文件（单次 open/write，减少 IO 次数）"""
+        # 先在锁内取出待写行（短暂持锁，不阻塞 log()）
+        with self._lock:
+            if not self._pending:
+                return
+            lines_to_write = self._pending[:]
+            self._pending = []
+        # 文件写入在锁外执行（慢 IO 不阻塞 log() 与 get_log_text()）
+        try:
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+            with open(self.filepath, 'a', encoding='utf-8') as f:
+                f.write("\n".join(lines_to_write) + "\n")
+            self._maybe_rotate()
+        except Exception as e:
+            # 落盘失败 — 记录到内存缓冲（用户查看日志仍能看到内容）
+            ts = get_system_date().strftime('%Y-%m-%d %H:%M:%S')
+            err_line = "[%s] [WARN] [APPLOG] 日志文件写入失败: %s（仅内存缓冲可见）" % (ts, str(e)[:60])
+            with self._lock:
+                self._lines.append(err_line)
+                if len(self._lines) > self._max_lines:
+                    self._lines = self._lines[-self._max_lines:]
 
     def is_enabled(self):
         """v3.22.0: 返回当前开关状态"""
         return self._enabled
 
     def log(self, level, tag, msg):
-        """写入一条日志。level: INFO/WARN/ERROR；tag: 模块标签如 EXCEL/PHOTO/AI/APP"""
-        # v3.22.0: 日志开关关闭时不写文件、不入缓冲
+        """写入一条日志。level: INFO/WARN/ERROR；tag: 模块标签如 EXCEL/PHOTO/AI/APP
+        v3.22.7: 仅追加内存缓冲并唤醒后台线程，不同步写文件（避免主线程 IO 阻塞）。"""
+        # v3.22.0: 日志开关关闭时不写文件、不入缓冲（完全跳过）
         if not self._enabled:
             return
         ts = get_system_date().strftime('%Y-%m-%d %H:%M:%S')
         line = "[%s] [%s] [%s] %s" % (ts, level, tag, msg)
-        file_ok = True
         with self._lock:
             self._lines.append(line)
             if len(self._lines) > self._max_lines:
                 self._lines = self._lines[-self._max_lines:]
-            try:
-                os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-                with open(self.filepath, 'a', encoding='utf-8') as f:
-                    f.write(line + "\n")
-                # 轮转检查
-                self._maybe_rotate()
-            except Exception as e:
-                # v3.22.3: 文件写入失败时记录到内存缓冲（用户查看日志仍能看到内容）
-                file_ok = False
-                err_line = "[%s] [WARN] [APPLOG] 日志文件写入失败: %s（仅内存缓冲可见）" % (ts, str(e)[:60])
-                self._lines.append(err_line)
-                if len(self._lines) > self._max_lines:
-                    self._lines = self._lines[-self._max_lines:]
+            # v3.22.7: 追加到待落盘缓冲，不立即写文件
+            self._pending.append(line)
+        # 唤醒后台线程落盘
+        self._flush_event.set()
         # 同时输出到 Kivy Logger（控制台可见）
         try:
             if level == 'ERROR':
@@ -540,9 +587,11 @@ class AppLogger:
             return "读取日志失败: %s" % e
 
     def clear(self):
-        """清空日志"""
+        """清空日志
+        v3.22.7: 同时清空 _pending 待落盘缓冲，避免 flush 线程写入已清除的行。"""
         with self._lock:
             self._lines = []
+            self._pending = []  # v3.22.7: 清空待落盘缓冲
             try:
                 if os.path.exists(self.filepath):
                     os.remove(self.filepath)
@@ -3039,7 +3088,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.6", font_size='12sp',
+            text="v3.22.7", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3768,6 +3817,7 @@ class RowWidget(BoxLayout):
 
     # ============================================================
     # v3.22.6: 长按检测 — 按住 500ms 不移动触发 on_long_press 回调
+    # v3.22.7: 长按时间 0.5s → 0.8s（减少误判，需用户更明确长按意图）
     # ============================================================
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
@@ -3778,7 +3828,7 @@ class RowWidget(BoxLayout):
             self._long_press_touch = touch
             self._long_press_start_pos = (touch.x, touch.y)
             self._long_press_timer = Clock.schedule_once(
-                lambda dt: self._trigger_long_press(touch), 0.5)
+                lambda dt: self._trigger_long_press(touch), 0.8)
         return super().on_touch_down(touch)
 
     def on_touch_move(self, touch):
@@ -3800,13 +3850,21 @@ class RowWidget(BoxLayout):
         return super().on_touch_up(touch)
 
     def _trigger_long_press(self, touch):
-        """v3.22.6: 长按回调触发（touch 仍在行内）"""
+        """v3.22.6: 长按回调触发（touch 仍在行内）
+        v3.22.7: 增加日志便于运行时定位；on_long_press 为 None 时记录警告。"""
         self._long_press_timer = None
-        if self.collide_point(*touch.pos) and self.on_long_press:
+        if not self.collide_point(*touch.pos):
+            return
+        # v3.22.7: 记录长按触发事件（便于运行时定位）
+        app_log.info('UI', '长按触发 row=%d' % self.row_index)
+        if self.on_long_press:
             try:
                 self.on_long_press(self.row_index)
             except Exception as e:
                 app_log.error('UI', 'RowWidget 长按回调异常: %s' % e)
+        else:
+            # v3.22.7: 长按回调未绑定 — 仅记录警告日志（RowWidget 无法访问 toast 工具）
+            app_log.warning('UI', '长按回调未绑定 row=%d' % self.row_index)
 
     def update_batch_marked(self):
         """v3.22.6: 刷新同类型标记状态与徽章显示（_refresh_list 时调用）"""
@@ -3819,6 +3877,27 @@ class RowWidget(BoxLayout):
         self.name_label.text = name_text
         self.name_label.color = THEME['accent'] if self.batch_marked else (THEME['success'] if self.done else THEME['text'])
         self._update_type_status()
+
+    def update_state(self):
+        """v3.22.7: 增量更新行状态（计数器/done/batch_marked 徽章/按钮文案），不重建 widget。
+        由 _refresh_list 在缓存命中时调用，避免长列表全量重建卡顿。"""
+        try:
+            # 刷新拍照状态
+            self.done = self.progress_mgr.is_photographed(self.progress_key)
+            self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
+            # 刷新同类型标记状态与徽章（内部调用 _update_type_status 并设置 name_label.color）
+            self.update_batch_marked()
+            # 拍照按钮颜色（已拍绿/未拍蓝）
+            self.photo_btn.background_color = THEME['success'] if self.done else THEME['accent']
+            # 查看已拍按钮文案与颜色
+            self.view_btn.text = "查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍"
+            self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else THEME['muted']
+            # 备注按钮文案与颜色
+            if hasattr(self, 'remark_btn'):
+                self.remark_btn.text = "备注●" if self.remark else "备注"
+                self.remark_btn.background_color = THEME['warning'] if self.remark else THEME['muted']
+        except Exception as e:
+            app_log.error('UI', 'update_state 异常 row=%d: %s' % (self.row_index, e))
 
     def _update_name_text_size(self, instance, value):
         instance.text_size = (value, None)
@@ -3948,6 +4027,7 @@ class MainScreen(Screen):
         self._log_long_press = None  # v3.22.0: 日志按钮长按检测定时器
         self.multi_select_active = False  # v3.22.6: 多选模式激活标志
         self.multi_select_toolbar = None  # v3.22.6: 多选工具栏引用（_build_ui 中创建）
+        self._row_widget_cache = {}  # v3.22.7: RowWidget 增量刷新缓存（按 row_index 复用）
         # v3.22.0: 从配置初始化日志开关（默认关闭）
         app_log.set_enabled(self.config.get('log_enabled', False))
 
@@ -4406,8 +4486,16 @@ class MainScreen(Screen):
 
     def _show_msg_popup(self, msg, color=None):
         """v3.22.6: 弹出一个居中 Popup 显示消息（替代不可见的 status_label）。
-        Popup 含消息文本 + 「知道了」按钮，背景色 THEME['card']（浅色主题）。"""
+        Popup 含消息文本 + 「知道了」按钮，背景色 THEME['card']（浅色主题）。
+        v3.22.7: 修复 background=THEME['card'] 传颜色列表导致
+        'Popup.background accept only str' 异常 → 改用 content.canvas.before 绘制浅色背景。"""
         content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(14))
+        # v3.22.7: 在 content 的 canvas.before 中绘制浅色背景（参照 PhotoViewerPopup 的做法）
+        with content.canvas.before:
+            Color(*THEME['card'])
+            _msg_bg = Rectangle(pos=content.pos, size=content.size)
+        content.bind(pos=lambda i, v: setattr(_msg_bg, 'pos', v),
+                     size=lambda i, v: setattr(_msg_bg, 'size', v))
         msg_color = color if color else THEME['text_dim']
         msg_label = Label(
             text=str(msg),
@@ -4430,14 +4518,13 @@ class MainScreen(Screen):
         content.add_widget(ok_btn)
         popup = Popup(
             title="提示",
-            title_color=THEME['text'],
+            title_color=THEME['accent_dark'],
             title_size='16sp',
             separator_color=THEME['card_border'],
             content=content,
             size_hint=(0.8, None),
             height=dp(200),
             auto_dismiss=True,
-            background=THEME['card'],
         )
         ok_btn.bind(on_release=popup.dismiss)
         popup.open()
@@ -4451,6 +4538,8 @@ class MainScreen(Screen):
             app_log.info('EXCEL', '开始加载 Excel: %s' % os.path.basename(path))
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
+            # v3.22.7: Excel 重新加载时清空 RowWidget 缓存（行数据已变，旧缓存失效）
+            self._row_widget_cache = {}
             # v3.22.5: 切换 Excel 时清理行号备注，使新 Excel F 列为备注唯一真相源
             try:
                 if '_row_remarks' in self.progress_mgr.data:
@@ -4493,13 +4582,34 @@ class MainScreen(Screen):
     def _refresh_list(self, filter_query=""):
         """v3.20.0: 重建列表，支持分批渲染(大数据量)和搜索过滤(只显示匹配行)。
         filter_query: 搜索关键词（小写），匹配客户名+地址；为空则显示全部
+        v3.22.7: 增量刷新优化 — 无搜索过滤且缓存命中全部行时，仅更新状态不重建 RowWidget。
         """
+        # v3.22.7: 增量刷新 — 仅当无搜索过滤、缓存命中全部行、且当前已显示全部行时
+        # 才走增量路径（避免破坏搜索/分批渲染逻辑）
+        try:
+            cache_full = bool(self._row_widget_cache) and len(self._row_widget_cache) == len(self.rows)
+            view_full = bool(self.row_widgets) and len(self.row_widgets) == len(self.rows)
+        except Exception:
+            cache_full = False
+            view_full = False
+        if (not filter_query.strip() and cache_full and view_full
+                and not self._loading_label):
+            for rw in self.row_widgets:
+                try:
+                    rw.update_state()
+                except Exception as e:
+                    app_log.error('UI', '增量刷新 update_state 异常 row=%d: %s' % (rw.row_index, e))
+            self._update_progress()
+            return
+
         # 取消之前可能正在进行的批量渲染
         self._render_token += 1
         token = self._render_token
 
         self.list_layout.clear_widgets()
         self.row_widgets = []
+        # v3.22.7: 清空缓存（由 _create_row_widget 重新填充）
+        self._row_widget_cache = {}
         self.scroll_view.scroll_y = 1
 
         # 计算匹配的行 — v3.22.0: 按搜索类型选择器过滤
@@ -4616,11 +4726,15 @@ class MainScreen(Screen):
             )
             # v3.22.6: 绑定长按回调 — 已标记行弹出「取消标记」，未标记行进入多选模式
             rw.on_long_press = self._on_row_long_press
+            # v3.22.7: 确认绑定成功（便于运行时定位绑定缺失问题）
+            app_log.debug('UI', 'RowWidget %d 绑定 on_long_press' % rw.row_index)
             # v3.22.6: 多选模式激活时，新创建的行也进入多选模式（如刷新列表后）
             if self.multi_select_active:
                 rw.enter_multi_select_mode(selected=False)
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
+            # v3.22.7: 按 row_index 缓存，供 _refresh_list 增量刷新复用
+            self._row_widget_cache[i] = rw
         except Exception as e:
             app_log.error('UI', '创建行 widget 失败 行%d: %s' % (i, e))
             traceback.print_exc()
@@ -5157,9 +5271,13 @@ class MainScreen(Screen):
         return list(self.row_widgets)
 
     def _on_row_long_press(self, row_index):
-        """v3.22.6: RowWidget 长按回调分发 — 已标记行弹出「取消标记」，否则进入多选模式"""
+        """v3.22.6: RowWidget 长按回调分发 — 已标记行弹出「取消标记」，否则进入多选模式
+        v3.22.7: 增加日志记录 is_batch_marked 状态便于运行时定位。"""
         try:
-            if self.progress_mgr.is_batch_marked(row_index):
+            # v3.22.7: 记录长按回调与已标记状态
+            is_marked = self.progress_mgr.is_batch_marked(row_index) if hasattr(self.progress_mgr, 'is_batch_marked') else False
+            app_log.info('UI', '长按回调 row=%d, is_batch_marked=%s' % (row_index, is_marked))
+            if is_marked:
                 self._toggle_batch_mark(row_index)
             else:
                 self._enter_multi_select(row_index)
@@ -5167,7 +5285,10 @@ class MainScreen(Screen):
             app_log.error('UI', '长按回调异常 row=%d: %s' % (row_index, e))
 
     def _enter_multi_select(self, row_index):
-        """v3.22.6: 进入多选模式 — 所有行显示 checkbox，触发行默认选中，显示工具栏"""
+        """v3.22.6: 进入多选模式 — 所有行显示 checkbox，触发行默认选中，显示工具栏
+        v3.22.7: 增加日志便于运行时定位。"""
+        # v3.22.7: 记录进入多选模式事件
+        app_log.info('UI', '进入多选模式，选中行=%d' % row_index)
         self.multi_select_active = True
         for rw in self._get_all_row_widgets():
             rw.enter_multi_select_mode(selected=(rw.row_index == row_index))
@@ -5464,6 +5585,12 @@ class MainScreen(Screen):
 
         # 构建确认弹窗
         content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(15))
+        # v3.22.7: 在 content 的 canvas.before 中绘制浅色背景（Kivy 默认深色背景导致深色文字不可见）
+        with content.canvas.before:
+            Color(*THEME['card'])
+            _rc_bg = Rectangle(pos=content.pos, size=content.size)
+        content.bind(pos=lambda i, v: setattr(_rc_bg, 'pos', v),
+                     size=lambda i, v: setattr(_rc_bg, 'size', v))
 
         # 标题
         title_label = Label(
@@ -5512,12 +5639,14 @@ class MainScreen(Screen):
 
         popup = Popup(
             title="",
+            # v3.22.7: 深色标题在浅色背景上可见；分隔线用浅灰
+            title_color=THEME.get('accent_dark', (0.08, 0.40, 0.78, 1)),
             content=content,
             size_hint=(0.85, None),
             height=dp(280),
             auto_dismiss=False,  # 防止点外部关闭
-            # v3.22.6 修复 THEME 键名: 'primary' → 'accent'
-            separator_color=THEME.get('accent', (0.13, 0.59, 0.95, 1))
+            # v3.22.7: 浅色分隔线（之前用 accent 蓝色与浅色主题不协调）
+            separator_color=THEME.get('card_border', (0.86, 0.88, 0.92, 1))
         )
 
         # 绑定按钮事件
@@ -5713,6 +5842,8 @@ class AIScreen(Screen):
         scroll = ScrollView(size_hint_y=1)
         scroll.add_widget(self.chat_layout)
         layout.add_widget(scroll)
+        # v3.22.7: 保存 scroll 引用，便于键盘弹出时滚动到底部
+        self.chat_scroll = scroll
 
         # 输入栏
         input_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
@@ -5721,6 +5852,8 @@ class AIScreen(Screen):
             size_hint_x=0.78, hint_text="输入问题...",
         )
         self.input_field.bind(on_text_validate=self._on_send)
+        # v3.22.7: 绑定 focus 事件，键盘弹出时切换 softinput_mode 防止遮挡
+        self.input_field.bind(focus=self._on_input_focus)
         input_row.add_widget(self.input_field)
 
         send_btn = RoundedButton(
@@ -5737,6 +5870,22 @@ class AIScreen(Screen):
 
         # 欢迎消息
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
+
+    def _on_input_focus(self, instance, value):
+        """v3.22.7: 输入框获得/失去焦点时调整键盘模式。
+        获得焦点时切换到 pan 模式（部分机型 resize 不生效，pan 可确保输入框不被遮挡）；
+        失去焦点时恢复 resize 模式。同时延迟滚动聊天记录到底部，确保最新消息可见。"""
+        try:
+            if value:
+                # 获得焦点：切换到 pan 模式，确保输入框不被遮挡
+                Window.softinput_mode = 'pan'
+                # 延迟滚动到底部（等待键盘弹出后，scroll_y=0 表示底部）
+                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.3)
+            else:
+                # 失去焦点：恢复 resize 模式
+                Window.softinput_mode = 'resize'
+        except Exception as e:
+            app_log.error('AI', '_on_input_focus 异常: %s' % e)
 
     def _add_message(self, role, text):
         """添加一条消息到聊天区"""
