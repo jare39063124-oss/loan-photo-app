@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.7
+资产盘点专项拍照工具 App - v3.22.8
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -557,7 +557,15 @@ class AppLogger:
     def info(self, tag, msg):
         self.log('INFO', tag, msg)
 
+    def debug(self, tag, msg):
+        # v3.22.8 新增：补全 DEBUG 级别日志方法（v3.22.7 调用 app_log.debug 导致 AttributeError）
+        self.log('DEBUG', tag, msg)
+
     def warn(self, tag, msg):
+        self.log('WARN', tag, msg)
+
+    def warning(self, tag, msg):
+        # v3.22.8 新增：warning 作为 warn 的别名（v3.22.7 调用 app_log.warning 导致 AttributeError）
         self.log('WARN', tag, msg)
 
     def error(self, tag, msg):
@@ -3088,7 +3096,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.7", font_size='12sp',
+            text="v3.22.8", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
