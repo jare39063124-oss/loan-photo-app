@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.4
+资产盘点专项拍照工具 App - v3.22.6
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -770,11 +770,16 @@ class ProgressManager:
                 # v3.22.3: 兼容旧数据（无 _row_remarks 字段时初始化为空字典）
                 if not isinstance(self.data.get('_row_remarks'), dict):
                     self.data['_row_remarks'] = {}
+                # v3.22.6: 兼容旧数据（无 batch_marked 字段时初始化为空字典）
+                if not isinstance(self.data.get('batch_marked'), dict):
+                    self.data['batch_marked'] = {}
             except Exception:
                 self.data = {}
                 self.data['_row_remarks'] = {}
+                self.data['batch_marked'] = {}
         else:
             self.data['_row_remarks'] = {}
+            self.data['batch_marked'] = {}
 
     def save(self):
         with self._lock:
@@ -806,6 +811,37 @@ class ProgressManager:
             if '_row_remarks' not in self.data:
                 return ""
             return self.data['_row_remarks'].get(str(row_index), "")
+
+    # ============================================================
+    # v3.22.6: 批量标记同类型 — 借款人抵押整栋楼盘时只需拍代表性户型，
+    # 其余行标记为「同类型已拍」不计入未完成数量，AI 报表合并统计。
+    # key 为 row_index 字符串，与 _row_remarks 一致（稳定不受搜索过滤影响）。
+    # ============================================================
+    def mark_batch(self, row_index):
+        """v3.22.6: 标记某行为同类型"""
+        with self._lock:
+            if 'batch_marked' not in self.data:
+                self.data['batch_marked'] = {}
+            self.data['batch_marked'][str(row_index)] = True
+        self.save()
+
+    def unmark_batch(self, row_index):
+        """v3.22.6: 取消同类型标记"""
+        with self._lock:
+            if 'batch_marked' in self.data:
+                self.data['batch_marked'].pop(str(row_index), None)
+        self.save()
+
+    def is_batch_marked(self, row_index):
+        """v3.22.6: 返回某行是否已标记为同类型"""
+        with self._lock:
+            return str(row_index) in self.data.get('batch_marked', {})
+
+    def get_all_batch_marked(self):
+        """v3.22.6: 返回所有已标记的 row_index 列表（int）"""
+        with self._lock:
+            marked = self.data.get('batch_marked', {})
+            return [int(k) for k in marked.keys() if isinstance(k, str) and k.isdigit()]
 
     def mark_photo(self, key, photo_path, photo_type=""):
         """key = _make_key(borrower, address_general, address_precise)"""
@@ -1202,6 +1238,10 @@ class ReportGenerator:
         "【重要】严禁使用「等」字省略信息！备注中提及的所有人名、地址、使用人、"
         "使用情况必须完整列出，不得遗漏。例如备注写「抵押物由张三、李四、王五使用」，"
         "报告中必须写「由张三、李四、王五使用」，不得简写为「由张三等人使用」。\n"
+        "v3.22.6 同类型说明：对于标记为「同类型」的抵押物，这些是借款人抵押整栋楼盘中"
+        "具有代表性的户型，已批量标记为同类型，无需为每户单独拍照。在报告中应合并表述为"
+        "「同类型户型」，可在抵押物情况中说明「该抵押物与同楼盘代表性户型为同类型，"
+        "已现场勘查代表性户型」，现状描述与风险备注可参照同类型代表性户型的勘查结论填写。\n"
         "仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。"
         "格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]"
     )
@@ -1222,6 +1262,8 @@ class ReportGenerator:
         v3.22.0: Excel 格式改为 A序号 B客户名 C地址概 D地址详 E性质 F备注
         v3.22.0: 按 borrower 分组 — 同一客户多处抵押物合并为一条记录，
         detail 字段需表述"共计盘点 N 处，位置为 XX、XX…"。
+        v3.22.6: 新增 batch_marked 字段 — 标记为同类型的代表性户型（无需单独拍照）。
+                 按 borrower 分组时，组内任一行被标记即视为该组已标记同类型。
         """
         from collections import OrderedDict
         groups = OrderedDict()
@@ -1243,14 +1285,19 @@ class ReportGenerator:
             remark = row_remark if row_remark else (excel_remark if excel_remark else saved_remark)
             photo_info = progress_mgr.get_photo_types(pk) if hasattr(progress_mgr, 'get_photo_types') else {}
             photo_count = sum(photo_info.values()) if isinstance(photo_info, dict) else 0
+            # v3.22.6: 查询该行是否被标记为同类型（按行号，稳定）
+            row_batch_marked = progress_mgr.is_batch_marked(i) if hasattr(progress_mgr, 'is_batch_marked') else False
             g = groups.setdefault(borrower, {
                 'name': borrower, 'addresses': [], 'property_types': [],
-                'remarks': [], 'photo_count': 0,
+                'remarks': [], 'photo_count': 0, 'batch_marked': False,
             })
             g['addresses'].append(full_addr)
             g['property_types'].append(property_type)
             g['remarks'].append(remark)
             g['photo_count'] += photo_count
+            # v3.22.6: 组内任一行被标记即视为该组已标记同类型
+            if row_batch_marked:
+                g['batch_marked'] = True
         records = []
         for name, g in groups.items():
             # 合并备注：去重保留所有非空备注
@@ -1262,6 +1309,8 @@ class ReportGenerator:
                 'remark': merged_remark,
                 'photo_count': g['photo_count'],
                 'count': len(g['addresses']),
+                # v3.22.6: 是否标记为同类型代表性户型
+                'batch_marked': g.get('batch_marked', False),
             })
         return records
 
@@ -1476,6 +1525,8 @@ class ReportGenerator:
         """AI 生成日报表。返回 (ok, out_path_or_None, msg)
         v3.19.6: 仅对有外访照片的客户生成报告行；末尾追加汇总说明行；
                  输出文件名改为"抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx"。
+        v3.22.6: 合并统计「同类型」户数 — 已标记为同类型代表性户型且无照片的客户
+                 不再单独生成报告行，但在汇总说明中合并表述。
         """
         records = self._collect_records(rows, progress_mgr)
         if not records:
@@ -1484,6 +1535,10 @@ class ReportGenerator:
         # 仅对有照片的客户生成报告
         visited_records = [r for r in records if r['photo_count'] > 0]
         visited_count = len(visited_records)
+        # v3.22.6: 统计同类型户数（标记为同类型且无照片的，需合并表述）
+        batch_marked_count = len([r for r in records
+                                  if r.get('batch_marked', False)
+                                  and r.get('photo_count', 0) == 0])
         not_visited_count = total - visited_count
         if not visited_records:
             return False, None, "所有客户均无外访照片，无法生成报告（请先现场拍照）"
@@ -1497,8 +1552,13 @@ class ReportGenerator:
         items = self._parse_ai_response(ai_text, visited_records)
         # 汇总说明行（基于导入Excel文件名 + 客户外访统计）
         excel_name = excel_filename or "未命名"
-        summary = "本次报告基于%s生成，共计%d个客户，其中有外访%d户已生成报告，%d个客户没有外访未生成报告" % (
-            excel_name, total, visited_count, not_visited_count)
+        # v3.22.6: 如有同类型标记，汇总文案合并表述「代表性户型+同类型」
+        if batch_marked_count > 0:
+            summary = "本次报告基于%s生成，共计%d个客户，其中已外访代表性户型%d户，另有%d户为同类型（已批量标记）" % (
+                excel_name, total, visited_count, batch_marked_count)
+        else:
+            summary = "本次报告基于%s生成，共计%d个客户，其中有外访%d户已生成报告，%d个客户没有外访未生成报告" % (
+                excel_name, total, visited_count, not_visited_count)
         out_path = os.path.join(APP_DIR, "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str())
         try:
             self._fill_template(items, out_path, summary_text=summary)
@@ -2979,7 +3039,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.5", font_size='12sp',
+            text="v3.22.6", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3532,6 +3592,8 @@ class SettingsScreen(Screen):
 # ============================================================
 
 class RowWidget(BoxLayout):
+    # v3.22.6: 长按回调（MainScreen 创建时绑定 _enter_multi_select / _toggle_batch_mark）
+    # 用普通属性即可（不需 ObjectProperty 的观察特性），保持与现有代码风格一致
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
                  progress_key, progress_mgr, photo_callback, view_photos_callback,
                  remark="", remark_callback=None, excel_row_index=None, serial="",
@@ -3559,6 +3621,14 @@ class RowWidget(BoxLayout):
         self.excel_row_index = excel_row_index  # Excel中的实际行号（含表头，从1开始）
         self.done = progress_mgr.is_photographed(progress_key)
         self.photo_count = progress_mgr.get_photo_count(progress_key)
+        # v3.22.6: 同类型标记状态（按行号，稳定）
+        self.batch_marked = progress_mgr.is_batch_marked(row_index) if hasattr(progress_mgr, 'is_batch_marked') else False
+        # v3.22.6: 多选模式标志与长按回调
+        self.multi_select_mode = False
+        self.on_long_press = None  # MainScreen 创建后绑定
+        self._long_press_timer = None  # 长按检测定时器
+        self._long_press_touch = None  # 记录触发长按的 touch
+        self._long_press_start_pos = None  # 长按起点坐标（用于移动阈值判断）
 
         with self.canvas.before:
             Color(*THEME['card'])
@@ -3575,13 +3645,16 @@ class RowWidget(BoxLayout):
         name_text = borrower if borrower else "（无客户名）"
         if self.serial:
             name_text = "%s. %s" % (self.serial, name_text)
+        # v3.22.6: 同类型标记的客户名前加 [同类型] 前缀徽章文字
+        if self.batch_marked:
+            name_text = "同类型  " + name_text
 
         # 客户名（加粗，自动换行）
         self.name_label = Label(
             text=name_text,
             font_size='16sp',
             bold=True,
-            color=THEME['success'] if self.done else THEME['text'],
+            color=THEME['accent'] if self.batch_marked else (THEME['success'] if self.done else THEME['text']),
             size_hint_y=None,
             halign='left', valign='middle',
         )
@@ -3609,6 +3682,14 @@ class RowWidget(BoxLayout):
         # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数横排）
         # v3.22.2: 计数器从竖排 5 行改为横排单 label，并入按钮行末尾，节省屏幕空间
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
+
+        # v3.22.6: 多选 checkbox（默认隐藏 width=0/opacity=0）
+        # 放在 btn_row 最左侧；size_hint_x=None 时按 width 占位，其余 size_hint_x 子项共享剩余空间
+        self.checkbox = CheckBox(
+            active=False, opacity=0,
+            size_hint_x=None, width=dp(0),
+        )
+        btn_row.add_widget(self.checkbox)
 
         self.photo_btn = RoundedButton(
             text="拍照", font_size='16sp',
@@ -3662,6 +3743,83 @@ class RowWidget(BoxLayout):
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
 
+    # ============================================================
+    # v3.22.6: 多选模式 UI 控制
+    # ============================================================
+    def enter_multi_select_mode(self, selected=False):
+        """v3.22.6: 进入多选模式 — 显示 checkbox 并设置选中状态"""
+        self.multi_select_mode = True
+        self.checkbox.opacity = 1
+        self.checkbox.width = dp(40)
+        self.checkbox.size_hint_x = None
+        self.checkbox.active = bool(selected)
+
+    def exit_multi_select_mode(self):
+        """v3.22.6: 退出多选模式 — 隐藏 checkbox 并清除选中状态"""
+        self.multi_select_mode = False
+        self.checkbox.opacity = 0
+        self.checkbox.width = dp(0)
+        self.checkbox.size_hint_x = None
+        self.checkbox.active = False
+
+    def is_selected(self):
+        """v3.22.6: 返回多选模式下是否被选中"""
+        return self.multi_select_mode and self.checkbox.active
+
+    # ============================================================
+    # v3.22.6: 长按检测 — 按住 500ms 不移动触发 on_long_press 回调
+    # ============================================================
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            # 取消旧定时器（防止重复触发）
+            if self._long_press_timer:
+                self._long_press_timer.cancel()
+                self._long_press_timer = None
+            self._long_press_touch = touch
+            self._long_press_start_pos = (touch.x, touch.y)
+            self._long_press_timer = Clock.schedule_once(
+                lambda dt: self._trigger_long_press(touch), 0.5)
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        # 移动超过阈值则取消长按（避免误触发）
+        if self._long_press_timer and self._long_press_touch is touch:
+            sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
+            dx = abs(touch.x - sx)
+            dy = abs(touch.y - sy)
+            if dx > dp(10) or dy > dp(10):
+                self._long_press_timer.cancel()
+                self._long_press_timer = None
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if self._long_press_timer:
+            self._long_press_timer.cancel()
+            self._long_press_timer = None
+        self._long_press_touch = None
+        return super().on_touch_up(touch)
+
+    def _trigger_long_press(self, touch):
+        """v3.22.6: 长按回调触发（touch 仍在行内）"""
+        self._long_press_timer = None
+        if self.collide_point(*touch.pos) and self.on_long_press:
+            try:
+                self.on_long_press(self.row_index)
+            except Exception as e:
+                app_log.error('UI', 'RowWidget 长按回调异常: %s' % e)
+
+    def update_batch_marked(self):
+        """v3.22.6: 刷新同类型标记状态与徽章显示（_refresh_list 时调用）"""
+        self.batch_marked = self.progress_mgr.is_batch_marked(self.row_index) if hasattr(self.progress_mgr, 'is_batch_marked') else False
+        name_text = self.borrower if self.borrower else "（无客户名）"
+        if self.serial:
+            name_text = "%s. %s" % (self.serial, name_text)
+        if self.batch_marked:
+            name_text = "同类型  " + name_text
+        self.name_label.text = name_text
+        self.name_label.color = THEME['accent'] if self.batch_marked else (THEME['success'] if self.done else THEME['text'])
+        self._update_type_status()
+
     def _update_name_text_size(self, instance, value):
         instance.text_size = (value, None)
 
@@ -3703,6 +3861,10 @@ class RowWidget(BoxLayout):
 
     def _update_type_status(self):
         # v3.22.2: 横排单行显示 5 类照片状态 [类型:张数 ...]，已拍加绿色加粗
+        # v3.22.6: 同类型标记的行在计数器位置显示「同类型」徽章（蓝色加粗）替代 5 类计数
+        if getattr(self, 'batch_marked', False) and not self.done:
+            self.type_status_label.text = "[color=2196F3][b]同类型[/b][/color]"
+            return
         counts = self.progress_mgr.get_photo_count_by_type(self.progress_key)
         parts = []
         for label in PHOTO_TYPE_LABELS:
@@ -3736,7 +3898,8 @@ class RowWidget(BoxLayout):
         self.done = True
         self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
         self.photo_btn.background_color = THEME['success']
-        self.name_label.color = THEME['success']
+        # v3.22.6: 同类型标记的行名色保持 accent（蓝），否则已拍为 success（绿）
+        self.name_label.color = THEME['accent'] if getattr(self, 'batch_marked', False) else THEME['success']
         self.view_btn.text = "查看已拍(%d)" % self.photo_count
         self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else THEME['muted']
         self._update_type_status()
@@ -3783,6 +3946,8 @@ class MainScreen(Screen):
         self._photo_session_ctx = None  # v3.20.0: 拍照会话上下文（替代 self._current_* 实例状态）
         self._photo_session_active = False  # v3.20.0: 拍照会话锁，防止连拍期间切换客户
         self._log_long_press = None  # v3.22.0: 日志按钮长按检测定时器
+        self.multi_select_active = False  # v3.22.6: 多选模式激活标志
+        self.multi_select_toolbar = None  # v3.22.6: 多选工具栏引用（_build_ui 中创建）
         # v3.22.0: 从配置初始化日志开关（默认关闭）
         app_log.set_enabled(self.config.get('log_enabled', False))
 
@@ -3865,6 +4030,40 @@ class MainScreen(Screen):
         bind_press_animation(search_btn)
         toolbar.add_widget(search_btn)
         parent.add_widget(toolbar)
+
+        # v3.22.6: 多选模式工具栏（默认隐藏 opacity=0/height=0）
+        # 长按客户行进入多选模式后显示，含「标记为同类型」和「取消」按钮
+        self.multi_select_toolbar = BoxLayout(
+            orientation='horizontal', size_hint_y=None, height=dp(0),
+            spacing=dp(8), padding=[dp(10), dp(6), dp(10), dp(6)],
+            opacity=0,
+        )
+        with self.multi_select_toolbar.canvas.before:
+            Color(*THEME['accent_dark'])
+            self._ms_tb_rect = RoundedRectangle(pos=self.multi_select_toolbar.pos,
+                                                size=self.multi_select_toolbar.size, radius=[0, 0, 10, 10])
+        self.multi_select_toolbar.bind(
+            pos=lambda i, v: setattr(self._ms_tb_rect, 'pos', v),
+            size=lambda i, v: setattr(self._ms_tb_rect, 'size', v))
+        ms_info = Label(text="多选模式：勾选行后点「标记为同类型」",
+                        font_size='13sp', color=(1, 1, 1, 1),
+                        size_hint_x=0.5, halign='left', valign='middle')
+        self.multi_select_toolbar.add_widget(ms_info)
+        ms_mark_btn = RoundedButton(text="标记为同类型", font_size='15sp',
+                                    size_hint_x=0.3,
+                                    background_color=THEME['accent'], background_normal='',
+                                    color=(1, 1, 1, 1), bold=True)
+        ms_mark_btn.bind(on_release=self._on_mark_batch_selected)
+        bind_press_animation(ms_mark_btn)
+        self.multi_select_toolbar.add_widget(ms_mark_btn)
+        ms_cancel_btn = RoundedButton(text="取消", font_size='15sp',
+                                      size_hint_x=0.2,
+                                      background_color=THEME['muted'], background_normal='',
+                                      color=(1, 1, 1, 1), bold=True)
+        ms_cancel_btn.bind(on_release=lambda inst: self._exit_multi_select())
+        bind_press_animation(ms_cancel_btn)
+        self.multi_select_toolbar.add_widget(ms_cancel_btn)
+        parent.add_widget(self.multi_select_toolbar)
 
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
         self.list_layout = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[dp(8), dp(6), dp(8), dp(6)])
@@ -4181,20 +4380,67 @@ class MainScreen(Screen):
         popup.open()
 
     def _show_msg(self, msg, color=None, toast=True):
-        """在日志区域追加一条消息，同时可选显示Toast。用于非相机状态提示。
-        v3.22.2: 同步写入 app_log 全量日志（开关开启时入文件），保证 UI 交互可追溯。"""
+        """v3.22.6: 改用 Popup 居中显示消息（替代写入不可见的 status_label）。
+        旧版本写入 status_label（opacity=0 且从未 add_widget），所有错误对用户不可见，
+        导致「查看已拍」按钮看似无反应。现改为弹窗，并保留 status_label 属性兼容。
+        同时同步写入 app_log 全量日志（开关开启时入文件），保证 UI 交互可追溯。"""
         ts = get_system_date().strftime('%H:%M:%S')
         line = f"[{ts}] {msg}"
         self.camera_mgr._log_lines.append(line)
         if len(self.camera_mgr._log_lines) > self.camera_mgr._max_log_lines:
             self.camera_mgr._log_lines = self.camera_mgr._log_lines[-self.camera_mgr._max_log_lines:]
-        log_text = '\n'.join(self.camera_mgr._log_lines[-12:])
-        self.status_label.text = log_text
-        self.status_label.color = color if color else THEME['text_dim']
+        # v3.22.6: 不再写入 status_label（其 opacity=0 且未加入布局，写入不可见）
+        # 仅保留属性以兼容旧代码引用，不再赋值
         # v3.22.2: 同步入全量 app 日志（开关开启时落盘）
         app_log.info('UI', msg)
         if toast and IS_ANDROID:
-            self.camera_mgr._toast(msg)
+            try:
+                self.camera_mgr._toast(msg)
+            except Exception:
+                pass
+        # v3.22.6: 弹出居中 Popup 显示消息
+        try:
+            self._show_msg_popup(msg, color)
+        except Exception as e:
+            app_log.error('UI', '_show_msg popup 异常: %s' % e)
+
+    def _show_msg_popup(self, msg, color=None):
+        """v3.22.6: 弹出一个居中 Popup 显示消息（替代不可见的 status_label）。
+        Popup 含消息文本 + 「知道了」按钮，背景色 THEME['card']（浅色主题）。"""
+        content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(14))
+        msg_color = color if color else THEME['text_dim']
+        msg_label = Label(
+            text=str(msg),
+            font_size='16sp',
+            color=msg_color,
+            halign='center', valign='middle',
+            size_hint_y=None, height=dp(60),
+        )
+        msg_label.bind(width=lambda s, w: setattr(s, 'text_size', (w, None)))
+        content.add_widget(msg_label)
+        ok_btn = RoundedButton(
+            text="知道了",
+            font_size='15sp',
+            size_hint_y=None, height=dp(44),
+            background_color=THEME['accent'],
+            background_normal='',
+            color=(1, 1, 1, 1), bold=True,
+        )
+        bind_press_animation(ok_btn)
+        content.add_widget(ok_btn)
+        popup = Popup(
+            title="提示",
+            title_color=THEME['text'],
+            title_size='16sp',
+            separator_color=THEME['card_border'],
+            content=content,
+            size_hint=(0.8, None),
+            height=dp(200),
+            auto_dismiss=True,
+            background=THEME['card'],
+        )
+        ok_btn.bind(on_release=popup.dismiss)
+        popup.open()
 
     def _load_excel_path(self, path, display_name=None, source_uri=None):
         if not path or not os.path.exists(path):
@@ -4368,6 +4614,11 @@ class MainScreen(Screen):
                 excel_row_index=i + 2,  # Excel行号（1=表头，2=第一行数据）
                 serial=serial,
             )
+            # v3.22.6: 绑定长按回调 — 已标记行弹出「取消标记」，未标记行进入多选模式
+            rw.on_long_press = self._on_row_long_press
+            # v3.22.6: 多选模式激活时，新创建的行也进入多选模式（如刷新列表后）
+            if self.multi_select_active:
+                rw.enter_multi_select_mode(selected=False)
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
         except Exception as e:
@@ -4898,6 +5149,98 @@ class MainScreen(Screen):
                 return rw
         return None
 
+    # ============================================================
+    # v3.22.6: 批量标记同类型 — 多选模式入口与操作
+    # ============================================================
+    def _get_all_row_widgets(self):
+        """v3.22.6: 返回当前列表中所有 RowWidget（搜索过滤后仅含匹配行）"""
+        return list(self.row_widgets)
+
+    def _on_row_long_press(self, row_index):
+        """v3.22.6: RowWidget 长按回调分发 — 已标记行弹出「取消标记」，否则进入多选模式"""
+        try:
+            if self.progress_mgr.is_batch_marked(row_index):
+                self._toggle_batch_mark(row_index)
+            else:
+                self._enter_multi_select(row_index)
+        except Exception as e:
+            app_log.error('UI', '长按回调异常 row=%d: %s' % (row_index, e))
+
+    def _enter_multi_select(self, row_index):
+        """v3.22.6: 进入多选模式 — 所有行显示 checkbox，触发行默认选中，显示工具栏"""
+        self.multi_select_active = True
+        for rw in self._get_all_row_widgets():
+            rw.enter_multi_select_mode(selected=(rw.row_index == row_index))
+        # 显示多选工具栏
+        if self.multi_select_toolbar:
+            self.multi_select_toolbar.opacity = 1
+            self.multi_select_toolbar.height = dp(50)
+            self.multi_select_toolbar.size_hint_y = None
+
+    def _exit_multi_select(self):
+        """v3.22.6: 退出多选模式 — 隐藏 checkbox 与工具栏"""
+        self.multi_select_active = False
+        for rw in self._get_all_row_widgets():
+            try:
+                rw.exit_multi_select_mode()
+            except Exception:
+                pass
+        if self.multi_select_toolbar:
+            self.multi_select_toolbar.opacity = 0
+            self.multi_select_toolbar.height = dp(0)
+            self.multi_select_toolbar.size_hint_y = None
+
+    def _on_mark_batch_selected(self, instance):
+        """v3.22.6: 标记选中行为同类型 — 持久化到 progress_mgr 并刷新列表"""
+        marked = 0
+        for rw in self._get_all_row_widgets():
+            if rw.is_selected():
+                self.progress_mgr.mark_batch(rw.row_index)
+                marked += 1
+        self._exit_multi_select()
+        if marked > 0:
+            self._show_msg("已标记 %d 行为同类型" % marked, THEME['success'], toast=False)
+            self._refresh_list()
+        else:
+            self._show_msg("未选中任何行", THEME['warning'], toast=False)
+
+    def _toggle_batch_mark(self, row_index):
+        """v3.22.6: 长按已标记行弹出「取消同类型标记」确认弹窗"""
+        content = BoxLayout(orientation='vertical', padding=dp(16), spacing=dp(10))
+        msg = Label(text="该行已标记为同类型，\n是否取消标记？",
+                    color=THEME['text'], font_size='15sp',
+                    size_hint_y=None, height=dp(60),
+                    halign='center', valign='middle')
+        msg.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        content.add_widget(msg)
+        btn_box = BoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(44))
+        yes_btn = RoundedButton(text="取消标记", font_size='15sp',
+                                background_color=THEME['danger'], background_normal='',
+                                color=(1, 1, 1, 1), bold=True)
+        no_btn = RoundedButton(text="关闭", font_size='15sp',
+                               background_color=THEME['muted'], background_normal='',
+                               color=(1, 1, 1, 1), bold=True)
+        btn_box.add_widget(yes_btn)
+        btn_box.add_widget(no_btn)
+        content.add_widget(btn_box)
+        popup = Popup(title="确认", content=content,
+                      size_hint=(0.8, None), height=dp(180),
+                      auto_dismiss=False, background=THEME['card'],
+                      title_color=THEME['text'], separator_color=THEME['card_border'])
+
+        def _do_unmark(_btn):
+            try:
+                self.progress_mgr.unmark_batch(row_index)
+            except Exception as e:
+                app_log.error('UI', '取消同类型标记失败 row=%d: %s' % (row_index, e))
+            popup.dismiss()
+            self._refresh_list()
+            self._show_msg("已取消同类型标记", THEME['success'], toast=False)
+
+        yes_btn.bind(on_release=_do_unmark)
+        no_btn.bind(on_release=popup.dismiss)
+        popup.open()
+
     def _refresh_row_done(self, row_index):
         rw = self._get_row_widget(row_index)
         if rw:
@@ -5091,22 +5434,32 @@ class MainScreen(Screen):
         popup.open()
 
     def _show_report_confirm(self, instance):
-        """v3.22.5: AI报表二次确认弹窗，展示外访进度"""
+        """v3.22.5: AI报表二次确认弹窗，展示外访进度。
+        v3.22.6: 修复 _collect_records 调用（应通过 report_generator），
+                 异常时不再静默 fallback 到 _generate_report，改为弹错误提示；
+                 进度文案含「同类型」统计（如有标记）。"""
         # 空数据检查（保留原有保护逻辑）
         if not self.rows or not any(r for r in self.rows if r and len(r) > 1 and r[1]):
             self._show_msg("请先打开Excel客户数据", THEME['warning'])
             return
 
         # 统计外访进度
+        # v3.22.6 修复: _collect_records 属于 ReportGenerator 类，MainScreen 没有此方法 →
+        # 旧代码 self._collect_records(...) 抛 AttributeError 被 except 捕获后 fallback
+        # 到 _generate_report，导致二次确认弹窗被跳过。改为通过 report_generator 调用。
         try:
-            records = self._collect_records(self.rows, self.progress_mgr)
+            records = self.report_generator._collect_records(self.rows, self.progress_mgr)
             total = len(records)
             visited_count = sum(1 for r in records if r.get('photo_count', 0) > 0)
             not_visited_count = total - visited_count
+            # v3.22.6: 统计同类型标记数（已标记且无照片的视为同类型未拍照）
+            batch_marked_count = len([r for r in records
+                                      if r.get('batch_marked', False)
+                                      and r.get('photo_count', 0) == 0])
         except Exception as e:
             app_log.error('REPORT', '统计外访进度异常: %s' % e)
-            # 异常时直接进入生成流程
-            self._generate_report(instance)
+            # v3.22.6: 不再静默 fallback 到 _generate_report，改为弹错误提示
+            self._show_msg("统计外访进度失败，请重试：%s" % str(e)[:60], THEME['danger'], toast=False)
             return
 
         # 构建确认弹窗
@@ -5122,8 +5475,13 @@ class MainScreen(Screen):
         content.add_widget(title_label)
 
         # 进度信息
-        msg = "今日外访进度 %d/%d，尚有%d户未完成，\n是否立即生成报告？" % (
-            visited_count, total, not_visited_count)
+        # v3.22.6: 如有同类型标记，进度文案含「另有S户标记为同类型」
+        if batch_marked_count > 0:
+            msg = "今日外访进度 %d/%d，\n另有%d户标记为同类型，\n是否立即生成报告？" % (
+                visited_count, total, batch_marked_count)
+        else:
+            msg = "今日外访进度 %d/%d，尚有%d户未完成，\n是否立即生成报告？" % (
+                visited_count, total, not_visited_count)
         info_label = Label(
             text=msg,
             font_size=dp(16),
@@ -5145,7 +5503,8 @@ class MainScreen(Screen):
         btn_cancel = RoundedButton(
             text="取消",
             size_hint_x=0.5,
-            background_color=THEME.get('border', (0.86, 0.88, 0.91, 1))
+            # v3.22.6 修复 THEME 键名: 'border' → 'card_border'
+            background_color=THEME.get('card_border', (0.86, 0.88, 0.91, 1))
         )
         btn_box.add_widget(btn_generate)
         btn_box.add_widget(btn_cancel)
@@ -5157,7 +5516,8 @@ class MainScreen(Screen):
             size_hint=(0.85, None),
             height=dp(280),
             auto_dismiss=False,  # 防止点外部关闭
-            separator_color=THEME.get('primary', (0.13, 0.59, 0.95, 1))
+            # v3.22.6 修复 THEME 键名: 'primary' → 'accent'
+            separator_color=THEME.get('accent', (0.13, 0.59, 0.95, 1))
         )
 
         # 绑定按钮事件
