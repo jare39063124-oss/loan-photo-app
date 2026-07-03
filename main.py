@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.8
+资产盘点专项拍照工具 App - v3.22.9
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -569,6 +569,14 @@ class AppLogger:
         self.log('WARN', tag, msg)
 
     def error(self, tag, msg):
+        """v3.22.9: ERROR 级别始终输出到 Kivy Logger（控制台），不受 _enabled 控制。
+        避免"日志关闭 + try/except 静默吞异常 = 完全无诊断线索"的死局。"""
+        # 始终输出到 Kivy Logger（logcat 可见），不受 _enabled 控制
+        try:
+            Logger.error(' [%s] %s' % (tag, msg))
+        except Exception:
+            pass  # Kivy Logger 不可用时静默（不应发生）
+        # 同时走正常 log 流程（受 _enabled 控制，决定是否写文件）
         self.log('ERROR', tag, msg)
 
     def get_log_text(self, max_chars=100000):
@@ -3096,7 +3104,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.8", font_size='12sp',
+            text="v3.22.9", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3187,19 +3195,41 @@ class PhotoTypePopup(Popup):
 
 
 # ============================================================
+# v3.22.9: 统一 Popup 浅色主题基类
+# ============================================================
+
+class ThemedPopup(Popup):
+    """v3.22.9: 统一 Popup 浅色主题基类。
+    自动绘制 THEME['card'] 浅色背景 + 设置 title_color/separator_color，
+    根治 v3.22.7 漏改 L5357 这类 background=THEME['card'] 遗漏问题。
+    子类只需继承，无需再写 canvas.before 背景绘制代码。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 统一绘制浅色背景
+        with self.canvas.before:
+            Color(*THEME['card'])
+            _bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
+                 size=lambda i, v: setattr(_bg, 'size', v))
+        # 统一标题颜色和分隔线颜色
+        self.title_color = THEME['accent_dark']
+        self.separator_color = THEME['card_border']
+
+
+# ============================================================
 # 照片查看弹窗
 # ============================================================
 
-class PhotoViewerPopup(Popup):
+class PhotoViewerPopup(ThemedPopup):
     """v3.22.0: 异步加载缩略图，避免大图同步解码导致"查看已拍"卡顿；
-    浅色背景白底深字，确保删除确认弹窗可读。"""
+    浅色背景白底深字，确保删除确认弹窗可读。
+    v3.22.9: 继承 ThemedPopup，背景与标题色由基类统一处理。"""
     _THUMB_DIR = None  # 缩略图缓存目录（惰性初始化）
 
     def __init__(self, row_index, photos, delete_callback, **kwargs):
         super().__init__(**kwargs)
         self.title = f"已拍照片 ({len(photos)}张)"
-        self.title_color = THEME['accent_dark']
-        self.separator_color = THEME['card_border']
         self.size_hint = (0.92, 0.8)
         self.row_index = row_index
         self.photos = photos
@@ -3207,12 +3237,7 @@ class PhotoViewerPopup(Popup):
         self._thumb_slots = []  # 每项图片占位 widget，索引对应 photos
 
         main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
-        # v3.22.0: 浅色背景白底
-        with main_layout.canvas.before:
-            Color(*THEME['card'])
-            _pv_bg = Rectangle(pos=main_layout.pos, size=main_layout.size)
-        main_layout.bind(pos=lambda i, v: setattr(_pv_bg, 'pos', v),
-                         size=lambda i, v: setattr(_pv_bg, 'size', v))
+        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
         scroll = ScrollView()
         list_layout = GridLayout(cols=1, spacing=dp(8), size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
@@ -3330,18 +3355,14 @@ class PhotoViewerPopup(Popup):
             app_log.error('PHOTO', '替换缩略图失败: %s' % e)
 
     def _confirm_delete(self, index):
-        """删除单张照片前弹出二次确认（v3.22.0: 白底深字可读）"""
+        """删除单张照片前弹出二次确认（v3.22.0: 白底深字可读）
+        v3.22.9: 改用 ThemedPopup，背景与标题色由基类统一处理。"""
         content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        with content.canvas.before:
-            Color(*THEME['card'])
-            _bg = Rectangle(pos=content.pos, size=content.size)
-        content.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
-                     size=lambda i, v: setattr(_bg, 'size', v))
+        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
         content.add_widget(Label(text=f"确定要删除这张照片吗？\n此操作不可撤销。",
                                  font_size='16sp', color=THEME['text'], halign='center'))
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        popup = Popup(title="确认删除", title_color=THEME['accent_dark'],
-                      separator_color=THEME['card_border'],
+        popup = ThemedPopup(title="确认删除",
                       size_hint=(0.8, 0.35), auto_dismiss=True)
         yes_btn = RoundedButton(text="确认删除", font_size='16sp', background_color=THEME['danger'],
                          background_normal='', color=(1,1,1,1), bold=True)
@@ -3360,18 +3381,14 @@ class PhotoViewerPopup(Popup):
         popup.open()
 
     def _confirm_delete_all(self, instance):
-        """删除全部照片前弹出二次确认（v3.22.0: 白底深字可读）"""
+        """删除全部照片前弹出二次确认（v3.22.0: 白底深字可读）
+        v3.22.9: 改用 ThemedPopup，背景与标题色由基类统一处理。"""
         content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        with content.canvas.before:
-            Color(*THEME['card'])
-            _bg = Rectangle(pos=content.pos, size=content.size)
-        content.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
-                     size=lambda i, v: setattr(_bg, 'size', v))
+        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
         content.add_widget(Label(text=f"确定要删除该客户的全部照片吗？\n此操作不可撤销！",
                                  font_size='16sp', color=THEME['danger'], halign='center'))
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        popup = Popup(title="危险操作确认", title_color=THEME['accent_dark'],
-                      separator_color=THEME['card_border'],
+        popup = ThemedPopup(title="危险操作确认",
                       size_hint=(0.85, 0.35), auto_dismiss=True)
         yes_btn = RoundedButton(text="全部删除", font_size='16sp', background_color=THEME['danger'],
                          background_normal='', color=(1,1,1,1), bold=True)
@@ -3845,7 +3862,7 @@ class RowWidget(BoxLayout):
             sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
             dx = abs(touch.x - sx)
             dy = abs(touch.y - sy)
-            if dx > dp(10) or dy > dp(10):
+            if dx > dp(15) or dy > dp(15):  # v3.22.9: 放宽阈值减少手指微动导致的长按误取消
                 self._long_press_timer.cancel()
                 self._long_press_timer = None
         return super().on_touch_move(touch)
@@ -4496,14 +4513,10 @@ class MainScreen(Screen):
         """v3.22.6: 弹出一个居中 Popup 显示消息（替代不可见的 status_label）。
         Popup 含消息文本 + 「知道了」按钮，背景色 THEME['card']（浅色主题）。
         v3.22.7: 修复 background=THEME['card'] 传颜色列表导致
-        'Popup.background accept only str' 异常 → 改用 content.canvas.before 绘制浅色背景。"""
+        'Popup.background accept only str' 异常 → 改用 content.canvas.before 绘制浅色背景。
+        v3.22.9: 改用 ThemedPopup，背景与标题色由基类统一处理，移除重复 canvas.before。"""
         content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(14))
-        # v3.22.7: 在 content 的 canvas.before 中绘制浅色背景（参照 PhotoViewerPopup 的做法）
-        with content.canvas.before:
-            Color(*THEME['card'])
-            _msg_bg = Rectangle(pos=content.pos, size=content.size)
-        content.bind(pos=lambda i, v: setattr(_msg_bg, 'pos', v),
-                     size=lambda i, v: setattr(_msg_bg, 'size', v))
+        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
         msg_color = color if color else THEME['text_dim']
         msg_label = Label(
             text=str(msg),
@@ -4524,11 +4537,9 @@ class MainScreen(Screen):
         )
         bind_press_animation(ok_btn)
         content.add_widget(ok_btn)
-        popup = Popup(
+        popup = ThemedPopup(
             title="提示",
-            title_color=THEME['accent_dark'],
             title_size='16sp',
-            separator_color=THEME['card_border'],
             content=content,
             size_hint=(0.8, None),
             height=dp(200),
@@ -4746,6 +4757,36 @@ class MainScreen(Screen):
         except Exception as e:
             app_log.error('UI', '创建行 widget 失败 行%d: %s' % (i, e))
             traceback.print_exc()
+            # v3.22.9: 不再静默吞异常，插入可见占位 widget 让用户看到失败
+            try:
+                placeholder = Button(
+                    text='行 %d 加载失败，点击重试' % (i + 1),
+                    font_size='14sp',
+                    size_hint_y=None,
+                    height=dp(56),
+                    background_color=THEME['highlight_bg'],
+                    color=THEME['danger'],
+                )
+                placeholder.bind(on_release=lambda btn: self._retry_create_row_widget(i, placeholder))
+                self.list_layout.add_widget(placeholder)
+            except Exception as e2:
+                app_log.error('UI', '插入占位 widget 也失败 行%d: %s' % (i, e2))
+
+    def _retry_create_row_widget(self, row_index, placeholder):
+        """v3.22.9: 重试创建失败的行 widget"""
+        try:
+            # 移除占位 widget
+            self.list_layout.remove_widget(placeholder)
+            # 重新尝试创建
+            self._create_row_widget(row_index)
+            app_log.info('UI', '行 %d 重试创建成功' % row_index)
+        except Exception as e:
+            app_log.error('UI', '行 %d 重试创建仍失败: %s' % (row_index, e))
+            # 重新插入占位 widget
+            try:
+                self.list_layout.add_widget(placeholder)
+            except Exception:
+                pass
 
     def _update_progress(self):
         total = len(self.rows)
@@ -5291,12 +5332,20 @@ class MainScreen(Screen):
                 self._enter_multi_select(row_index)
         except Exception as e:
             app_log.error('UI', '长按回调异常 row=%d: %s' % (row_index, e))
+            # v3.22.9: 不再静默吞异常，弹出可见错误提示
+            try:
+                self._show_msg_popup('长按操作失败：%s' % e, color=THEME['danger'])
+            except Exception as e2:
+                app_log.error('UI', '弹出错误提示也失败: %s' % e2)
 
     def _enter_multi_select(self, row_index):
         """v3.22.6: 进入多选模式 — 所有行显示 checkbox，触发行默认选中，显示工具栏
-        v3.22.7: 增加日志便于运行时定位。"""
+        v3.22.7: 增加日志便于运行时定位。
+        v3.22.9: 增加 Android 原生 toast 反馈。"""
         # v3.22.7: 记录进入多选模式事件
         app_log.info('UI', '进入多选模式，选中行=%d' % row_index)
+        # v3.22.9: 弹 Android 原生 toast，让用户明显感知多选模式已激活
+        self._show_android_toast('已进入多选模式')
         self.multi_select_active = True
         for rw in self._get_all_row_widgets():
             rw.enter_multi_select_mode(selected=(rw.row_index == row_index))
@@ -5305,6 +5354,17 @@ class MainScreen(Screen):
             self.multi_select_toolbar.opacity = 1
             self.multi_select_toolbar.height = dp(50)
             self.multi_select_toolbar.size_hint_y = None
+
+    def _show_android_toast(self, message):
+        """v3.22.9: 弹 Android 原生 toast（通过 pyjnius）"""
+        try:
+            from jnius import autoclass
+            Toast = autoclass('android.widget.Toast')
+            PythonActivity = autoclass('org.kivy.android.PythonActivity')
+            Toast.makeText(PythonActivity.mActivity, message, Toast.LENGTH_SHORT).show()
+        except Exception as e:
+            # 非 Android 环境或 jnius 不可用时静默 fallback 到日志
+            app_log.info('UI', 'toast 调用失败（非 Android 环境？）: %s' % e)
 
     def _exit_multi_select(self):
         """v3.22.6: 退出多选模式 — 隐藏 checkbox 与工具栏"""
@@ -5352,10 +5412,9 @@ class MainScreen(Screen):
         btn_box.add_widget(yes_btn)
         btn_box.add_widget(no_btn)
         content.add_widget(btn_box)
-        popup = Popup(title="确认", content=content,
+        popup = ThemedPopup(title="确认", content=content,
                       size_hint=(0.8, None), height=dp(180),
-                      auto_dismiss=False, background=THEME['card'],
-                      title_color=THEME['text'], separator_color=THEME['card_border'])
+                      auto_dismiss=False)
 
         def _do_unmark(_btn):
             try:
@@ -5796,6 +5855,8 @@ class AIScreen(Screen):
         self.chat_history = []  # [{"role":"user/assistant","text":"..."}]
         self._sending = False
         self._build_ui()
+        # v3.22.9: 监听键盘高度变化，给 input_row 加 bottom padding 防止遮挡
+        Window.bind(on_keyboard_height=self._on_keyboard_height)
 
     def _build_ui(self):
         from kivy.uix.scrollview import ScrollView
@@ -5854,15 +5915,16 @@ class AIScreen(Screen):
         self.chat_scroll = scroll
 
         # 输入栏
-        input_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
+        # v3.22.9: 改为实例属性 self.input_row，供 _on_keyboard_height 调整 padding
+        self.input_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(6))
         self.input_field = TextInput(
             font_size='15sp', multiline=False,
             size_hint_x=0.78, hint_text="输入问题...",
         )
         self.input_field.bind(on_text_validate=self._on_send)
-        # v3.22.7: 绑定 focus 事件，键盘弹出时切换 softinput_mode 防止遮挡
+        # v3.22.7: 绑定 focus 事件；v3.22.9: 焦点回调仅保留占位，键盘适配改由 _on_keyboard_height 处理
         self.input_field.bind(focus=self._on_input_focus)
-        input_row.add_widget(self.input_field)
+        self.input_row.add_widget(self.input_field)
 
         send_btn = RoundedButton(
             text="发送", font_size='16sp', bold=True,
@@ -5871,8 +5933,8 @@ class AIScreen(Screen):
             color=(1, 1, 1, 1),
         )
         send_btn.bind(on_release=self._on_send)
-        input_row.add_widget(send_btn)
-        layout.add_widget(input_row)
+        self.input_row.add_widget(send_btn)
+        layout.add_widget(self.input_row)
 
         self.add_widget(layout)
 
@@ -5880,20 +5942,42 @@ class AIScreen(Screen):
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
 
     def _on_input_focus(self, instance, value):
-        """v3.22.7: 输入框获得/失去焦点时调整键盘模式。
-        获得焦点时切换到 pan 模式（部分机型 resize 不生效，pan 可确保输入框不被遮挡）；
-        失去焦点时恢复 resize 模式。同时延迟滚动聊天记录到底部，确保最新消息可见。"""
+        """v3.22.9: 输入框焦点变化回调。
+        键盘遮挡改由 _on_keyboard_height 处理（监听 Window.on_keyboard_height），
+        此方法仅保留占位（滚动由 _on_keyboard_height 触发）。"""
         try:
             if value:
-                # 获得焦点：切换到 pan 模式，确保输入框不被遮挡
-                Window.softinput_mode = 'pan'
-                # 延迟滚动到底部（等待键盘弹出后，scroll_y=0 表示底部）
-                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.3)
-            else:
-                # 失去焦点：恢复 resize 模式
-                Window.softinput_mode = 'resize'
+                # 获得焦点：滚动逻辑改由 _on_keyboard_height 触发，这里不做软键盘 mode 切换
+                pass
+            # 失去焦点：padding 恢复由 _on_keyboard_height(height=0) 处理
         except Exception as e:
             app_log.error('AI', '_on_input_focus 异常: %s' % e)
+
+    def _on_keyboard_height(self, instance, height):
+        """v3.22.9: 键盘高度变化时调整 input_row 的 bottom padding。
+        这是 Kivy Android 社区公认最稳的键盘适配方案，
+        替代 v3.22.7 的 softinput_mode 动态切换（时机太晚无效）。"""
+        try:
+            if height > 0:
+                # 键盘弹出：input_row 加 bottom padding = 键盘高度，把输入框顶到键盘上方
+                self.input_row.padding = [0, 0, 0, height]
+                # 延迟滚动聊天记录到底部（等键盘完全弹出）
+                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.1)
+            else:
+                # 键盘收起：恢复 padding
+                self.input_row.padding = [0, 0, 0, 0]
+        except Exception as e:
+            app_log.error('AI', '_on_keyboard_height 异常: %s' % e)
+
+    def on_leave(self):
+        """v3.22.9: 离开 AI 界面时解绑键盘高度监听，避免内存泄漏"""
+        try:
+            Window.unbind(on_keyboard_height=self._on_keyboard_height)
+            # 离开时收起键盘
+            if self.input_field:
+                self.input_field.focus = False
+        except Exception as e:
+            app_log.error('AI', 'on_leave 解绑异常: %s' % e)
 
     def _add_message(self, role, text):
         """添加一条消息到聊天区"""
