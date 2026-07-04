@@ -2,7 +2,7 @@ $repo = "jare39063124-oss/loan-photo-app"
 $apiBase = "https://api.github.com/repos/$repo"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $projectDir = "D:\hermes\loan_photo_app"
-$finalApkName = "loan-photo-tool-v3.22.16.apk"
+$finalApkName = "loan-photo-tool-v3.22.17.apk"
 $destPath = Join-Path $desktop $finalApkName
 
 Write-Host "=== Step 1: Git Push (retry every 60s) ===" -ForegroundColor Cyan
@@ -114,7 +114,7 @@ if ($apks.Count -gt 0) {
     $finalSize = [math]::Round((Get-Item $destPath).Length / 1MB, 2)
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host "  v3.22.16 APK READY!" -ForegroundColor Green
+    Write-Host "  v3.22.17 APK READY!" -ForegroundColor Green
     Write-Host "  File: $finalApkName"
     Write-Host "  Size: ${finalSize} MB"
     Write-Host "  Path: $destPath"

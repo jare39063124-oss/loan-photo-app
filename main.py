@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.16
+资产盘点专项拍照工具 App - v3.22.17
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -3170,7 +3170,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.16", font_size='12sp',
+            text="v3.22.17", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3272,7 +3272,7 @@ class ThemedPopup(Popup):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # v3.22.16: 禁用 Kivy Popup 默认的 atlas 背景图像，避免在某些机型上加载失败导致 popup 不可见
+        # v3.22.17: 禁用 Kivy Popup 默认的 atlas 背景图像，避免在某些机型上加载失败导致 popup 不可见
         self.background = ''
         # 统一绘制浅色背景
         with self.canvas.before:
@@ -3405,6 +3405,7 @@ class PhotoViewerPopup(ThemedPopup):
     def __init__(self, row_index, photos, delete_callback, **kwargs):
         super().__init__(**kwargs)
         self.title = f"已拍照片 ({len(photos)}张)"
+        self.auto_dismiss = False  # v3.22.17: 防止被打开它的同一触摸事件立即关闭
         self.size_hint = (None, None)
         self.size = (int(Window.width * 0.92), int(Window.height * 0.8))
         self.center = (Window.width / 2, Window.height / 2)
@@ -3456,13 +3457,13 @@ class PhotoViewerPopup(ThemedPopup):
         del_all_btn = RoundedButton(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
-        del_all_btn.bind(on_release=self._confirm_delete_all)
+        del_all_btn.bind(on_press=self._confirm_delete_all)
         main_layout.add_widget(del_all_btn)
 
         close_btn = RoundedButton(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
                           background_color=THEME['accent'], background_normal='',
                           color=(1,1,1,1), bold=True)
-        close_btn.bind(on_release=self.dismiss)
+        close_btn.bind(on_press=self.dismiss)
         main_layout.add_widget(close_btn)
         self.content = main_layout
 
@@ -4977,7 +4978,7 @@ class MainScreen(Screen):
         try:
             if self.camera_mgr._debug_log_path and os.path.exists(self.camera_mgr._debug_log_path):
                 os.remove(self.camera_mgr._debug_log_path)
-        except:
+        except OSError:
             pass
         app_log.clear()  # v3.20.0: 同时清空全量 app 日志
         self.status_label.text = ""
@@ -5305,7 +5306,7 @@ class MainScreen(Screen):
             sv = self.status_label.parent
             if isinstance(sv, ScrollView):
                 sv.scroll_y = 0
-        except:
+        except Exception:
             pass
 
     def _launch_next_photo(self, ctx=None):
@@ -5390,13 +5391,13 @@ class MainScreen(Screen):
                             _shutil.copy2(photo_path, new_path)
                             try:
                                 os.remove(photo_path)
-                            except:
+                            except OSError:
                                 pass
                     # 兜底：确保 capture_xxx 临时文件被清理
                     try:
                         if photo_path != new_path and os.path.exists(photo_path):
                             os.remove(photo_path)
-                    except:
+                    except OSError:
                         pass
 
                 # v3.22.4: 始终保留 APP_DIR 副本，progress_mgr 记录 APP_DIR 路径。
@@ -5497,14 +5498,14 @@ class MainScreen(Screen):
             if not photos:
                 self._show_msg('该客户暂无照片（或照片文件已被系统清理）')
                 return
-            # v3.22.16: 直接创建 PhotoViewerPopup 并 open()（显式设置像素尺寸，无需 Clock.schedule_once 延迟）
+            # v3.22.17: 直接创建 PhotoViewerPopup 并 open()（显式设置像素尺寸，无需 Clock.schedule_once 延迟）
             try:
                 app_log.info('PHOTO', '创建 PhotoViewerPopup: photos=%d' % len(photos))
                 popup = PhotoViewerPopup(row_index=row_index, photos=photos,
                                          delete_callback=self._on_delete_photo)
                 popup.open()
                 app_log.info('PHOTO', 'PhotoViewerPopup.open() 已调用')
-                # v3.22.16: 延迟 0.2 秒记录 popup 状态诊断日志
+                # v3.22.17: 延迟 0.2 秒记录 popup 状态诊断日志
                 Clock.schedule_once(lambda dt: self._log_popup_status(popup), 0.2)
             except Exception as e:
                 app_log.error('UI', '创建/打开 PhotoViewerPopup 异常 row=%d: %s' % (row_index, e), exc_info=True)
@@ -5521,7 +5522,7 @@ class MainScreen(Screen):
                 app_log.error('UI', '_show_msg 反馈也失败: %s' % e2)
 
     def _log_popup_status(self, popup):
-        """v3.22.16: 记录 popup 状态诊断日志，排查 popup 不可见问题"""
+        """v3.22.17: 记录 popup 状态诊断日志，排查 popup 不可见问题"""
         try:
             app_log.info('PHOTO', 'popup 状态: pos=%s size=%s opacity=%s parent=%s' % (
                 popup.pos, popup.size, popup.opacity, popup.parent))
@@ -5937,7 +5938,7 @@ class MainScreen(Screen):
             def _done(dt):
                 try:
                     popup.dismiss()
-                except:
+                except Exception:
                     pass
                 # 恢复按钮状态
                 try:
@@ -6330,7 +6331,7 @@ class LoanPhotoApp(App):
                                      size_hint=(0.5, 0.15), auto_dismiss=True)
                         popup.open()
                         Clock.schedule_once(lambda dt: popup.dismiss(), 1.5)
-                    except:
+                    except Exception:
                         pass
                 return True
         return False
@@ -6376,7 +6377,7 @@ class LoanPhotoApp(App):
                          Permission.ACCESS_COARSE_LOCATION,
                          Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
             request_permissions(perms)
-        except:
+        except Exception:
             pass
 
     def on_pause(self):
