@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.11
+资产盘点专项拍照工具 App - v3.22.12
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1693,7 +1693,9 @@ class PhotoProcessor:
             if not lines:
                 return
 
-            img = PILImage.open(photo_path)
+            # v3.22.12: 用 with 管理文件句柄；convert 返回新 Image 对象，不依赖原文件句柄
+            with PILImage.open(photo_path) as src_img:
+                img = src_img.convert('RGBA')
             draw = ImageDraw.Draw(img)
 
             font_size_key = config.get('watermark_font_size', '中')
@@ -3106,7 +3108,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.11", font_size='12sp',
+            text="v3.22.12", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3240,30 +3242,35 @@ class PhotoViewerPopup(ThemedPopup):
         main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
         # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
         scroll = ScrollView()
-        list_layout = GridLayout(cols=1, spacing=dp(8), size_hint_y=None)
+        list_layout = GridLayout(cols=3, spacing=dp(6), size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
 
         for i, photo_path in enumerate(photos):
-            item = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(130), spacing=dp(8))
+            # v3.22.12: 改为垂直布局（缩略图+文件名+删除按钮），3 列网格
+            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(150), spacing=dp(2))
             # v3.22.0: 占位 Label，异步加载缩略图后替换
-            placeholder = Label(text="加载中…", font_size='13sp', color=THEME['text_dim'],
-                                size_hint_x=0.38, halign='center', valign='middle')
+            placeholder = Label(text="加载中…", font_size='11sp', color=THEME['text_dim'],
+                                size_hint_y=0.65, halign='center', valign='middle')
             item.add_widget(placeholder)
             self._thumb_slots.append(placeholder)
 
-            info_box = BoxLayout(orientation='vertical', spacing=dp(6), size_hint_x=0.62)
-            name_label = Label(text=os.path.basename(photo_path), font_size='14sp',
-                                      halign='left', valign='top', size_hint_y=0.5,
-                                      color=THEME['text'],
+            # v3.22.12: 文件名（短截断，居中）
+            fname = os.path.basename(photo_path)
+            if len(fname) > 16:
+                fname = fname[:13] + '...'
+            name_label = Label(text=fname, font_size='10sp',
+                                      halign='center', valign='middle', size_hint_y=0.15,
+                                      color=THEME['text_dim'],
                                       text_size=(0, None))
             name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
-            info_box.add_widget(name_label)
-            del_btn = RoundedButton(text="删除此照片", font_size='14sp', size_hint_y=0.5, height=dp(48),
+            item.add_widget(name_label)
+
+            # v3.22.12: 删除按钮（小尺寸）
+            del_btn = RoundedButton(text="删除", font_size='11sp', size_hint_y=0.20, height=dp(32),
                             background_color=THEME['danger'], background_normal='',
                             color=(1,1,1,1), bold=True)
-            del_btn.bind(on_release=lambda x, idx=i: self._confirm_delete(idx))
-            info_box.add_widget(del_btn)
-            item.add_widget(info_box)
+            del_btn.bind(on_press=lambda x, idx=i: self._confirm_delete(idx))
+            item.add_widget(del_btn)
             list_layout.add_widget(item)
 
         scroll.add_widget(list_layout)
@@ -3307,9 +3314,10 @@ class PhotoViewerPopup(ThemedPopup):
             thumb_path = os.path.join(self._get_thumb_dir(), thumb_name)
             if os.path.exists(thumb_path):
                 return thumb_path
-            img = PILImage.open(photo_path)
-            img.thumbnail((240, 240))
-            img.save(thumb_path, 'PNG')
+            # v3.22.12: 用 with 管理文件句柄，thumbnail/save 后自动关闭
+            with PILImage.open(photo_path) as img:
+                img.thumbnail((240, 240))
+                img.save(thumb_path, 'PNG')
             return thumb_path
         except Exception as e:
             app_log.error('PHOTO', '生成缩略图失败: %s' % e)
@@ -3348,7 +3356,7 @@ class PhotoViewerPopup(ThemedPopup):
             parent_item = slot.parent
             pos_in_parent = parent_item.children.index(slot) if slot in parent_item.children else 0
             parent_item.remove_widget(slot)
-            img = KivyImage(source=thumb_path, size_hint_x=0.38,
+            img = KivyImage(source=thumb_path, size_hint_y=0.65,
                            allow_stretch=True, keep_ratio=True)
             parent_item.add_widget(img, index=pos_in_parent)
             self._thumb_slots[idx] = img
@@ -3474,7 +3482,7 @@ class SettingsScreen(Screen):
         save_naming_btn = RoundedButton(text="保存命名规则", font_size='16sp', size_hint_y=None, height=dp(52),
                                 background_color=THEME['accent'], background_normal='',
                                 color=(1,1,1,1), bold=True)
-        save_naming_btn.bind(on_release=self._save_naming)
+        save_naming_btn.bind(on_press=self._save_naming)
         naming_card.add_widget(save_naming_btn)
 
         content.add_widget(naming_card)
@@ -3544,7 +3552,7 @@ class SettingsScreen(Screen):
         save_wm_btn = RoundedButton(text="保存水印设置", font_size='16sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['accent'], background_normal='',
                             color=(1,1,1,1), bold=True)
-        save_wm_btn.bind(on_release=self._save_watermark)
+        save_wm_btn.bind(on_press=self._save_watermark)
         watermark_card.add_widget(save_wm_btn)
 
         content.add_widget(watermark_card)
@@ -3597,7 +3605,7 @@ class SettingsScreen(Screen):
         save_ai_btn = RoundedButton(text="保存AI设置", font_size='16sp', size_hint_y=None, height=dp(52),
                             background_color=THEME['success'], background_normal='',
                             color=(1,1,1,1), bold=True)
-        save_ai_btn.bind(on_release=self._save_ai_settings)
+        save_ai_btn.bind(on_press=self._save_ai_settings)
         ai_card.add_widget(save_ai_btn)
 
         content.add_widget(ai_card)
@@ -3773,7 +3781,8 @@ class RowWidget(BoxLayout):
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
-        self.photo_btn.bind(on_release=self._on_photo)
+        # v3.22.12: 改用 on_press — 与 view_btn 同 bug 模式（ScrollView 消费 touch_up）
+        self.photo_btn.bind(on_press=self._on_photo)
         bind_press_animation(self.photo_btn)
         btn_row.add_widget(self.photo_btn)
 
@@ -3784,7 +3793,8 @@ class RowWidget(BoxLayout):
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
-        self.view_btn.bind(on_release=self._on_view_photos)
+        # v3.22.12: 改用 on_press — on_release 依赖 touch_up 被 ScrollView 消费导致不触发；on_press 在 on_touch_down 触发不受影响
+        self.view_btn.bind(on_press=self._on_view_photos)
         bind_press_animation(self.view_btn)
         btn_row.add_widget(self.view_btn)
 
@@ -3796,7 +3806,8 @@ class RowWidget(BoxLayout):
             background_normal='',
             color=(1, 1, 1, 1), bold=True,
         )
-        self.remark_btn.bind(on_release=self._on_remark)
+        # v3.22.12: 改用 on_press — 与 view_btn 同 bug 模式（ScrollView 消费 touch_up）
+        self.remark_btn.bind(on_press=self._on_remark)
         bind_press_animation(self.remark_btn)
         btn_row.add_widget(self.remark_btn)
 
@@ -3817,6 +3828,18 @@ class RowWidget(BoxLayout):
 
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
+        # v3.22.12: widget 从父容器移除时清理长按定时器，防止内存泄漏
+        self.bind(parent=lambda inst, parent: inst._cleanup() if parent is None else None)
+
+    def _cleanup(self):
+        """v3.22.12: widget 销毁时清理长按定时器，防止内存泄漏和误触"""
+        if self._long_press_timer:
+            try:
+                self._long_press_timer.cancel()
+            except Exception:
+                pass
+            self._long_press_timer = None
+        self._long_press_touch = None
 
     # ============================================================
     # v3.22.6: 多选模式 UI 控制
@@ -3877,9 +3900,16 @@ class RowWidget(BoxLayout):
 
     def _trigger_long_press(self, touch):
         """v3.22.6: 长按回调触发（touch 仍在行内）
-        v3.22.7: 增加日志便于运行时定位；on_long_press 为 None 时记录警告。"""
+        v3.22.7: 增加日志便于运行时定位；on_long_press 为 None 时记录警告。
+        v3.22.12: 移除 collide_point 检查（ScrollView 滚动后 RowWidget 窗口坐标变化导致失败），
+                  改用 touch 移动距离判断用户是否在滚动（>dp(15) 视为滚动，不触发长按）。"""
         self._long_press_timer = None
-        if not self.collide_point(*touch.pos):
+        # v3.22.12: 检查 touch 移动距离（替代 collide_point）
+        sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
+        dx = abs(touch.x - sx)
+        dy = abs(touch.y - sy)
+        if dx > dp(15) or dy > dp(15):
+            # 用户在滚动列表，取消长按
             return
         # v3.22.7: 记录长按触发事件（便于运行时定位）
         app_log.info('UI', '长按触发 row=%d' % self.row_index)
@@ -4243,7 +4273,7 @@ class MainScreen(Screen):
                     color=THEME['accent_dark'],
                     background_normal='',
                 )
-                btn.bind(on_release=lambda inst, u=uri: self._open_recent_excel(u))
+                btn.bind(on_press=lambda inst, u=uri: self._open_recent_excel(u))
                 bind_press_animation(btn)
                 self.list_layout.add_widget(btn)
 
@@ -4769,7 +4799,7 @@ class MainScreen(Screen):
                     background_color=THEME['highlight_bg'],
                     color=THEME['danger'],
                 )
-                placeholder.bind(on_release=lambda btn: self._retry_create_row_widget(i, placeholder))
+                placeholder.bind(on_press=lambda btn: self._retry_create_row_widget(i, placeholder))
                 self.list_layout.add_widget(placeholder)
             except Exception as e2:
                 app_log.error('UI', '插入占位 widget 也失败 行%d: %s' % (i, e2))
