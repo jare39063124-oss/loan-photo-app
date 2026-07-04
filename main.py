@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.9
+资产盘点专项拍照工具 App - v3.22.10
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -390,6 +390,8 @@ class RoundedButton(ButtonBehavior, Label):
 
         # 调用 Label.__init__（ButtonBehavior 无 __init__）
         super().__init__(**kwargs)
+
+        self.always_release = True  # v3.22.10: 触摸屏手指微动移出按钮时 on_release 仍触发（Kivy 官方推荐）
 
         # v3.22.4: radius 默认 dp(16)，倒角更明显
         if radius is None:
@@ -3104,7 +3106,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.9", font_size='12sp',
+            text="v3.22.10", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3215,6 +3217,71 @@ class ThemedPopup(Popup):
         # 统一标题颜色和分隔线颜色
         self.title_color = THEME['accent_dark']
         self.separator_color = THEME['card_border']
+
+
+# ============================================================
+# v3.22.10: 运行时调试覆盖层（DebugOverlay）
+# ============================================================
+
+class DebugOverlay(FloatLayout):
+    """v3.22.10: 运行时调试覆盖层。用户报告"按钮没反应"时，开启此覆盖层即可看到 touch down/up 坐标、目标 widget、softinput_mode、键盘高度。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.size_hint = (None, None)
+        self.size = (dp(220), dp(120))
+        self.pos_hint = {'top': 1, 'right': 1}
+        self._visible = False
+
+        with self.canvas.before:
+            Color(0, 0, 0, 0.7)
+            self._bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._update_bg, size=self._update_bg)
+
+        self._label = Label(
+            text='DebugOverlay (待开启)',
+            font_size='10sp',
+            color=(1, 1, 1, 1),
+            size_hint=(1, 1),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            halign='left',
+            valign='top',
+        )
+        self._label.bind(size=lambda i, v: setattr(self._label, 'text_size', v))
+        self.add_widget(self._label)
+        self.set_visible(False)
+
+    def _update_bg(self, *args):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+
+    def update_info(self, **kwargs):
+        """更新覆盖层显示信息。kwargs 可包含: touch_down, touch_up, target, row_count, softinput_mode, keyboard_height, released"""
+        if not self._visible:
+            return
+        text_parts = ['[DebugOverlay v3.22.10]']
+        if 'touch_down' in kwargs:
+            td = kwargs['touch_down']
+            text_parts.append('touch_down: (%.0f, %.0f)' % (td[0], td[1]))
+        if 'target' in kwargs:
+            text_parts.append('target: %s' % str(kwargs['target'])[:40])
+        if 'touch_up' in kwargs:
+            tu = kwargs['touch_up']
+            text_parts.append('touch_up: (%.0f, %.0f)' % (tu[0], tu[1]))
+        if 'released' in kwargs:
+            text_parts.append('on_release: %s' % ('FIRED' if kwargs['released'] else 'NO RELEASE'))
+        if 'row_count' in kwargs:
+            text_parts.append('rows: %d' % kwargs['row_count'])
+        if 'softinput_mode' in kwargs:
+            text_parts.append('softinput: %s' % kwargs['softinput_mode'])
+        if 'keyboard_height' in kwargs:
+            text_parts.append('kb_height: %d' % kwargs['keyboard_height'])
+        self._label.text = '\n'.join(text_parts)
+
+    def set_visible(self, visible):
+        self._visible = bool(visible)
+        self.opacity = 1 if self._visible else 0
+        self.disabled = not self._visible
 
 
 # ============================================================
@@ -3853,21 +3920,26 @@ class RowWidget(BoxLayout):
             self._long_press_touch = touch
             self._long_press_start_pos = (touch.x, touch.y)
             self._long_press_timer = Clock.schedule_once(
-                lambda dt: self._trigger_long_press(touch), 0.8)
+                lambda dt: self._trigger_long_press(touch), 1.2)  # v3.22.10: 0.8s→1.2s，给中老年用户更充裕的点击时间
+            touch.grab(self)  # v3.22.10: grab 锁定 touch，防止 ScrollView 消费后续 move/up 事件
         return super().on_touch_down(touch)
 
     def on_touch_move(self, touch):
-        # 移动超过阈值则取消长按（避免误触发）
-        if self._long_press_timer and self._long_press_touch is touch:
-            sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
-            dx = abs(touch.x - sx)
-            dy = abs(touch.y - sy)
-            if dx > dp(15) or dy > dp(15):  # v3.22.9: 放宽阈值减少手指微动导致的长按误取消
-                self._long_press_timer.cancel()
-                self._long_press_timer = None
+        # v3.22.10: 只有 grab 锁定的是自己才处理（防止其他 widget 的 touch 误取消长按）
+        if touch.grab_current is self:
+            # 移动超过阈值则取消长按（避免误触发）
+            if self._long_press_timer and self._long_press_touch is touch:
+                sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
+                dx = abs(touch.x - sx)
+                dy = abs(touch.y - sy)
+                if dx > dp(15) or dy > dp(15):  # v3.22.9: 放宽阈值减少手指微动导致的长按误取消
+                    self._long_press_timer.cancel()
+                    self._long_press_timer = None
         return super().on_touch_move(touch)
 
     def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)  # v3.22.10: 释放 grab 锁定
         if self._long_press_timer:
             self._long_press_timer.cancel()
             self._long_press_timer = None
@@ -4059,6 +4131,37 @@ class MainScreen(Screen):
         main = BoxLayout(orientation='vertical')
         self._build_ui(main)
         self.add_widget(main)
+
+        # v3.22.10: 运行时调试覆盖层
+        self.debug_overlay = DebugOverlay()
+        self.add_widget(self.debug_overlay)
+
+    def on_touch_down(self, touch):
+        # v3.22.10: DebugOverlay 开启时记录触摸坐标与目标 widget，便于诊断"按钮没反应"
+        try:
+            if self.debug_overlay._visible:
+                target = None
+                for w in self.walk():
+                    if hasattr(w, 'collide_point') and w.collide_point(*touch.pos):
+                        target = w.__class__.__name__
+                        break
+                self.debug_overlay.update_info(
+                    touch_down=touch.pos, target=target,
+                    row_count=len(getattr(self, 'row_widgets', [])),
+                    softinput_mode=Window.softinput_mode,
+                )
+        except Exception as e:
+            app_log.error('UI', 'DebugOverlay on_touch_down 异常: %s' % e)
+        return super().on_touch_down(touch)
+
+    def on_touch_up(self, touch):
+        # v3.22.10: DebugOverlay 开启时记录触摸抬起坐标
+        try:
+            if self.debug_overlay._visible:
+                self.debug_overlay.update_info(touch_up=touch.pos)
+        except Exception as e:
+            app_log.error('UI', 'DebugOverlay on_touch_up 异常: %s' % e)
+        return super().on_touch_up(touch)
 
     def _build_ui(self, parent):
         parent.add_widget(Label(size_hint_y=None, height=dp(get_status_bar_height_dp())))
@@ -4909,6 +5012,18 @@ class MainScreen(Screen):
         btn_grid.add_widget(row2)
         content.add_widget(btn_grid)
 
+        # v3.22.10: 调试覆盖层开关（与日志管理同放，便于诊断"按钮没反应"时一并开启）
+        debug_box = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        debug_box.add_widget(Label(text="开启调试覆盖层（v3.22.10 诊断用）",
+                                   font_size='14sp', color=THEME['text'], size_hint_x=0.7,
+                                   halign='left', valign='middle'))
+        debug_box.add_widget(Label(size_hint_x=None, width=dp(4)))  # 占位间距
+        self._debug_check = CheckBox(active=bool(getattr(self, 'debug_overlay', None) and self.debug_overlay._visible),
+                                     size_hint_x=0.3)
+        self._debug_check.bind(active=lambda i, v: self.debug_overlay.set_visible(v))
+        debug_box.add_widget(self._debug_check)
+        content.add_widget(debug_box)
+
         # 关闭按钮
         close_btn = RoundedButton(text="关闭", font_size='15sp',
             background_color=THEME['muted'], background_normal='',
@@ -5442,7 +5557,7 @@ class MainScreen(Screen):
         rw = self._get_row_widget(row_index)
         if rw is None:
             app_log.error('UI', '查看已拍失败: 未找到 row_index=%d 的 widget' % row_index)
-            self._show_msg("无法打开此客户的照片（行数据丢失）", THEME['danger'])
+            self._show_msg_popup("无法打开此客户的照片（行数据丢失）", color=THEME['danger'])  # v3.22.10: 改用 Popup（替代不可见的 status_label）
             return
         try:
             key = rw.progress_key
@@ -5450,7 +5565,7 @@ class MainScreen(Screen):
             app_log.info('PHOTO', '查看已拍: 客户=%s, key=%s, 照片数=%d' % (
                 rw.borrower, key[:8], len(photos)))
             if not photos:
-                self._show_msg("该客户暂无照片（或照片文件已被系统清理）", THEME['warning'])
+                self._show_msg_popup("该客户暂无照片（或照片文件已被系统清理）", color=THEME['warning'])  # v3.22.10: 改用 Popup
                 return
             popup = PhotoViewerPopup(row_index=row_index, photos=photos,
                                      delete_callback=self._on_delete_photo)
@@ -5458,7 +5573,7 @@ class MainScreen(Screen):
         except Exception as e:
             app_log.error('UI', '查看已拍异常 row=%d: %s' % (row_index, e))
             traceback.print_exc()
-            self._show_msg("打开照片列表失败: %s" % str(e)[:40], THEME['danger'])
+            self._show_msg_popup("打开照片列表失败: %s" % str(e)[:40], color=THEME['danger'])  # v3.22.10: 改用 Popup
 
     def _on_delete_photo(self, row_index, photo_index):
         if row_index >= len(self.rows):
@@ -5942,14 +6057,10 @@ class AIScreen(Screen):
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
 
     def _on_input_focus(self, instance, value):
-        """v3.22.9: 输入框焦点变化回调。
-        键盘遮挡改由 _on_keyboard_height 处理（监听 Window.on_keyboard_height），
-        此方法仅保留占位（滚动由 _on_keyboard_height 触发）。"""
+        """v3.22.10: 简化 - 焦点变化时仅滚动聊天到底部。键盘遮挡由 softinput_mode='pan'（系统级）+ _on_keyboard_height padding（双保险）处理。"""
         try:
             if value:
-                # 获得焦点：滚动逻辑改由 _on_keyboard_height 触发，这里不做软键盘 mode 切换
-                pass
-            # 失去焦点：padding 恢复由 _on_keyboard_height(height=0) 处理
+                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.3)
         except Exception as e:
             app_log.error('AI', '_on_input_focus 异常: %s' % e)
 
@@ -5963,9 +6074,23 @@ class AIScreen(Screen):
                 self.input_row.padding = [0, 0, 0, height]
                 # 延迟滚动聊天记录到底部（等键盘完全弹出）
                 Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.1)
+                # v3.22.10: 同步键盘高度到 DebugOverlay（AIScreen 无 self.app，用 App.get_running_app 兜底）
+                try:
+                    ms = App.get_running_app().root.get_screen('main')
+                    if ms and hasattr(ms, 'debug_overlay') and ms.debug_overlay._visible:
+                        ms.debug_overlay.update_info(keyboard_height=height)
+                except Exception:
+                    pass
             else:
                 # 键盘收起：恢复 padding
                 self.input_row.padding = [0, 0, 0, 0]
+                # v3.22.10: 同步键盘高度（收起）到 DebugOverlay
+                try:
+                    ms = App.get_running_app().root.get_screen('main')
+                    if ms and hasattr(ms, 'debug_overlay') and ms.debug_overlay._visible:
+                        ms.debug_overlay.update_info(keyboard_height=height)
+                except Exception:
+                    pass
         except Exception as e:
             app_log.error('AI', '_on_keyboard_height 异常: %s' % e)
 
@@ -6117,7 +6242,8 @@ class LoanPhotoApp(App):
         self.title = "资产盘点专项拍照工具"
         Window.clearcolor = THEME['bg']
         # v3.22.0: 全局 resize 模式 — 键盘弹出时窗口收缩，搜索框/输入框不被顶出屏幕
-        Window.softinput_mode = 'resize'
+        # v3.22.10: resize 在 Android SDL2 不工作（Kivy 官方文档），改用 pan 让系统自动上移窗口
+        Window.softinput_mode = 'pan'
 
         # 拦截Android返回键：边缘滑动不直接退出App，而是返回上一页面
         Window.bind(on_keyboard=self._on_keyboard)
