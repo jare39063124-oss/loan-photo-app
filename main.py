@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.14
+资产盘点专项拍照工具 App - v3.22.15
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -3170,7 +3170,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.14", font_size='12sp',
+            text="v3.22.15", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3272,6 +3272,8 @@ class ThemedPopup(Popup):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # v3.22.15: 禁用 Kivy Popup 默认的 atlas 背景图像，避免在某些机型上加载失败导致 popup 不可见
+        self.background = ''
         # 统一绘制浅色背景
         with self.canvas.before:
             Color(*THEME['card'])
@@ -3328,10 +3330,15 @@ class VisitNoteDialog(ThemedPopup):
 
         # 提示文字
         hint = Label(
-            text='请输入今日走访的补充说明，AI 将参考此说明生成日报表。\n示例：借款人张三 贷款对应抵押地址为 和平区南大街1号楼102、103、403、504房间',
+            text=('请输入今日走访的补充说明，AI 将参考此说明生成日报表。\n'
+                  '【同楼盘多房间合并说明】\n'
+                  '同一借款人抵押同一栋楼的多个房间号时，只需对代表性户型拍摄并备注。\n'
+                  '示例：A大街12号101、201、301房型一致，仅拍摄101并备注；\n'
+                  '102、202、302为镜像关系，可一并说明。\n'
+                  'AI 会根据此说明合并描述同楼盘多房间的情况，报告中只生成 1 行。'),
             font_size='11sp',
             color=THEME['text_dim'],
-            size_hint_y=0.15,
+            size_hint_y=0.28,
             halign='left', valign='top',
             text_size=(0, None),
         )
@@ -3343,7 +3350,7 @@ class VisitNoteDialog(ThemedPopup):
             text=self._initial_text,
             multiline=True,
             font_size='13sp',
-            size_hint_y=0.55,
+            size_hint_y=0.42,
             hint_text='在此输入今日走访补充说明…',
         )
         content.add_widget(self.text_input)
@@ -5467,11 +5474,11 @@ class MainScreen(Screen):
         """v3.22.13: 整体 try/except 包裹，任何异常通过 _show_msg（toast + popup）反馈
         v3.22.2 P0 修复: 直接用 RowWidget 持有的 progress_key（构造时算好），
         避免用 self.rows[row_index] 重算 key 时与 widget 不一致导致"无反应"。
-        v3.22.11: 防抖 — 500ms 内只执行一次，防止多次触发导致 popup 状态异常"""
-        # v3.22.11: 防抖（500ms）— 防抖检查不纳入 try/except（异常也不应跳过防抖）
+        v3.22.11: 防抖 — 1500ms 内只执行一次，防止多次触发导致 popup 状态异常"""
+        # v3.22.11: 防抖（1500ms）— 防抖检查不纳入 try/except（异常也不应跳过防抖）
         now = Clock.get_time()
-        if now - getattr(self, '_view_photos_last_time', 0) < 0.5:
-            app_log.info('PHOTO', '查看已拍防抖：跳过本次调用（距上次 < 500ms）')
+        if now - getattr(self, '_view_photos_last_time', 0) < 1.5:
+            app_log.info('PHOTO', '查看已拍防抖：跳过本次调用（距上次 < 1500ms）')
             return
         self._view_photos_last_time = now
         # v3.22.13: 整体 try/except — 任何异常（含 PhotoViewerPopup 创建失败）都通过 _show_msg 反馈
@@ -5488,12 +5495,23 @@ class MainScreen(Screen):
             if not photos:
                 self._show_msg('该客户暂无照片（或照片文件已被系统清理）')
                 return
-            # v3.22.14: 增加诊断日志 — 排查 PhotoViewerPopup 静默不显示问题
-            app_log.info('PHOTO', '创建 PhotoViewerPopup: photos=%d' % len(photos))
-            popup = PhotoViewerPopup(row_index=row_index, photos=photos,
-                                     delete_callback=self._on_delete_photo)
-            popup.open()
-            app_log.info('PHOTO', 'PhotoViewerPopup.open() 已调用')
+            # v3.22.15: 用 Clock.schedule_once 延迟 0.1 秒创建+open，避免 on_press 事件链与 Popup 渲染时序冲突
+            def _open_photo_popup(*args):
+                try:
+                    app_log.info('PHOTO', '创建 PhotoViewerPopup: photos=%d' % len(photos))
+                    popup = PhotoViewerPopup(row_index=row_index, photos=photos,
+                                             delete_callback=self._on_delete_photo)
+                    popup.open()
+                    app_log.info('PHOTO', 'PhotoViewerPopup.open() 已调用')
+                    # v3.22.15: 延迟 0.2 秒记录 popup 状态诊断日志
+                    Clock.schedule_once(lambda dt: self._log_popup_status(popup), 0.2)
+                except Exception as e:
+                    app_log.error('UI', '_open_photo_popup 异常 row=%d: %s' % (row_index, e), exc_info=True)
+                    try:
+                        self._show_msg('查看已拍失败: %s' % str(e))
+                    except Exception as e2:
+                        app_log.error('UI', '_show_msg 反馈也失败: %s' % e2)
+            Clock.schedule_once(_open_photo_popup, 0.1)
         except Exception as e:
             app_log.error('UI', '_on_view_photos 异常 row=%d: %s' % (row_index, e), exc_info=True)
             # v3.22.13: 用 _show_msg 反馈给用户（toast + popup，不再"连失败提示都没有"）
@@ -5501,6 +5519,14 @@ class MainScreen(Screen):
                 self._show_msg('查看已拍失败: %s' % str(e))
             except Exception as e2:
                 app_log.error('UI', '_show_msg 反馈也失败: %s' % e2)
+
+    def _log_popup_status(self, popup):
+        """v3.22.15: 记录 popup 状态诊断日志，排查 popup 不可见问题"""
+        try:
+            app_log.info('PHOTO', 'popup 状态: pos=%s size=%s opacity=%s parent=%s' % (
+                popup.pos, popup.size, popup.opacity, popup.parent))
+        except Exception as e:
+            app_log.error('UI', '_log_popup_status 异常: %s' % e)
 
     def _on_delete_photo(self, row_index, photo_index):
         if row_index >= len(self.rows):
