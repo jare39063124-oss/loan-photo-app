@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.12
+资产盘点专项拍照工具 App - v3.22.13
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -313,6 +313,7 @@ def android_copy_uri_to_app_dir(uri_str, dest_path):
     """通过Android ContentResolver从content URI或文件路径复制文件到app私有目录，
     解决scoped storage下PermissionError问题。
     支持: content:// URI 和 /storage/... 路径
+    v3.22.13 修复: in_stream/out_stream 用 try/finally 确保异常时关闭，防止 Java 文件句柄泄漏。
     """
     from jnius import autoclass
     FileInputStream = autoclass('java.io.FileInputStream')
@@ -322,23 +323,36 @@ def android_copy_uri_to_app_dir(uri_str, dest_path):
     activity = autoclass('org.kivy.android.PythonActivity').mActivity
     resolver = activity.getContentResolver()
 
-    if uri_str.startswith('content://'):
-        uri = Uri.parse(uri_str)
-        in_stream = resolver.openInputStream(uri)
-    else:
-        # 尝试直接用文件路径
-        in_stream = FileInputStream(uri_str)
+    in_stream = None
+    out_stream = None
+    try:
+        if uri_str.startswith('content://'):
+            uri = Uri.parse(uri_str)
+            in_stream = resolver.openInputStream(uri)
+        else:
+            # 尝试直接用文件路径
+            in_stream = FileInputStream(uri_str)
 
-    out_stream = FileOutputStream(dest_path)
-    buffer = bytearray(8192)
-    while True:
-        read = in_stream.read(buffer)
-        if read == -1:
-            break
-        out_stream.write(buffer, 0, read)
-    in_stream.close()
-    out_stream.close()
-    return dest_path
+        out_stream = FileOutputStream(dest_path)
+        buffer = bytearray(8192)
+        while True:
+            read = in_stream.read(buffer)
+            if read == -1:
+                break
+            out_stream.write(buffer, 0, read)
+        return dest_path
+    finally:
+        # v3.22.13: 无论成功/失败都关闭流（原代码仅在成功路径 close，异常时泄漏句柄）
+        if in_stream is not None:
+            try:
+                in_stream.close()
+            except Exception:
+                pass
+        if out_stream is not None:
+            try:
+                out_stream.close()
+            except Exception:
+                pass
 
 # === 目录 ===
 # 复用 setup_crash_handler() 已解析出的 app 专属外部存储路径：
@@ -1258,6 +1272,9 @@ class ExcelWriter:
         """
         if not IS_ANDROID or not uri_str or not os.path.exists(source_file):
             return False, "无可用 URI 或源文件"
+        # v3.22.13 修复: fis/out 用 try/finally 确保异常时也关闭，防止 Java 文件句柄泄漏
+        out = None
+        fis = None
         try:
             from jnius import autoclass
             Uri = autoclass('android.net.Uri')
@@ -1273,13 +1290,23 @@ class ExcelWriter:
                 if n <= 0:
                     break
                 out.write(buf, 0, n)
-            fis.close()
-            out.close()
             Logger.info(f"write_back_to_uri: 已写回原始 Excel URI")
             return True, "已写回原始 Excel"
         except Exception as e:
             Logger.error(f"write_back_to_uri 失败: {e}")
             return False, f"写回原始文件失败: {str(e)[:40]}"
+        finally:
+            # v3.22.13: 无论成功/失败都关闭流（原代码仅在成功路径 close，异常时泄漏句柄）
+            if fis is not None:
+                try:
+                    fis.close()
+                except Exception:
+                    pass
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
 
 # ============================================================
 # 报告生成器
@@ -1588,12 +1615,13 @@ class ReportGenerator:
         wb.close()
         return out_path
 
-    def generate_with_ai(self, rows, progress_mgr, ai_service, excel_filename=""):
+    def generate_with_ai(self, rows, progress_mgr, ai_service, excel_filename="", visit_note=""):
         """AI 生成日报表。返回 (ok, out_path_or_None, msg)
         v3.19.6: 仅对有外访照片的客户生成报告行；末尾追加汇总说明行；
                  输出文件名改为"抵押物、抵债资产现场勘查日报表YYYYMMDD.xlsx"。
         v3.22.6: 合并统计「同类型」户数 — 已标记为同类型代表性户型且无照片的客户
                  不再单独生成报告行，但在汇总说明中合并表述。
+        v3.22.13: visit_note 参数 — 今日走访补充说明，附加到 system prompt 供 AI 参考。
         """
         records = self._collect_records(rows, progress_mgr)
         if not records:
@@ -1610,8 +1638,12 @@ class ReportGenerator:
         if not visited_records:
             return False, None, "所有客户均无外访照片，无法生成报告（请先现场拍照）"
         prompt = self._build_prompt(visited_records)
+        # v3.22.13: 附加今日走访补充说明到 system prompt
+        sys_prompt = self.REPORT_SYSTEM_PROMPT
+        if visit_note:
+            sys_prompt = sys_prompt + '\n\n今日走访补充说明：\n' + visit_note
         ok, ai_text = ai_service.chat([
-            {"role": "system", "content": self.REPORT_SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prompt},
         ], timeout=120)
         if not ok:
@@ -1865,16 +1897,29 @@ class PhotoProcessor:
             uri = resolver.insert(ImagesMedia.EXTERNAL_CONTENT_URI, cv)
             if uri is not None:
                 inserted_uri = uri
-                out = resolver.openOutputStream(uri)
-                fis = FileInputStream(photo_path)
-                buf = bytearray(8192)
-                while True:
-                    n = fis.read(buf)
-                    if n <= 0:
-                        break
-                    out.write(buf, 0, n)
-                fis.close()
-                out.close()
+                # v3.22.13 修复: fis/out 用 try/finally 确保异常时关闭，防止 Java 文件句柄泄漏
+                out = None
+                fis = None
+                try:
+                    out = resolver.openOutputStream(uri)
+                    fis = FileInputStream(photo_path)
+                    buf = bytearray(8192)
+                    while True:
+                        n = fis.read(buf)
+                        if n <= 0:
+                            break
+                        out.write(buf, 0, n)
+                finally:
+                    if fis is not None:
+                        try:
+                            fis.close()
+                        except Exception:
+                            pass
+                    if out is not None:
+                        try:
+                            out.close()
+                        except Exception:
+                            pass
                 Logger.info(f"save_to_gallery: MediaStore 已插入 DCIM/Camera {fname}")
                 # 使用 MediaScannerConnection 刷新，Android 10+ 比旧广播更稳定。
                 PhotoProcessor._scan_file(photo_path, uri=uri)
@@ -3108,7 +3153,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.12", font_size='12sp',
+            text="v3.22.13", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3220,6 +3265,109 @@ class ThemedPopup(Popup):
         self.title_color = THEME['accent_dark']
         self.separator_color = THEME['card_border']
 
+
+# ============================================================
+# v3.22.13: 今日走访补充说明对话框
+# ============================================================
+
+class VisitNoteDialog(ThemedPopup):
+    """v3.22.13: 今日走访补充说明输入对话框
+    用户输入今日走访的补充说明，AI 报告生成时参考此说明。
+    说明按 Excel 文件路径 md5 哈希持久化到 APP_DIR/visit_notes/ 目录。
+    """
+
+    def __init__(self, initial_text='', on_confirm=None, **kwargs):
+        """v3.22.13: 初始化
+        Args:
+            initial_text: 预填的文本（从持久化加载）
+            on_confirm: 确认回调，签名为 on_confirm(text: str)
+        """
+        super().__init__(**kwargs)
+        self.title = '今日走访补充说明'
+        self.auto_dismiss = False  # 避免误关闭丢失输入
+        self.size_hint = (0.9, None)
+        self.height = dp(420)
+
+        self._on_confirm_callback = on_confirm
+        self._initial_text = initial_text
+
+        content = self._build_content()
+        self.content = content
+
+    def _build_content(self):
+        """构建对话框内容"""
+        content = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(10))
+
+        # 标题
+        title = Label(
+            text='今日走访补充说明',
+            font_size='18sp', bold=True,
+            color=THEME['text'],
+            size_hint_y=0.1,
+            halign='left', valign='middle',
+        )
+        title.bind(size=lambda inst, val: setattr(inst, 'text_size', (val[0], None)))
+        content.add_widget(title)
+
+        # 提示文字
+        hint = Label(
+            text='请输入今日走访的补充说明，AI 将参考此说明生成日报表。\n示例：借款人张三 贷款对应抵押地址为 和平区南大街1号楼102、103、403、504房间',
+            font_size='11sp',
+            color=THEME['text_dim'],
+            size_hint_y=0.15,
+            halign='left', valign='top',
+            text_size=(0, None),
+        )
+        hint.bind(size=lambda inst, val: setattr(inst, 'text_size', (val[0], val[1])))
+        content.add_widget(hint)
+
+        # 多行 TextInput
+        self.text_input = TextInput(
+            text=self._initial_text,
+            multiline=True,
+            font_size='13sp',
+            size_hint_y=0.55,
+            hint_text='在此输入今日走访补充说明…',
+        )
+        content.add_widget(self.text_input)
+
+        # 按钮行
+        btn_row = BoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=0.15)
+
+        btn_cancel = RoundedButton(
+            text='取消', font_size='14sp',
+            background_color=THEME['text_dim'], background_normal='',
+            color=(1, 1, 1, 1),
+        )
+        btn_cancel.bind(on_press=self.dismiss)
+        btn_row.add_widget(btn_cancel)
+
+        btn_confirm = RoundedButton(
+            text='生成日报表', font_size='14sp',
+            background_color=THEME['success'], background_normal='',
+            color=(1, 1, 1, 1),
+        )
+        btn_confirm.bind(on_press=self._on_confirm)
+        btn_row.add_widget(btn_confirm)
+
+        content.add_widget(btn_row)
+        return content
+
+    def _on_confirm(self, instance):
+        """v3.22.13: 确认按钮回调"""
+        text = self.text_input.text or ''
+        try:
+            self.dismiss()
+            if self._on_confirm_callback:
+                self._on_confirm_callback(text)
+        except Exception as e:
+            app_log.error('UI', 'VisitNoteDialog._on_confirm 异常: %s' % e, exc_info=True)
+
+    def get_text(self):
+        """获取输入文本"""
+        return self.text_input.text or ''
+
+
 # ============================================================
 # 照片查看弹窗
 # ============================================================
@@ -3246,29 +3394,32 @@ class PhotoViewerPopup(ThemedPopup):
         list_layout.bind(minimum_height=list_layout.setter('height'))
 
         for i, photo_path in enumerate(photos):
-            # v3.22.12: 改为垂直布局（缩略图+文件名+删除按钮），3 列网格
-            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(150), spacing=dp(2))
-            # v3.22.0: 占位 Label，异步加载缩略图后替换
-            placeholder = Label(text="加载中…", font_size='11sp', color=THEME['text_dim'],
-                                size_hint_y=0.65, halign='center', valign='middle')
-            item.add_widget(placeholder)
-            self._thumb_slots.append(placeholder)
+            # v3.22.13: 缩略图用 Button + background_normal（参考 Kivy 图片画廊案例）
+            # FloatLayout 包裹：缩略图按钮（占满）+ 右上角删除小图标（不遮挡缩略图）
+            item = FloatLayout(size_hint_y=None, height=dp(110))
 
-            # v3.22.12: 文件名（短截断，居中）
-            fname = os.path.basename(photo_path)
-            if len(fname) > 16:
-                fname = fname[:13] + '...'
-            name_label = Label(text=fname, font_size='10sp',
-                                      halign='center', valign='middle', size_hint_y=0.15,
-                                      color=THEME['text_dim'],
-                                      text_size=(0, None))
-            name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
-            item.add_widget(name_label)
+            # 缩略图按钮（占满整个 item）— 点击查看全图
+            thumb_btn = Button(
+                background_normal='',  # 先用空，异步加载后设置
+                background_down='',
+                size_hint=(1, 1),
+                pos_hint={'x': 0, 'y': 0},
+            )
+            # 占位背景色（加载中）
+            thumb_btn.background_color = THEME['card']
+            thumb_btn.bind(on_press=lambda x, idx=i: self._show_full_image(idx))
+            item.add_widget(thumb_btn)
+            self._thumb_slots.append(thumb_btn)  # _set_thumb 时设置 background_normal
 
-            # v3.22.12: 删除按钮（小尺寸）
-            del_btn = RoundedButton(text="删除", font_size='11sp', size_hint_y=0.20, height=dp(32),
-                            background_color=THEME['danger'], background_normal='',
-                            color=(1,1,1,1), bold=True)
+            # 右上角删除小图标（不遮挡缩略图）— size_hint=(0.28, 0.22) 右上角
+            del_btn = Button(
+                text='×', font_size='18sp', bold=True,
+                size_hint=(0.28, 0.22),
+                pos_hint={'right': 1, 'top': 1},
+                background_color=THEME['danger'],
+                background_normal='',
+                color=(1, 1, 1, 1),
+            )
             del_btn.bind(on_press=lambda x, idx=i: self._confirm_delete(idx))
             item.add_widget(del_btn)
             list_layout.add_widget(item)
@@ -3346,22 +3497,61 @@ class PhotoViewerPopup(ThemedPopup):
             return False
 
     def _set_thumb(self, idx, thumb_path):
-        """主线程：用 KivyImage 替换占位 Label"""
+        """v3.22.13: 设置缩略图按钮的 background_normal（替代 KivyImage 替换占位 Label）"""
         try:
             if idx >= len(self._thumb_slots):
                 return
-            slot = self._thumb_slots[idx]
-            if slot is None or slot.parent is None:
+            thumb_btn = self._thumb_slots[idx]
+            if thumb_btn is None:
                 return
-            parent_item = slot.parent
-            pos_in_parent = parent_item.children.index(slot) if slot in parent_item.children else 0
-            parent_item.remove_widget(slot)
-            img = KivyImage(source=thumb_path, size_hint_y=0.65,
-                           allow_stretch=True, keep_ratio=True)
-            parent_item.add_widget(img, index=pos_in_parent)
-            self._thumb_slots[idx] = img
+            thumb_btn.background_normal = thumb_path
+            thumb_btn.background_down = thumb_path
+            thumb_btn.background_color = (1, 1, 1, 1)  # 重置为白色 multiplier（不染色）
         except Exception as e:
-            app_log.error('PHOTO', '替换缩略图失败: %s' % e)
+            app_log.error('PHOTO', '设置缩略图 background_normal 失败: %s' % e)
+
+    def _show_full_image(self, idx):
+        """v3.22.13: 点击缩略图弹出全图查看"""
+        if idx >= len(self.photos):
+            return
+        photo_path = self.photos[idx]
+        try:
+            content = BoxLayout(orientation='vertical', spacing=dp(8))
+            img = KivyImage(source=photo_path, allow_stretch=True, keep_ratio=True)
+            content.add_widget(img)
+            btn_close = RoundedButton(text='关闭', font_size='15sp',
+                                      size_hint_y=None, height=dp(44),
+                                      background_color=THEME['accent'], background_normal='',
+                                      color=(1, 1, 1, 1), bold=True)
+            btn_close.bind(on_press=lambda x: popup.dismiss())
+            content.add_widget(btn_close)
+            popup = ThemedPopup(title='查看图片', content=content,
+                                size_hint=(0.95, 0.95), auto_dismiss=True)
+            popup.open()
+        except Exception as e:
+            app_log.error('UI', '_show_full_image 异常: %s' % e, exc_info=True)
+            try:
+                self._show_msg_safe('查看图片失败: %s' % str(e))
+            except Exception:
+                pass
+
+    def _show_msg_safe(self, msg):
+        """v3.22.13: PhotoViewerPopup 内部用 — 无 MainScreen._show_msg 时的 fallback
+        v3.22.13 修复: 原实现仅记日志，用户看不到失败反馈（违反 v3.22.13 「Toast 反馈」目标）。
+        现改为 Android 上弹 Toast，非 Android 环境仅记录日志。"""
+        try:
+            app_log.error('UI', msg)
+        except Exception:
+            pass
+        # v3.22.13: Android 上弹 Toast 让用户看到失败原因
+        if IS_ANDROID:
+            try:
+                from jnius import autoclass
+                Toast = autoclass('android.widget.Toast')
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                Toast.makeText(PythonActivity.mActivity, msg, Toast.LENGTH_SHORT).show()
+            except Exception:
+                pass
 
     def _confirm_delete(self, index):
         """删除单张照片前弹出二次确认（v3.22.0: 白底深字可读）
@@ -3674,12 +3864,13 @@ class SettingsScreen(Screen):
 # 单行组件
 # ============================================================
 
-class RowWidget(BoxLayout):
-    # v3.22.6: 长按回调（MainScreen 创建时绑定 _enter_multi_select / _toggle_batch_mark）
-    # 用普通属性即可（不需 ObjectProperty 的观察特性），保持与现有代码风格一致
+class RowWidget(ButtonBehavior, BoxLayout):
+    # v3.22.13: 改为 ButtonBehavior + 全行点击触发 on_press → on_tap_callback
+    # 彻底放弃内嵌按钮方案（ScrollView 消费 touch_up 导致 on_release 不触发）
+    # 移除长按多选相关代码（multi_select / on_long_press / _long_press_*）
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
-                 progress_key, progress_mgr, photo_callback, view_photos_callback,
-                 remark="", remark_callback=None, excel_row_index=None, serial="",
+                 progress_key, progress_mgr,
+                 remark="", excel_row_index=None, serial="",
                  **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
@@ -3696,22 +3887,15 @@ class RowWidget(BoxLayout):
         self.address_precise = address_precise
         self.property_type = property_type
         self.progress_key = progress_key
-        self.photo_callback = photo_callback
-        self.view_photos_callback = view_photos_callback
         self.progress_mgr = progress_mgr
         self.remark = remark or ""
-        self.remark_callback = remark_callback
         self.excel_row_index = excel_row_index  # Excel中的实际行号（含表头，从1开始）
         self.done = progress_mgr.is_photographed(progress_key)
         self.photo_count = progress_mgr.get_photo_count(progress_key)
-        # v3.22.6: 同类型标记状态（按行号，稳定）
+        # v3.22.6: 同类型标记状态（按行号，稳定）— 仅显示用，标记由 MainScreen 操作菜单触发
         self.batch_marked = progress_mgr.is_batch_marked(row_index) if hasattr(progress_mgr, 'is_batch_marked') else False
-        # v3.22.6: 多选模式标志与长按回调
-        self.multi_select_mode = False
-        self.on_long_press = None  # MainScreen 创建后绑定
-        self._long_press_timer = None  # 长按检测定时器
-        self._long_press_touch = None  # 记录触发长按的 touch
-        self._long_press_start_pos = None  # 长按起点坐标（用于移动阈值判断）
+        # v3.22.13: 行点击回调（由 MainScreen._create_row_widget 赋值）
+        self.on_tap_callback = None
 
         with self.canvas.before:
             Color(*THEME['card'])
@@ -3762,165 +3946,33 @@ class RowWidget(BoxLayout):
         # 间隔
         self.add_widget(Label(size_hint_y=None, height=dp(4)))
 
-        # 按钮行（拍照 + 查看已拍 + 备注 + 类型计数横排）
-        # v3.22.2: 计数器从竖排 5 行改为横排单 label，并入按钮行末尾，节省屏幕空间
-        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
-
-        # v3.22.6: 多选 checkbox（默认隐藏 width=0/opacity=0）
-        # 放在 btn_row 最左侧；size_hint_x=None 时按 width 占位，其余 size_hint_x 子项共享剩余空间
-        self.checkbox = CheckBox(
-            active=False, opacity=0,
-            size_hint_x=None, width=dp(0),
-        )
-        btn_row.add_widget(self.checkbox)
-
-        self.photo_btn = RoundedButton(
-            text="拍照", font_size='16sp',
-            size_hint_x=0.20,
-            background_color=THEME['success'] if self.done else THEME['accent'],
-            background_normal='',
-            color=(1, 1, 1, 1), bold=True,
-        )
-        # v3.22.12: 改用 on_press — 与 view_btn 同 bug 模式（ScrollView 消费 touch_up）
-        self.photo_btn.bind(on_press=self._on_photo)
-        bind_press_animation(self.photo_btn)
-        btn_row.add_widget(self.photo_btn)
-
-        self.view_btn = RoundedButton(
-            text="查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍",
-            font_size='14sp', size_hint_x=0.28,
-            background_color=THEME['accent_dark'] if self.photo_count > 0 else THEME['muted'],
-            background_normal='',
-            color=(1, 1, 1, 1), bold=True,
-        )
-        # v3.22.12: 改用 on_press — on_release 依赖 touch_up 被 ScrollView 消费导致不触发；on_press 在 on_touch_down 触发不受影响
-        self.view_btn.bind(on_press=self._on_view_photos)
-        bind_press_animation(self.view_btn)
-        btn_row.add_widget(self.view_btn)
-
-        # 备注按钮 v3.15.0
-        self.remark_btn = RoundedButton(
-            text="备注●" if self.remark else "备注",
-            font_size='14sp', size_hint_x=0.20,
-            background_color=THEME['warning'] if self.remark else THEME['muted'],
-            background_normal='',
-            color=(1, 1, 1, 1), bold=True,
-        )
-        # v3.22.12: 改用 on_press — 与 view_btn 同 bug 模式（ScrollView 消费 touch_up）
-        self.remark_btn.bind(on_press=self._on_remark)
-        bind_press_animation(self.remark_btn)
-        btn_row.add_widget(self.remark_btn)
-
+        # v3.22.13: 移除内嵌按钮行（photo_btn/view_btn/remark_btn/checkbox）
+        # 全行点击 → on_press → on_tap_callback → MainScreen 显示行操作菜单 Popup
+        # 仅保留类型计数标签（信息展示，非交互）
         # v3.22.2: 横排类型计数器（markup 单 label，5 类一行显示）
         # 格式: 远景:2 近景:1 内部:0 瑕疵:0 其他:3（已拍绿色加粗）
         self.type_status_label = Label(
             text="",
             font_size='12sp',
-            size_hint_x=0.32,
+            size_hint_y=None,
+            height=dp(20),
             color=THEME['text_dim'],
             markup=True,
             halign='left', valign='middle',
         )
         self.type_status_label.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
-        btn_row.add_widget(self.type_status_label)
-
-        self.add_widget(btn_row)
+        self.add_widget(self.type_status_label)
 
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
-        # v3.22.12: widget 从父容器移除时清理长按定时器，防止内存泄漏
-        self.bind(parent=lambda inst, parent: inst._cleanup() if parent is None else None)
 
-    def _cleanup(self):
-        """v3.22.12: widget 销毁时清理长按定时器，防止内存泄漏和误触"""
-        if self._long_press_timer:
+    def on_press(self):
+        """v3.22.13: ButtonBehavior 全行点击触发 — 替代内嵌套按钮方案"""
+        if self.on_tap_callback:
             try:
-                self._long_press_timer.cancel()
-            except Exception:
-                pass
-            self._long_press_timer = None
-        self._long_press_touch = None
-
-    # ============================================================
-    # v3.22.6: 多选模式 UI 控制
-    # ============================================================
-    def enter_multi_select_mode(self, selected=False):
-        """v3.22.6: 进入多选模式 — 显示 checkbox 并设置选中状态"""
-        self.multi_select_mode = True
-        self.checkbox.opacity = 1
-        self.checkbox.width = dp(40)
-        self.checkbox.size_hint_x = None
-        self.checkbox.active = bool(selected)
-
-    def exit_multi_select_mode(self):
-        """v3.22.6: 退出多选模式 — 隐藏 checkbox 并清除选中状态"""
-        self.multi_select_mode = False
-        self.checkbox.opacity = 0
-        self.checkbox.width = dp(0)
-        self.checkbox.size_hint_x = None
-        self.checkbox.active = False
-
-    def is_selected(self):
-        """v3.22.6: 返回多选模式下是否被选中"""
-        return self.multi_select_mode and self.checkbox.active
-
-    # ============================================================
-    # v3.22.6: 长按检测 — 按住 500ms 不移动触发 on_long_press 回调
-    # v3.22.7: 长按时间 0.5s → 0.8s（减少误判，需用户更明确长按意图）
-    # ============================================================
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            # 取消旧定时器（防止重复触发）
-            if self._long_press_timer:
-                self._long_press_timer.cancel()
-                self._long_press_timer = None
-            self._long_press_touch = touch
-            self._long_press_start_pos = (touch.x, touch.y)
-            self._long_press_timer = Clock.schedule_once(
-                lambda dt: self._trigger_long_press(touch), 0.8)  # v3.22.11: 回退到 0.8s，1.2s 太长用户以为没反应
-        return super().on_touch_down(touch)
-
-    def on_touch_move(self, touch):
-        # v3.22.11: 回退 grab 守卫（与 ButtonBehavior 内部 grab 冲突），直接检查长按取消
-        if self._long_press_timer and self._long_press_touch is touch:
-            sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
-            dx = abs(touch.x - sx)
-            dy = abs(touch.y - sy)
-            if dx > dp(15) or dy > dp(15):  # v3.22.9: 放宽阈值减少手指微动导致的长按误取消
-                self._long_press_timer.cancel()
-                self._long_press_timer = None
-        return super().on_touch_move(touch)
-
-    def on_touch_up(self, touch):
-        if self._long_press_timer:
-            self._long_press_timer.cancel()
-            self._long_press_timer = None
-        self._long_press_touch = None
-        return super().on_touch_up(touch)
-
-    def _trigger_long_press(self, touch):
-        """v3.22.6: 长按回调触发（touch 仍在行内）
-        v3.22.7: 增加日志便于运行时定位；on_long_press 为 None 时记录警告。
-        v3.22.12: 移除 collide_point 检查（ScrollView 滚动后 RowWidget 窗口坐标变化导致失败），
-                  改用 touch 移动距离判断用户是否在滚动（>dp(15) 视为滚动，不触发长按）。"""
-        self._long_press_timer = None
-        # v3.22.12: 检查 touch 移动距离（替代 collide_point）
-        sx, sy = getattr(self, '_long_press_start_pos', (touch.x, touch.y))
-        dx = abs(touch.x - sx)
-        dy = abs(touch.y - sy)
-        if dx > dp(15) or dy > dp(15):
-            # 用户在滚动列表，取消长按
-            return
-        # v3.22.7: 记录长按触发事件（便于运行时定位）
-        app_log.info('UI', '长按触发 row=%d' % self.row_index)
-        if self.on_long_press:
-            try:
-                self.on_long_press(self.row_index)
+                self.on_tap_callback(self.row_index)
             except Exception as e:
-                app_log.error('UI', 'RowWidget 长按回调异常: %s' % e)
-        else:
-            # v3.22.7: 长按回调未绑定 — 仅记录警告日志（RowWidget 无法访问 toast 工具）
-            app_log.warning('UI', '长按回调未绑定 row=%d' % self.row_index)
+                app_log.error('UI', 'RowWidget on_tap_callback 异常 row=%d: %s' % (self.row_index, e))
 
     def update_batch_marked(self):
         """v3.22.6: 刷新同类型标记状态与徽章显示（_refresh_list 时调用）"""
@@ -3938,20 +3990,11 @@ class RowWidget(BoxLayout):
         """v3.22.7: 增量更新行状态（计数器/done/batch_marked 徽章/按钮文案），不重建 widget。
         由 _refresh_list 在缓存命中时调用，避免长列表全量重建卡顿。"""
         try:
-            # 刷新拍照状态
+            # v3.22.13: 仅刷新状态数据与徽章（按钮已移除，无需更新按钮文案/颜色）
             self.done = self.progress_mgr.is_photographed(self.progress_key)
             self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
             # 刷新同类型标记状态与徽章（内部调用 _update_type_status 并设置 name_label.color）
             self.update_batch_marked()
-            # 拍照按钮颜色（已拍绿/未拍蓝）
-            self.photo_btn.background_color = THEME['success'] if self.done else THEME['accent']
-            # 查看已拍按钮文案与颜色
-            self.view_btn.text = "查看已拍(%d)" % self.photo_count if self.photo_count > 0 else "查看已拍"
-            self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else THEME['muted']
-            # 备注按钮文案与颜色
-            if hasattr(self, 'remark_btn'):
-                self.remark_btn.text = "备注●" if self.remark else "备注"
-                self.remark_btn.background_color = THEME['warning'] if self.remark else THEME['muted']
         except Exception as e:
             app_log.error('UI', 'update_state 异常 row=%d: %s' % (self.row_index, e))
 
@@ -3966,8 +4009,8 @@ class RowWidget(BoxLayout):
         addr_h = self.addr_label.texture_size[1] if self.addr_label.texture_size else dp(20)
         self.name_label.height = max(dp(24), name_h + dp(4))
         self.addr_label.height = max(dp(20), addr_h + dp(4))
-        # v3.22.2: 移除竖版计数器(100dp)，仅含 btn_row 52dp
-        self.height = self.name_label.height + self.addr_label.height + dp(52) + dp(16) + dp(4)
+        # v3.22.13: 移除 btn_row(52dp) → type_status_label(20dp)
+        self.height = self.name_label.height + self.addr_label.height + dp(20) + dp(16) + dp(8)
 
     def _update_bg(self, *args):
         # v3.22.2: 高亮态切换底色与边色，重绘整个 canvas.before
@@ -4011,32 +4054,16 @@ class RowWidget(BoxLayout):
                 parts.append("[color=9EA6B3]%s:0[/color]" % label)
         self.type_status_label.text = "  ".join(parts)
 
-    def _on_photo(self, instance):
-        self.photo_callback(self.row_index, self.borrower, self.address_general,
-                           self.address_precise, self.property_type)
-
-    def _on_view_photos(self, instance):
-        self.view_photos_callback(self.row_index)
-
-    def _on_remark(self, instance):
-        """打开备注输入弹窗 v3.15.0"""
-        if self.remark_callback:
-            self.remark_callback(self.row_index)
-
     def set_remark(self, remark_text):
-        """更新备注并刷新按钮显示"""
+        """v3.22.13: 更新备注（按钮已移除，仅存储状态）"""
         self.remark = remark_text or ""
-        self.remark_btn.text = "备注●" if self.remark else "备注"
-        self.remark_btn.background_color = THEME['warning'] if self.remark else THEME['muted']
 
     def mark_done(self):
+        # v3.22.13: 按钮已移除，仅更新状态与徽章
         self.done = True
         self.photo_count = self.progress_mgr.get_photo_count(self.progress_key)
-        self.photo_btn.background_color = THEME['success']
         # v3.22.6: 同类型标记的行名色保持 accent（蓝），否则已拍为 success（绿）
         self.name_label.color = THEME['accent'] if getattr(self, 'batch_marked', False) else THEME['success']
-        self.view_btn.text = "查看已拍(%d)" % self.photo_count
-        self.view_btn.background_color = THEME['accent_dark'] if self.photo_count > 0 else THEME['muted']
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
 
@@ -4081,10 +4108,10 @@ class MainScreen(Screen):
         self._photo_session_ctx = None  # v3.20.0: 拍照会话上下文（替代 self._current_* 实例状态）
         self._photo_session_active = False  # v3.20.0: 拍照会话锁，防止连拍期间切换客户
         self._log_long_press = None  # v3.22.0: 日志按钮长按检测定时器
-        self.multi_select_active = False  # v3.22.6: 多选模式激活标志
-        self.multi_select_toolbar = None  # v3.22.6: 多选工具栏引用（_build_ui 中创建）
         self._row_widget_cache = {}  # v3.22.7: RowWidget 增量刷新缓存（按 row_index 复用）
         self._view_photos_last_time = 0  # v3.22.11: _on_view_photos 防抖时间戳
+        self.current_visit_note = ''  # v3.22.13: 当前 Excel 的今日走访补充说明
+        self.current_visit_note_excel_path = ''  # v3.22.13: 当前 visit_note 对应的 Excel 路径
         # v3.22.0: 从配置初始化日志开关（默认关闭）
         app_log.set_enabled(self.config.get('log_enabled', False))
 
@@ -4168,40 +4195,6 @@ class MainScreen(Screen):
         toolbar.add_widget(search_btn)
         parent.add_widget(toolbar)
 
-        # v3.22.6: 多选模式工具栏（默认隐藏 opacity=0/height=0）
-        # 长按客户行进入多选模式后显示，含「标记为同类型」和「取消」按钮
-        self.multi_select_toolbar = BoxLayout(
-            orientation='horizontal', size_hint_y=None, height=dp(0),
-            spacing=dp(8), padding=[dp(10), dp(6), dp(10), dp(6)],
-            opacity=0,
-        )
-        with self.multi_select_toolbar.canvas.before:
-            Color(*THEME['accent_dark'])
-            self._ms_tb_rect = RoundedRectangle(pos=self.multi_select_toolbar.pos,
-                                                size=self.multi_select_toolbar.size, radius=[0, 0, 10, 10])
-        self.multi_select_toolbar.bind(
-            pos=lambda i, v: setattr(self._ms_tb_rect, 'pos', v),
-            size=lambda i, v: setattr(self._ms_tb_rect, 'size', v))
-        ms_info = Label(text="多选模式：勾选行后点「标记为同类型」",
-                        font_size='13sp', color=(1, 1, 1, 1),
-                        size_hint_x=0.5, halign='left', valign='middle')
-        self.multi_select_toolbar.add_widget(ms_info)
-        ms_mark_btn = RoundedButton(text="标记为同类型", font_size='15sp',
-                                    size_hint_x=0.3,
-                                    background_color=THEME['accent'], background_normal='',
-                                    color=(1, 1, 1, 1), bold=True)
-        ms_mark_btn.bind(on_release=self._on_mark_batch_selected)
-        bind_press_animation(ms_mark_btn)
-        self.multi_select_toolbar.add_widget(ms_mark_btn)
-        ms_cancel_btn = RoundedButton(text="取消", font_size='15sp',
-                                      size_hint_x=0.2,
-                                      background_color=THEME['muted'], background_normal='',
-                                      color=(1, 1, 1, 1), bold=True)
-        ms_cancel_btn.bind(on_release=lambda inst: self._exit_multi_select())
-        bind_press_animation(ms_cancel_btn)
-        self.multi_select_toolbar.add_widget(ms_cancel_btn)
-        parent.add_widget(self.multi_select_toolbar)
-
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
         self.list_layout = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[dp(8), dp(6), dp(8), dp(6)])
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
@@ -4214,7 +4207,7 @@ class MainScreen(Screen):
         ai_report_btn = RoundedButton(text="AI 一键生成日报表", font_size='17sp',
                                background_color=THEME['success'], background_normal='',
                                color=(1,1,1,1), bold=True, size_hint_x=0.7)
-        ai_report_btn.bind(on_release=self._show_report_confirm)  # v3.22.5: 改为二次确认弹窗
+        ai_report_btn.bind(on_release=self._on_generate_report_button)  # v3.22.13: 改为先弹 VisitNoteDialog
         bind_press_animation(ai_report_btn)
         footer.add_widget(ai_report_btn)
 
@@ -4580,10 +4573,55 @@ class MainScreen(Screen):
         ok_btn.bind(on_release=popup.dismiss)
         popup.open()
 
+    def _get_visit_note_path(self, excel_path):
+        """v3.22.13: 返回 visit_note 持久化文件路径
+        按 Excel 文件路径 md5 哈希存储，避免路径含特殊字符
+        """
+        if not excel_path:
+            return None
+        import hashlib
+        hash_val = hashlib.md5(excel_path.encode('utf-8')).hexdigest()
+        return os.path.join(APP_DIR, 'visit_notes', '%s.txt' % hash_val)
+
+    def _load_visit_note(self, excel_path):
+        """v3.22.13: 加载 visit_note（不存在返回空字符串）"""
+        path = self._get_visit_note_path(excel_path)
+        if not path or not os.path.exists(path):
+            return ''
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            app_log.error('IO', '_load_visit_note 异常: %s' % e, exc_info=True)
+            return ''
+
+    def _save_visit_note(self, excel_path, text):
+        """v3.22.13: 保存 visit_note 到文件
+        v3.22.13 修复: 原子写（临时文件 + os.replace），防止写入中途崩溃导致文件损坏
+        （参考 ProgressManager.save 的原子写实现）。"""
+        if not excel_path:
+            return
+        path = self._get_visit_note_path(excel_path)
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # v3.22.13: 原子写 — 先写临时文件再 os.replace，防止崩溃损坏文件
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(text or '')
+            os.replace(tmp, path)
+            app_log.info('IO', 'visit_note 已保存: %s' % path)
+        except Exception as e:
+            app_log.error('IO', '_save_visit_note 异常: %s' % e, exc_info=True)
+
     def _load_excel_path(self, path, display_name=None, source_uri=None):
         if not path or not os.path.exists(path):
             self._show_msg("文件不存在或路径无效", THEME['danger'])
             return
+        # v3.22.13: 切换 Excel 前保存当前 visit_note（避免上次输入丢失）
+        if self.current_visit_note_excel_path:
+            self._save_visit_note(self.current_visit_note_excel_path, self.current_visit_note)
         self.excel_path = path
         try:
             app_log.info('EXCEL', '开始加载 Excel: %s' % os.path.basename(path))
@@ -4624,6 +4662,10 @@ class MainScreen(Screen):
             _name = display_name or os.path.basename(path)
             self._add_recent_excel(_uri, _name)
             self._refresh_list()
+            # v3.22.13: 加载 visit_note（按当前 Excel 路径持久化）
+            self.current_visit_note_excel_path = path
+            self.current_visit_note = self._load_visit_note(path)
+            app_log.info('IO', 'visit_note 已加载: %d 字符' % len(self.current_visit_note))
         except Exception as e:
             err_msg = str(e)
             app_log.error('EXCEL', '加载失败: %s' % err_msg)
@@ -4768,20 +4810,12 @@ class MainScreen(Screen):
                 address_general=address_general, address_precise=address_precise,
                 property_type=property_type,
                 progress_key=pk, progress_mgr=self.progress_mgr,
-                photo_callback=self._on_photo_request,
-                view_photos_callback=self._on_view_photos,
                 remark=remark,
-                remark_callback=self._on_remark_request,
                 excel_row_index=i + 2,  # Excel行号（1=表头，2=第一行数据）
                 serial=serial,
             )
-            # v3.22.6: 绑定长按回调 — 已标记行弹出「取消标记」，未标记行进入多选模式
-            rw.on_long_press = self._on_row_long_press
-            # v3.22.7: 确认绑定成功（便于运行时定位绑定缺失问题）
-            app_log.debug('UI', 'RowWidget %d 绑定 on_long_press' % rw.row_index)
-            # v3.22.6: 多选模式激活时，新创建的行也进入多选模式（如刷新列表后）
-            if self.multi_select_active:
-                rw.enter_multi_select_mode(selected=False)
+            # v3.22.13: 绑定行点击回调 → 显示行操作菜单 Popup
+            rw.on_tap_callback = self._on_row_tap
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
             # v3.22.7: 按 row_index 缓存，供 _refresh_list 增量刷新复用
@@ -5160,23 +5194,24 @@ class MainScreen(Screen):
             ), 0.3)
 
     def _lock_photo_buttons(self, exclude_row=None):
-        """v3.20.0: 拍照会话期间禁用其他行的拍照按钮"""
+        """v3.22.13: 拍照会话期间禁用其他行（替代 photo_btn.disabled）
+        RowWidget 已改为 ButtonBehavior，直接 disabled 整行即可阻止点击。"""
         for rw in self.row_widgets:
             if rw.row_index != exclude_row:
                 try:
-                    rw.photo_btn.disabled = True
-                    rw.photo_btn.opacity = 0.5
+                    rw.disabled = True
+                    rw.opacity = 0.5
                 except Exception:
                     pass
 
     def _unlock_photo_buttons(self):
-        """v3.20.0: 拍照会话结束后恢复所有行的拍照按钮
+        """v3.22.13: 拍照会话结束后恢复所有行（替代 photo_btn 恢复）
         v3.22.3: 不再清除高亮（高亮在会话期间保持，让用户退出相机准备拍下一类时仍能找到当前条目）。
         高亮改由 _clear_all_highlights 统一管理，在切换客户/跳转页面时调用。"""
         for rw in self.row_widgets:
             try:
-                rw.photo_btn.disabled = False
-                rw.photo_btn.opacity = 1
+                rw.disabled = False
+                rw.opacity = 1
             except Exception:
                 pass
 
@@ -5345,50 +5380,10 @@ class MainScreen(Screen):
         return None
 
     # ============================================================
-    # v3.22.6: 批量标记同类型 — 多选模式入口与操作
+    # v3.22.13: 行点击操作菜单（替代内嵌按钮 + 长按多选）
     # ============================================================
-    def _get_all_row_widgets(self):
-        """v3.22.6: 返回当前列表中所有 RowWidget（搜索过滤后仅含匹配行）"""
-        return list(self.row_widgets)
-
-    def _on_row_long_press(self, row_index):
-        """v3.22.6: RowWidget 长按回调分发 — 已标记行弹出「取消标记」，否则进入多选模式
-        v3.22.7: 增加日志记录 is_batch_marked 状态便于运行时定位。"""
-        try:
-            # v3.22.7: 记录长按回调与已标记状态
-            is_marked = self.progress_mgr.is_batch_marked(row_index) if hasattr(self.progress_mgr, 'is_batch_marked') else False
-            app_log.info('UI', '长按回调 row=%d, is_batch_marked=%s' % (row_index, is_marked))
-            if is_marked:
-                self._toggle_batch_mark(row_index)
-            else:
-                self._enter_multi_select(row_index)
-        except Exception as e:
-            app_log.error('UI', '长按回调异常 row=%d: %s' % (row_index, e))
-            # v3.22.9: 不再静默吞异常，弹出可见错误提示
-            try:
-                self._show_msg_popup('长按操作失败：%s' % e, color=THEME['danger'])
-            except Exception as e2:
-                app_log.error('UI', '弹出错误提示也失败: %s' % e2)
-
-    def _enter_multi_select(self, row_index):
-        """v3.22.6: 进入多选模式 — 所有行显示 checkbox，触发行默认选中，显示工具栏
-        v3.22.7: 增加日志便于运行时定位。
-        v3.22.9: 增加 Android 原生 toast 反馈。"""
-        # v3.22.7: 记录进入多选模式事件
-        app_log.info('UI', '进入多选模式，选中行=%d' % row_index)
-        # v3.22.9: 弹 Android 原生 toast，让用户明显感知多选模式已激活
-        self._show_android_toast('已进入多选模式')
-        self.multi_select_active = True
-        for rw in self._get_all_row_widgets():
-            rw.enter_multi_select_mode(selected=(rw.row_index == row_index))
-        # 显示多选工具栏
-        if self.multi_select_toolbar:
-            self.multi_select_toolbar.opacity = 1
-            self.multi_select_toolbar.height = dp(50)
-            self.multi_select_toolbar.size_hint_y = None
-
     def _show_android_toast(self, message):
-        """v3.22.9: 弹 Android 原生 toast（通过 pyjnius）"""
+        """v3.22.9: 弹 Android 原生 toast（通过 pyjnius）— 通用工具方法"""
         try:
             from jnius import autoclass
             Toast = autoclass('android.widget.Toast')
@@ -5398,68 +5393,103 @@ class MainScreen(Screen):
             # 非 Android 环境或 jnius 不可用时静默 fallback 到日志
             app_log.info('UI', 'toast 调用失败（非 Android 环境？）: %s' % e)
 
-    def _exit_multi_select(self):
-        """v3.22.6: 退出多选模式 — 隐藏 checkbox 与工具栏"""
-        self.multi_select_active = False
-        for rw in self._get_all_row_widgets():
+    def _on_row_tap(self, row_index):
+        """v3.22.13: 行点击触发 — 显示行操作菜单 Popup（替代内嵌套按钮方案）"""
+        try:
+            app_log.info('UI', '行点击 row=%d' % row_index)
+            self._show_row_action_menu(row_index)
+        except Exception as e:
+            app_log.error('UI', '_on_row_tap 异常: %s' % e, exc_info=True)
             try:
-                rw.exit_multi_select_mode()
+                self._show_msg('行点击操作失败: %s' % str(e))
             except Exception:
                 pass
-        if self.multi_select_toolbar:
-            self.multi_select_toolbar.opacity = 0
-            self.multi_select_toolbar.height = dp(0)
-            self.multi_select_toolbar.size_hint_y = None
 
-    def _on_mark_batch_selected(self, instance):
-        """v3.22.6: 标记选中行为同类型 — 持久化到 progress_mgr 并刷新列表"""
-        marked = 0
-        for rw in self._get_all_row_widgets():
-            if rw.is_selected():
-                self.progress_mgr.mark_batch(rw.row_index)
-                marked += 1
-        self._exit_multi_select()
-        if marked > 0:
-            self._show_msg("已标记 %d 行为同类型" % marked, THEME['success'], toast=False)
-            self._refresh_list()
-        else:
-            self._show_msg("未选中任何行", THEME['warning'], toast=False)
+    def _show_row_action_menu(self, row_index):
+        """v3.22.13: 显示行操作菜单 Popup — 4 个操作：查看已拍 / 拍照 / 备注 / 取消"""
+        rw = self._get_row_widget(row_index)
+        borrower = rw.borrower if rw else ''
+        content = BoxLayout(orientation='vertical', spacing=dp(6), padding=dp(8))
 
-    def _toggle_batch_mark(self, row_index):
-        """v3.22.6: 长按已标记行弹出「取消同类型标记」确认弹窗"""
-        content = BoxLayout(orientation='vertical', padding=dp(16), spacing=dp(10))
-        msg = Label(text="该行已标记为同类型，\n是否取消标记？",
-                    color=THEME['text'], font_size='15sp',
-                    size_hint_y=None, height=dp(60),
-                    halign='center', valign='middle')
-        msg.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
-        content.add_widget(msg)
-        btn_box = BoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(44))
-        yes_btn = RoundedButton(text="取消标记", font_size='15sp',
-                                background_color=THEME['danger'], background_normal='',
-                                color=(1, 1, 1, 1), bold=True)
-        no_btn = RoundedButton(text="关闭", font_size='15sp',
-                               background_color=THEME['muted'], background_normal='',
-                               color=(1, 1, 1, 1), bold=True)
-        btn_box.add_widget(yes_btn)
-        btn_box.add_widget(no_btn)
-        content.add_widget(btn_box)
-        popup = ThemedPopup(title="确认", content=content,
-                      size_hint=(0.8, None), height=dp(180),
-                      auto_dismiss=False)
+        # 标题（显示客户名）
+        title = Label(text='选择操作  [%s]' % borrower, font_size='15sp', bold=True,
+                      color=THEME['text'], size_hint_y=None, height=dp(36),
+                      halign='left', valign='middle')
+        title.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+        content.add_widget(title)
 
-        def _do_unmark(_btn):
-            try:
-                self.progress_mgr.unmark_batch(row_index)
-            except Exception as e:
-                app_log.error('UI', '取消同类型标记失败 row=%d: %s' % (row_index, e))
-            popup.dismiss()
-            self._refresh_list()
-            self._show_msg("已取消同类型标记", THEME['success'], toast=False)
+        # 查看已拍照片
+        btn_view = RoundedButton(text='查看已拍照片', font_size='15sp',
+                                 size_hint_y=None, height=dp(48),
+                                 background_color=THEME['accent_dark'], background_normal='',
+                                 color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(btn_view)
+        content.add_widget(btn_view)
 
-        yes_btn.bind(on_release=_do_unmark)
-        no_btn.bind(on_release=popup.dismiss)
+        # 拍照
+        btn_photo = RoundedButton(text='拍照', font_size='15sp',
+                                  size_hint_y=None, height=dp(48),
+                                  background_color=THEME['accent'], background_normal='',
+                                  color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(btn_photo)
+        content.add_widget(btn_photo)
+
+        # 备注
+        btn_remark = RoundedButton(text='备注', font_size='15sp',
+                                   size_hint_y=None, height=dp(48),
+                                   background_color=THEME['muted'], background_normal='',
+                                   color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(btn_remark)
+        content.add_widget(btn_remark)
+
+        # 取消
+        btn_cancel = RoundedButton(text='取消', font_size='15sp',
+                                   size_hint_y=None, height=dp(44),
+                                   background_color=THEME['text_dim'], background_normal='',
+                                   color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(btn_cancel)
+        content.add_widget(btn_cancel)
+
+        popup = ThemedPopup(title='操作', content=content,
+                            size_hint=(0.82, None), height=dp(300),
+                            auto_dismiss=True)
+
+        # v3.22.13: 用闭包绑定 — dismiss 后再执行操作，避免 popup 残留
+        btn_view.bind(on_press=lambda x: (popup.dismiss(), self._row_action_view_photos(row_index)))
+        btn_photo.bind(on_press=lambda x: (popup.dismiss(), self._row_action_take_photo(row_index)))
+        btn_remark.bind(on_press=lambda x: (popup.dismiss(), self._row_action_remark(row_index)))
+        btn_cancel.bind(on_press=lambda x: popup.dismiss())
+
         popup.open()
+
+    def _row_action_view_photos(self, row_index):
+        """v3.22.13: 行操作菜单 → 查看已拍照片"""
+        try:
+            self._on_view_photos(row_index)
+        except Exception as e:
+            app_log.error('UI', '_row_action_view_photos 异常 row=%d: %s' % (row_index, e), exc_info=True)
+            self._show_msg('查看已拍失败: %s' % str(e))
+
+    def _row_action_take_photo(self, row_index):
+        """v3.22.13: 行操作菜单 → 拍照（从 RowWidget 取行数据调用 _on_photo_request）"""
+        try:
+            rw = self._get_row_widget(row_index)
+            if rw is None:
+                self._show_msg('无法启动拍照：行数据丢失')
+                return
+            self._on_photo_request(row_index, rw.borrower, rw.address_general,
+                                   rw.address_precise, rw.property_type)
+        except Exception as e:
+            app_log.error('UI', '_row_action_take_photo 异常 row=%d: %s' % (row_index, e), exc_info=True)
+            self._show_msg('启动拍照失败: %s' % str(e))
+
+    def _row_action_remark(self, row_index):
+        """v3.22.13: 行操作菜单 → 备注"""
+        try:
+            self._on_remark_request(row_index)
+        except Exception as e:
+            app_log.error('UI', '_row_action_remark 异常 row=%d: %s' % (row_index, e), exc_info=True)
+            self._show_msg('打开备注失败: %s' % str(e))
 
     def _refresh_row_done(self, row_index):
         rw = self._get_row_widget(row_index)
@@ -5468,35 +5498,40 @@ class MainScreen(Screen):
         self._update_progress()
 
     def _on_view_photos(self, row_index):
-        # v3.22.2 P0 修复: 直接用 RowWidget 持有的 progress_key（构造时算好），
-        # 避免用 self.rows[row_index] 重算 key 时与 widget 不一致导致"无反应"。
-        # 同时加 try/except，避免任何异常静默失败。
-        # v3.22.11: 防抖 — 500ms 内只执行一次，防止 on_release 多次触发导致 popup 状态异常
+        """v3.22.13: 整体 try/except 包裹，任何异常通过 _show_msg（toast + popup）反馈
+        v3.22.2 P0 修复: 直接用 RowWidget 持有的 progress_key（构造时算好），
+        避免用 self.rows[row_index] 重算 key 时与 widget 不一致导致"无反应"。
+        v3.22.11: 防抖 — 500ms 内只执行一次，防止多次触发导致 popup 状态异常"""
+        # v3.22.11: 防抖（500ms）— 防抖检查不纳入 try/except（异常也不应跳过防抖）
         now = Clock.get_time()
         if now - getattr(self, '_view_photos_last_time', 0) < 0.5:
             app_log.info('PHOTO', '查看已拍防抖：跳过本次调用（距上次 < 500ms）')
             return
         self._view_photos_last_time = now
-        rw = self._get_row_widget(row_index)
-        if rw is None:
-            app_log.error('UI', '查看已拍失败: 未找到 row_index=%d 的 widget' % row_index)
-            self._show_msg_popup("无法打开此客户的照片（行数据丢失）", color=THEME['danger'])  # v3.22.10: 改用 Popup（替代不可见的 status_label）
-            return
+        # v3.22.13: 整体 try/except — 任何异常（含 PhotoViewerPopup 创建失败）都通过 _show_msg 反馈
         try:
+            rw = self._get_row_widget(row_index)
+            if rw is None:
+                app_log.error('UI', '查看已拍失败: 未找到 row_index=%d 的 widget' % row_index)
+                self._show_msg('无法打开此客户的照片（行数据丢失）')
+                return
             key = rw.progress_key
             photos = self.progress_mgr.get_photos(key)
             app_log.info('PHOTO', '查看已拍: 客户=%s, key=%s, 照片数=%d' % (
                 rw.borrower, key[:8], len(photos)))
             if not photos:
-                self._show_msg_popup("该客户暂无照片（或照片文件已被系统清理）", color=THEME['warning'])  # v3.22.10: 改用 Popup
+                self._show_msg('该客户暂无照片（或照片文件已被系统清理）')
                 return
             popup = PhotoViewerPopup(row_index=row_index, photos=photos,
                                      delete_callback=self._on_delete_photo)
             popup.open()
         except Exception as e:
-            app_log.error('UI', '查看已拍异常 row=%d: %s' % (row_index, e))
-            traceback.print_exc()
-            self._show_msg_popup("打开照片列表失败: %s" % str(e)[:40], color=THEME['danger'])  # v3.22.10: 改用 Popup
+            app_log.error('UI', '_on_view_photos 异常 row=%d: %s' % (row_index, e), exc_info=True)
+            # v3.22.13: 用 _show_msg 反馈给用户（toast + popup，不再"连失败提示都没有"）
+            try:
+                self._show_msg('查看已拍失败: %s' % str(e))
+            except Exception as e2:
+                app_log.error('UI', '_show_msg 反馈也失败: %s' % e2)
 
     def _on_delete_photo(self, row_index, photo_index):
         if row_index >= len(self.rows):
@@ -5658,6 +5693,38 @@ class MainScreen(Screen):
         save_btn.bind(on_release=do_save)
         cancel_btn.bind(on_release=popup.dismiss)
         popup.open()
+
+    def _on_generate_report_button(self, instance):
+        """v3.22.13: AI 一键生成日报表按钮入口 — 先弹 VisitNoteDialog 收集
+        「今日走访补充说明」，确认后再走原有 _show_report_confirm 二次确认流程。
+        VisitNoteDialog 预填 self.current_visit_note（按 Excel 路径持久化）。
+        """
+        try:
+            def _on_confirm(text):
+                self._on_visit_note_confirmed(text, instance)
+            dialog = VisitNoteDialog(
+                initial_text=self.current_visit_note,
+                on_confirm=_on_confirm,
+            )
+            dialog.open()
+        except Exception as e:
+            app_log.error('UI', '_on_generate_report_button 异常: %s' % e, exc_info=True)
+            # 兜底：直接走原有二次确认流程（保留现有 visit_note）
+            self._show_report_confirm(instance)
+
+    def _on_visit_note_confirmed(self, text, instance):
+        """v3.22.13: VisitNoteDialog 确认回调 — 保存说明（内存 + 持久化）后
+        走原有 _show_report_confirm 二次确认弹窗流程。"""
+        try:
+            self.current_visit_note = text or ''
+            if self.current_visit_note_excel_path:
+                self._save_visit_note(self.current_visit_note_excel_path, text or '')
+            # 走原有二次确认弹窗流程（展示外访进度，由用户再次确认生成）
+            self._show_report_confirm(instance)
+        except Exception as e:
+            app_log.error('UI', '_on_visit_note_confirmed 异常: %s' % e, exc_info=True)
+            # 兜底：直接生成报告（保留现有 visit_note）
+            self._generate_report(instance)
 
     def _show_report_confirm(self, instance):
         """v3.22.5: AI报表二次确认弹窗，展示外访进度。
@@ -5823,7 +5890,8 @@ class MainScreen(Screen):
                 )
                 excel_name = os.path.basename(self.excel_path) if self.excel_path else ""
                 ok, path, m = self.report_generator.generate_with_ai(
-                    self.rows, self.progress_mgr, ai_svc, excel_filename=excel_name)
+                    self.rows, self.progress_mgr, ai_svc, excel_filename=excel_name,
+                    visit_note=self.current_visit_note)
             except Exception as e:
                 ok, path, m = False, None, "生成报告时出错：%s" % str(e)[:100]
                 app_log.error('REPORT', '生成报告异常: %s' % traceback.format_exc())
@@ -6285,6 +6353,14 @@ class LoanPhotoApp(App):
                     main_screen.progress_mgr.save()
                 except Exception:
                     pass
+                # v3.22.13: 退出时保存 visit_note
+                if main_screen.current_visit_note_excel_path:
+                    try:
+                        main_screen._save_visit_note(
+                            main_screen.current_visit_note_excel_path,
+                            main_screen.current_visit_note)
+                    except Exception:
+                        pass
             app_log.info('APP', 'on_pause: app 切入后台')
         except Exception as e:
             app_log.error('APP', 'on_pause 异常: %s' % e)
