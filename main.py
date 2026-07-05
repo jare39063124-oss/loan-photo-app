@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.20
+资产盘点专项拍照工具 App - v3.22.21
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1529,6 +1529,12 @@ class ReportGenerator:
         "此时「现状描述」单元格内仅生成 1 条该地址的描述，但若各房间号现状不同，"
         "可在同一地址条目内用顿号或分号列出各房间号的不同情况，"
         "不为每个房间号单独标号成行。\n"
+        "【多选拍摄说明】v3.22.21: 当用户多选多个条目（如同一客户的多处抵押物）"
+        "并拍摄一张照片时，这些条目共享同一张照片（相册中实际仅一张物理照片，"
+        "但所有选中条目均标记为已拍摄该类型）。多选的语义是「同一客户的多处抵押物"
+        "共享一张照片」（基于备注共性或基础位置一致等原因）。AI 日报表的「现状描述」"
+        "中应体现：这些条目因全选共享同一张照片（基于备注共性/基础位置一致），"
+        "合并描述其拍摄情况，不为每个共享条目单独描述照片内容。\n"
         "【示例】客户「张三」有以下抵押物：\n"
         "- 弘马大街123号5xx（客房层）\n"
         "- 弘马大街123号4xx（客房层）\n"
@@ -2630,7 +2636,12 @@ class AIService:
             "- 照片类型包括：远景、近景、内部、瑕疵、其他\n"
             "- 每个客户最多拍5种类型的照片\n"
             "- 回答要简洁明了，用中文\n"
-            "- 如果数据中没有相关信息，请如实告知\n"
+            "- 如果数据中没有相关信息，请如实告知\n\n"
+            "## 多选拍摄语义\n"
+            "多选拍摄语义：当用户多选多个条目并拍摄一张照片时，所有选中条目均标记为已拍摄该类型，"
+            "但相册中实际只有一张照片（共享）。若用户询问某客户多选拍摄情况，应指出"
+            "「因全选标记为拍摄完成」，并结合用户填写的备注或客户共性（如基础位置一致）"
+            "解释多选原因。\n"
         ) % _json.dumps(data_summary, ensure_ascii=False, indent=2)
 
         return prompt
@@ -3424,23 +3435,25 @@ def _scroll_input_to_visible_func(popup, text_input):
 class CardWidget(BoxLayout):
     """卡片式容器
     v3.19.0: 明亮浅色主题——纯白卡片 + 浅灰描边 + 大圆角，更有层次感。
+    v3.22.21 审计修复: padding/spacing/圆角/线宽全部改为 dp() 密度无关值，适配不同分辨率。
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.orientation = 'vertical'
-        self.padding = [14, 12, 14, 12]
-        self.spacing = 6
+        # v3.22.21 审计修复: 硬编码像素改为 dp()，适配不同 Android 分辨率
+        self.padding = [dp(14), dp(12), dp(14), dp(12)]
+        self.spacing = dp(6)
         with self.canvas.before:
             Color(*THEME['card'])
-            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[14])
+            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(14)])
             Color(*THEME['card_border'])
-            self.border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, 10), width=1)
+            self.border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(10)), width=dp(1))
         self.bind(pos=self._update_rect, size=self._update_rect)
 
     def _update_rect(self, *args):
         self.rect.pos = self.pos
         self.rect.size = self.size
-        self.border.rounded_rectangle = (self.x, self.y, self.width, self.height, 10)
+        self.border.rounded_rectangle = (self.x, self.y, self.width, self.height, dp(10))
 
 
 class SectionLabel(Label):
@@ -3494,7 +3507,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.20", font_size='12sp',
+            text="v3.22.21", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3630,28 +3643,38 @@ class ColoredCheckBox(CheckBox):
     def _draw_appearance(self, *args):
         """根据 active 状态绘制外观。
         选中：填充 accent 色 + 白色对勾（简化为 ✓ 形状的 Line）。
-        未选中：浅色背景 + 灰色边框。"""
+        未选中：浅色背景 + 灰色边框。
+        v3.22.21: 绘制区域固定为 20dp×20dp（与原 Kivy CheckBox 默认尺寸一致），居中于 widget，
+                 不再使用 self.size（避免 widget 实际尺寸过大导致形状夸张）。size_hint_x 不变。
+        v3.22.21 审计修复: widget 未布局（width/height<=0）时跳过绘制，避免 (-10,-10) 离屏绘制；
+                 draw_size 取 min(dp(20), 实际尺寸) 防止小屏幕上 checkbox 超出 widget 边界。"""
         try:
             self.canvas.before.clear()
+            # v3.22.21 审计修复: widget 尚未布局时跳过绘制，避免离屏坐标
+            if self.width <= 0 or self.height <= 0:
+                return
+            # v3.22.21: 固定绘制尺寸 20dp×20dp，居中于 widget，不依赖 self.size
+            # 审计修复: 取 min(dp(20), 实际尺寸) 防止小屏幕上超出 widget 边界
+            draw_size = min(dp(20), self.width, self.height)
+            cx = self.center_x - draw_size / 2.0
+            cy = self.center_y - draw_size / 2.0
             with self.canvas.before:
                 if self.active:
                     # 选中：填充 accent 色（蓝色）
                     Color(*THEME.get('accent', (0.2, 0.5, 0.9, 1)))
-                    Rectangle(pos=self.pos, size=self.size)
-                    # 白色对勾（用 Line 绘制 ✓ 形状）
+                    Rectangle(pos=(cx, cy), size=(draw_size, draw_size))
+                    # 白色对勾（用 Line 绘制 ✓ 形状，基于固定绘制区域）
                     Color(1, 1, 1, 1)
-                    cx_w = self.width
-                    cy_h = self.height
-                    Line(points=[self.x + cx_w * 0.2, self.y + cy_h * 0.5,
-                                 self.x + cx_w * 0.4, self.y + cy_h * 0.3,
-                                 self.x + cx_w * 0.8, self.y + cy_h * 0.7],
+                    Line(points=[cx + draw_size * 0.2, cy + draw_size * 0.5,
+                                 cx + draw_size * 0.4, cy + draw_size * 0.3,
+                                 cx + draw_size * 0.8, cy + draw_size * 0.7],
                          width=dp(1.5))
                 else:
                     # 未选中：浅色背景 + 灰色边框
                     Color(1, 1, 1, 0.9)
-                    Rectangle(pos=self.pos, size=self.size)
+                    Rectangle(pos=(cx, cy), size=(draw_size, draw_size))
                     Color(0.4, 0.4, 0.4, 1)
-                    Line(rectangle=(self.x, self.y, self.width, self.height), width=dp(1.5))
+                    Line(rectangle=(cx, cy, draw_size, draw_size), width=dp(1.5))
         except Exception as e:
             app_log.error('UI', 'ColoredCheckBox._draw_appearance 异常: %s' % e)
 
@@ -5645,7 +5668,10 @@ class MainScreen(Screen):
         self.manager.current = 'ai'
 
     def _on_photo_request(self, row_index, borrower, address_general, address_precise, property_type):
-        """v3.20.0: 拍照会话入口 — 创建上下文 ctx 并启动会话锁，防止连拍期间切换客户"""
+        """v3.20.0: 拍照会话入口 — 创建上下文 ctx 并启动会话锁，防止连拍期间切换客户
+        v3.22.21: 多选拍摄支持 — 若 _row_selected 非空，ctx 中携带所有选中行的 key，
+                  拍完一张照片后对所有选中 key 调用 mark_photo（相册仅一张物理照片，
+                  各选中条目共享该照片路径）。单选（_row_selected 为空）行为不变。"""
         # v3.20.0: 会话锁 — 拍照进行中时拒绝新请求
         if self._photo_session_active:
             self.camera_mgr._dbg("拍照会话进行中，请先完成当前拍照", show_toast=True)
@@ -5660,6 +5686,31 @@ class MainScreen(Screen):
         self._current_key = self.progress_mgr._make_key(borrower, (address_general + address_precise).strip())
         self._photos_in_session = 0
 
+        # v3.22.21: 多选拍摄 — 收集所有选中行的 key（含当前行）
+        # 语义：同一客户的多处抵押物共享一张照片（基于备注共性/基础位置一致等）
+        # 相册仅保存一张物理照片（CameraManager 拍照逻辑不变），此处仅为各选中
+        # 条目记录该共享照片路径，使所有选中条目均标记为"已拍摄该类型"。
+        multi_select_keys = []  # 去重后的 key 列表（含当前 key）
+        multi_select_rows = []  # 对应的 row_index 列表（用于 UI 刷新）
+        if getattr(self, '_row_selected', None):
+            sel = set(self._row_selected)
+            sel.add(row_index)  # 始终包含当前触发拍照的行
+            for ri in sorted(sel):
+                try:
+                    row = self.rows[ri]
+                    b = row[1] if len(row) > 1 else ""
+                    if not b:
+                        continue
+                    ag = row[2] if len(row) > 2 else ""
+                    ap = row[3] if len(row) > 3 else ""
+                    fa = (ag + ap).strip()
+                    k = self.progress_mgr._make_key(b, fa)
+                    if k not in multi_select_keys:  # 去重（同 key 多行不重复记录）
+                        multi_select_keys.append(k)
+                        multi_select_rows.append(ri)
+                except Exception as e:
+                    app_log.error('PHOTO', '多选收集 key 异常 row=%d: %s' % (ri, e))
+
         # v3.20.0: 创建拍照会话上下文（通过闭包传递，不依赖实例状态）
         self._photo_session_ctx = {
             'row_index': row_index,
@@ -5669,6 +5720,10 @@ class MainScreen(Screen):
             'property_type': property_type,
             'photo_type': '',  # 在 _on_photo_type_selected 中设置
             'key': self._current_key,
+            # v3.22.21: 多选拍摄 — 共享同一张照片的所有 key/行号
+            # 主 mark_photo 调用仍用 ctx['key']，其余 key 在 _process 中追加调用
+            'multi_select_keys': multi_select_keys,
+            'multi_select_rows': multi_select_rows,
         }
 
         popup = PhotoTypePopup(on_select=self._on_photo_type_selected)
@@ -5854,6 +5909,17 @@ class MainScreen(Screen):
                 except Exception as e:
                     app_log.error('PHOTO', 'save_to_gallery 失败(不影响拍照保存): %s' % e)
                 self.progress_mgr.mark_photo(key, new_path, photo_type)
+                # v3.22.21: 多选拍摄 — 对所有其他选中 key 调用 mark_photo（共享同一张照片路径）
+                # 相册仅保存一张物理照片（new_path 已落盘），此处仅为其他选中条目记录该共享照片，
+                # 使其标记为"已拍摄该类型"。mark_photo 内部用 with self._lock 保证线程安全。
+                ms_keys = ctx.get('multi_select_keys') if ctx else None
+                if ms_keys:
+                    for k in ms_keys:
+                        if k and k != key:
+                            try:
+                                self.progress_mgr.mark_photo(k, new_path, photo_type)
+                            except Exception as e:
+                                app_log.error('PHOTO', '多选 mark_photo 异常 key=%s: %s' % (k, e))
                 Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename, ctx), 0)
             except Exception as e:
                 Logger.error("MainScreen._on_photo_done: %s" % e)
@@ -5867,6 +5933,15 @@ class MainScreen(Screen):
     @mainthread
     def _on_photo_saved(self, row_index, filename, ctx=None):
         self._refresh_row_done(row_index)
+        # v3.22.21: 多选拍摄 — 刷新所有其他选中行的 UI（已拍状态/计数）
+        ms_rows = ctx.get('multi_select_rows') if ctx else None
+        if ms_rows:
+            for ri in ms_rows:
+                if ri != row_index:
+                    try:
+                        self._refresh_row_done(ri)
+                    except Exception as e:
+                        app_log.error('PHOTO', '多选刷新行 UI 异常 row=%d: %s' % (ri, e))
         self.camera_mgr._dbg(f"[OK] 已保存: {filename}", show_toast=True)
         # v3.22.19: 异步生成压缩缩略图保存到 app 私有目录，规避 Scoped Storage 访问原图权限问题
         # ctx 中含 key（progress_key），filename 是原图 basename（保存在 APP_DIR 下）
@@ -6068,13 +6143,15 @@ class MainScreen(Screen):
                          size=lambda i, v: setattr(_bg, 'size', v))
 
         scroll = ScrollView()
-        list_layout = GridLayout(cols=3, spacing=dp(6), size_hint_y=None)
+        # v3.22.21: 缩略图改 2 列竖向布局（原 cols=3），每张约占弹窗宽度 45%
+        list_layout = GridLayout(cols=2, spacing=dp(6), size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
 
         thumb_slots = []  # 占位 widget 列表，用于异步加载缩略图
 
         for i, photo_path in enumerate(thumbnails):
-            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(150), spacing=dp(2))
+            # v3.22.21: 2 列布局下放大缩略图高度（150→220），充分利用弹窗宽度
+            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(220), spacing=dp(2))
             placeholder = Label(
                 text="加载中…", font_size='11sp', color=THEME['text_dim'],
                 size_hint_y=0.65, halign='center', valign='middle'
@@ -6145,6 +6222,8 @@ class MainScreen(Screen):
 
     def _load_thumbs_into(self, thumb_slots, thumbnails):
         """v3.22.20: 异步加载缩略图到 popup 内的占位 widget（替代原 PhotoViewerPopup._load_thumbs/_set_thumb）
+        v3.22.21: 用 PIL 检测图片宽高比，横版照片（width>height）逆时针旋转 90° 后再加载到 KivyImage；
+                  竖版照片不旋转。PIL 失败仅记录日志不崩溃，回退到原图路径。
         每张图用独立线程加载，避免大图同步解码阻塞 UI；加载完成后在主线程替换占位 Label 为 KivyImage。"""
         def _load_one(idx, path, slot):
             try:
@@ -6159,6 +6238,36 @@ class MainScreen(Screen):
                                     pass
                             Clock.schedule_once(_set_err, 0)
                             return
+                        # v3.22.21: 用 PIL 检测宽高比，横版照片逆时针旋转 90° 后再加载
+                        display_path = path
+                        try:
+                            with PILImage.open(path) as _im:
+                                _w, _h = _im.size
+                                if _w > _h:
+                                    # 横版：逆时针旋转 90°（PIL rotate 默认逆时针）
+                                    _rotated = _im.rotate(90, expand=True)
+                                    _tmp_dir = os.path.join(APP_DIR, 'tmp_rotated')
+                                    try:
+                                        os.makedirs(_tmp_dir, exist_ok=True)
+                                    except Exception:
+                                        pass
+                                    _tmp_name = 'rot_' + os.path.splitext(os.path.basename(path))[0] + '.png'
+                                    _rot_path = os.path.join(_tmp_dir, _tmp_name)
+                                    try:
+                                        _rotated.save(_rot_path)
+                                        display_path = _rot_path
+                                    except Exception as e:
+                                        app_log.error('PHOTO', '保存旋转缩略图失败 %s: %s' % (path, e))
+                                        display_path = path  # 保存失败回退原路径
+                                    finally:
+                                        # v3.22.21 审计修复: 释放 rotate() 返回的 PIL Image 对象，避免内存泄漏
+                                        try:
+                                            _rotated.close()
+                                        except Exception:
+                                            pass
+                        except Exception as e:
+                            app_log.error('PHOTO', 'PIL 检测/旋转缩略图失败 %s: %s' % (path, e))
+                            display_path = path  # PIL 失败回退原路径，不崩溃
                         # v3.22.20: 用 KivyImage 加载（参考原 _set_thumb 实现）
                         def _update(dt):
                             try:
@@ -6168,7 +6277,7 @@ class MainScreen(Screen):
                                 pos_in_parent = parent.children.index(slot)
                                 parent.remove_widget(slot)
                                 try:
-                                    img = KivyImage(source=path, size_hint_y=0.65,
+                                    img = KivyImage(source=display_path, size_hint_y=0.65,
                                                     allow_stretch=True, keep_ratio=True)
                                     parent.add_widget(img, pos_in_parent)
                                     thumb_slots[idx] = img
@@ -6201,21 +6310,28 @@ class MainScreen(Screen):
         photo_index == -1: 删除全部；photo_index >= 0: 删除单张。
         确认后调用 delete_callback(row_index, photo_index) 执行实际删除，并关闭 popup。"""
         is_delete_all = (photo_index == -1)
+        # v3.22.21: 二次确认弹窗增加"原图保留"提示（仅删除 app 内缩略图）
+        _retain_hint = "\n将仅删除 app 内缩略图，相册中的原图需在系统相册手动删除。"
         if is_delete_all:
             title = "危险操作确认"
-            msg = "确定要删除该客户的全部照片吗？\n此操作不可撤销！"
+            msg = "确定要删除该客户的全部照片吗？\n此操作不可撤销！" + _retain_hint
             msg_color = THEME['danger']
             yes_text = "全部删除"
         else:
             title = "确认删除"
-            msg = "确定要删除这张照片吗？\n此操作不可撤销。"
+            msg = "确定要删除这张照片吗？\n此操作不可撤销。" + _retain_hint
             msg_color = THEME['text']
             yes_text = "确认删除"
 
         content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        content.add_widget(Label(text=msg, font_size='16sp', color=msg_color, halign='center'))
+        # v3.22.21: 文案变长，需绑定 width→text_size 保证完整换行显示不被截断
+        msg_label = Label(text=msg, font_size='14sp', color=msg_color,
+                           halign='center', valign='middle', text_size=(0, None))
+        msg_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
+        content.add_widget(msg_label)
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        confirm_popup = ThemedPopup(title=title, size_hint=(0.8, 0.35), auto_dismiss=True)
+        # v3.22.21: 弹窗尺寸略放大（0.8,0.35 → 0.85,0.4）以容纳多行提示文案
+        confirm_popup = ThemedPopup(title=title, size_hint=(0.85, 0.4), auto_dismiss=True)
 
         yes_btn = RoundedButton(text=yes_text, font_size='16sp', background_color=THEME['danger'],
                                 background_normal='', color=(1, 1, 1, 1), bold=True)
@@ -6858,17 +6974,40 @@ class AIScreen(Screen):
         self.input_row.add_widget(send_btn)
         layout.add_widget(self.input_row)
 
+        # v3.22.21: 键盘遮挡修复 — 在布局底部添加可变高度 spacer。
+        # 键盘弹出时 spacer.height = 键盘高度，把 input_row 顶到键盘上方。
+        # 旧方案（v3.22.9）用 input_row.padding，但 input_row 是固定高度(dp(50))
+        # 的 BoxLayout，padding 仅在内部缩进子组件，不改变布局位置，input_row
+        # 仍在屏幕底部被键盘遮挡 — 这正是 v3.22.20 修复未生效的根因。
+        # spacer 在垂直 BoxLayout 中占据底部空间，scroll(size_hint_y=1) 自动收缩，
+        # input_row 随之上移到键盘上方。
+        self.keyboard_spacer = Widget(size_hint_y=None, height=0)
+        layout.add_widget(self.keyboard_spacer)
+
         self.add_widget(layout)
 
         # 欢迎消息
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
 
     def _on_input_focus(self, instance, value):
-        """v3.22.10: 简化 - 焦点变化时仅滚动聊天到底部。键盘遮挡由 softinput_mode='pan'（系统级）+ _on_keyboard_height padding（双保险）处理。
-        v3.22.20: 抽出 _scroll_chat_to_bottom 方法，便于复用与维护。"""
+        """v3.22.21: 焦点变化时滚动聊天到底部 + 兜底读取键盘高度。
+        旧方案仅依赖 on_keyboard_height 事件，但该事件在部分 Android 机型上
+        时机不稳定或与 focus 时序错开，导致 spacer 未及时撑开。
+        现增加兜底：聚焦后延迟读取 Window.keyboard_height，若 spacer 高度与
+        实际键盘高度不符则主动校正。"""
         try:
             if value:
                 Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.3)
+                # v3.22.21: 兜底 — 延迟读取 Window.keyboard_height 校正 spacer
+                def _check_kb_height(dt):
+                    try:
+                        kh = Window.keyboard_height
+                        if kh > 0 and self.keyboard_spacer.height != kh:
+                            self.keyboard_spacer.height = kh
+                            Clock.schedule_once(lambda d: self._scroll_chat_to_bottom(), 0.1)
+                    except Exception:
+                        pass
+                Clock.schedule_once(_check_kb_height, 0.5)
         except Exception as e:
             app_log.error('AI', '_on_input_focus 异常: %s' % e)
 
@@ -6882,30 +7021,35 @@ class AIScreen(Screen):
             app_log.error('AI', '_scroll_chat_to_bottom 异常: %s' % e)
 
     def _on_keyboard_height(self, instance, height):
-        """v3.22.9: 键盘高度变化时调整 input_row 的 bottom padding。
-        这是 Kivy Android 社区公认最稳的键盘适配方案，
-        替代 v3.22.7 的 softinput_mode 动态切换（时机太晚无效）。"""
+        """v3.22.21: 键盘高度变化时撑开/收起 keyboard_spacer，把 input_row 顶到键盘上方。
+        替代 v3.22.9 的 input_row.padding 方案（padding 不改变固定高度 BoxLayout 的位置）。
+        Window.on_keyboard_height 是 Kivy Android 反映软键盘高度变化的标准事件。"""
         try:
             if height > 0:
-                # 键盘弹出：input_row 加 bottom padding = 键盘高度，把输入框顶到键盘上方
-                self.input_row.padding = [0, 0, 0, height]
+                # 键盘弹出：spacer 撑开到键盘高度，input_row 上移到键盘上方
+                self.keyboard_spacer.height = height
                 # 延迟滚动聊天记录到底部（等键盘完全弹出）
-                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.1)
+                Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.2)
             else:
-                # 键盘收起：恢复 padding
-                self.input_row.padding = [0, 0, 0, 0]
+                # 键盘收起：spacer 归零，恢复布局
+                self.keyboard_spacer.height = 0
         except Exception as e:
             app_log.error('AI', '_on_keyboard_height 异常: %s' % e)
 
     def on_leave(self):
-        """v3.22.9: 离开 AI 界面时解绑键盘高度监听，避免内存泄漏"""
+        """v3.22.21: 离开 AI 界面时收起键盘并归零 spacer。
+        不再解绑 on_keyboard_height — 旧版解绑后无 on_enter 重新绑定，
+        导致首次离开后再进入 AIScreen 时键盘事件永久失效（v3.22.20 修复未生效的另一根因）。
+        保持绑定到 app 生命周期，修改 spacer 在非可见时无副作用。"""
         try:
-            Window.unbind(on_keyboard_height=self._on_keyboard_height)
             # 离开时收起键盘
             if self.input_field:
                 self.input_field.focus = False
+            # 归零 spacer，避免下次进入时残留键盘高度
+            if hasattr(self, 'keyboard_spacer'):
+                self.keyboard_spacer.height = 0
         except Exception as e:
-            app_log.error('AI', 'on_leave 解绑异常: %s' % e)
+            app_log.error('AI', 'on_leave 异常: %s' % e)
 
     def _add_message(self, role, text):
         """添加一条消息到聊天区"""
@@ -7131,6 +7275,24 @@ class LoanPhotoApp(App):
             setup_android_status_bar()
             self._register_android_activity_result()
             self._request_permissions()
+        # v3.22.21 审计修复: 清理 tmp_rotated 缓存目录，避免无限增长
+        # （旋转缩略图运行时按需重建，命名规则保证同一图片复用同一文件不重复）
+        self._cleanup_tmp_rotated()
+
+    def _cleanup_tmp_rotated(self):
+        """v3.22.21 审计修复: 清理 APP_DIR/tmp_rotated/ 下的旋转缩略图缓存。
+        命名规则 rot_<basename>.png 保证同一图片复用同一文件（不重复），
+        但不同图片会累积。启动时清理，避免目录无限增长。"""
+        try:
+            _tmp_dir = os.path.join(APP_DIR, 'tmp_rotated')
+            if os.path.isdir(_tmp_dir):
+                for _fn in os.listdir(_tmp_dir):
+                    try:
+                        os.remove(os.path.join(_tmp_dir, _fn))
+                    except Exception:
+                        pass
+        except Exception as e:
+            app_log.warning('UI', '清理 tmp_rotated 失败: %s' % e)
 
     def _register_android_activity_result(self):
         """注册Android activity结果回调，把文件选择器结果转发给MainScreen"""
