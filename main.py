@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.18
+资产盘点专项拍照工具 App - v3.22.20
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -238,7 +238,7 @@ if IS_ANDROID:
     try:
         from android import api_version
         ANDROID_API = api_version
-    except:
+    except Exception:  # v3.22.20: 原 bare except → except Exception（ImportError 等）
         ANDROID_API = 30
 
     from jnius import PythonJavaClass, java_method
@@ -1122,7 +1122,7 @@ class ProgressManager:
                     idx = int(idx_str)
                     if idx > max_idx:
                         max_idx = idx
-                except:
+                except Exception:  # v3.22.20: 原 bare except → except Exception（ValueError/TypeError 等）
                     pass
         return max_idx + 1
 
@@ -2089,7 +2089,7 @@ class PhotoProcessor:
         if os.path.exists(FONT_PATH):
             try:
                 return ImageFont.truetype(FONT_PATH, size)
-            except:
+            except Exception:  # v3.22.20: 原 bare except → except Exception（IOError/OSError 等）
                 pass
         font_paths = [
             "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
@@ -2100,7 +2100,7 @@ class PhotoProcessor:
         for fp in font_paths:
             try:
                 return ImageFont.truetype(fp, size)
-            except:
+            except Exception:  # v3.22.20: 原 bare except → except Exception（IOError/OSError 等）
                 continue
         return ImageFont.load_default()
 
@@ -2677,12 +2677,12 @@ class CameraManager:
                 os.makedirs(APP_DIR, exist_ok=True)
                 with open(self._debug_log_path, 'a', encoding='utf-8') as f:
                     f.write(line + "\n")
-            except:
+            except Exception:  # v3.22.20: 原 bare except → except Exception（OSError 等）
                 pass
         if self.status_callback:
             try:
                 self.status_callback('\n'.join(self._log_lines[-10:]))
-            except:
+            except Exception:  # v3.22.20: 原 bare except → except Exception（回调可能抛任意异常）
                 pass
         if show_toast:
             self._toast(msg)
@@ -3494,7 +3494,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.19", font_size='12sp',
+            text="v3.22.20", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3610,6 +3610,53 @@ class ThemedPopup(Popup):
 
 
 # ============================================================
+# v3.22.20: 自定义颜色 CheckBox
+# ============================================================
+
+class ColoredCheckBox(CheckBox):
+    """v3.22.20: 自定义颜色 CheckBox，确保与背景对比明显。
+    未选中：白色边框 + 浅色背景
+    选中：填充 accent 色（蓝色）+ 白色对勾
+    通过 canvas.before 自定义绘制外观，绑定 active/pos/size 事件刷新。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # v3.22.20: 用 canvas.before 自定义绘制外观
+        self._draw_appearance()
+        self.bind(active=lambda *a: self._draw_appearance())
+        self.bind(pos=lambda *a: self._draw_appearance())
+        self.bind(size=lambda *a: self._draw_appearance())
+
+    def _draw_appearance(self, *args):
+        """根据 active 状态绘制外观。
+        选中：填充 accent 色 + 白色对勾（简化为 ✓ 形状的 Line）。
+        未选中：浅色背景 + 灰色边框。"""
+        try:
+            self.canvas.before.clear()
+            with self.canvas.before:
+                if self.active:
+                    # 选中：填充 accent 色（蓝色）
+                    Color(*THEME.get('accent', (0.2, 0.5, 0.9, 1)))
+                    Rectangle(pos=self.pos, size=self.size)
+                    # 白色对勾（用 Line 绘制 ✓ 形状）
+                    Color(1, 1, 1, 1)
+                    cx_w = self.width
+                    cy_h = self.height
+                    Line(points=[self.x + cx_w * 0.2, self.y + cy_h * 0.5,
+                                 self.x + cx_w * 0.4, self.y + cy_h * 0.3,
+                                 self.x + cx_w * 0.8, self.y + cy_h * 0.7],
+                         width=dp(1.5))
+                else:
+                    # 未选中：浅色背景 + 灰色边框
+                    Color(1, 1, 1, 0.9)
+                    Rectangle(pos=self.pos, size=self.size)
+                    Color(0.4, 0.4, 0.4, 1)
+                    Line(rectangle=(self.x, self.y, self.width, self.height), width=dp(1.5))
+        except Exception as e:
+            app_log.error('UI', 'ColoredCheckBox._draw_appearance 异常: %s' % e)
+
+
+# ============================================================
 # v3.22.13: 今日走访补充说明对话框
 # ============================================================
 
@@ -3630,6 +3677,8 @@ class VisitNoteDialog(ThemedPopup):
         self.auto_dismiss = False  # 避免误关闭丢失输入
         self.size_hint = (0.9, None)
         self.height = dp(420)
+        # v3.22.20: 窗口默认位置在屏幕顶端，确保键盘弹出后内容仍可见
+        self.pos_hint = {'top': 0.95}
 
         self._on_confirm_callback = on_confirm
         self._initial_text = initial_text
@@ -3717,246 +3766,6 @@ class VisitNoteDialog(ThemedPopup):
     def get_text(self):
         """获取输入文本"""
         return self.text_input.text or ''
-
-
-# ============================================================
-# 照片查看弹窗
-# ============================================================
-
-class PhotoViewerPopup(Popup):
-    """v3.22.0: 异步加载缩略图，避免大图同步解码导致"查看已拍"卡顿；
-    浅色背景白底深字，确保删除确认弹窗可读。
-    v3.22.18: 直接继承 Popup，背景绘制在 content.canvas.before（匹配 _show_report_confirm 有效模式）"""
-    _THUMB_DIR = None  # 缩略图缓存目录（惰性初始化）
-
-    def __init__(self, row_index, photos, delete_callback,
-                 photo_count=None, progress_key=None, **kwargs):
-        super().__init__(**kwargs)
-        # v3.22.19: photos 含义改为缩略图路径列表；title 仍显示原照片数量（photo_count）
-        self.title = f"已拍照片 (%d张)" % (photo_count if photo_count is not None else len(photos))
-        self.title_color = THEME['accent_dark']
-        self.separator_color = THEME['card_border']
-        self.auto_dismiss = False  # v3.22.17: 防止被打开它的同一触摸事件立即关闭
-        self.size_hint = (None, None)
-        self.size = (int(Window.width * 0.92), int(Window.height * 0.8))
-        self.center = (Window.width / 2, Window.height / 2)
-        self.row_index = row_index
-        self.photos = photos  # v3.22.19: 缩略图路径列表
-        self.photo_count = photo_count if photo_count is not None else len(photos)
-        self.progress_key = progress_key  # v3.22.19: 用于删除缩略图
-        self.delete_callback = delete_callback
-        self._thumb_slots = []  # 每项图片占位 widget，索引对应 photos
-
-        main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
-        # v3.22.18: 在 content 的 canvas.before 中绘制浅色背景（匹配 _show_report_confirm 有效模式）
-        with main_layout.canvas.before:
-            Color(*THEME['card'])
-            self._content_bg = Rectangle(pos=main_layout.pos, size=main_layout.size)
-        main_layout.bind(pos=self._update_content_bg, size=self._update_content_bg)
-        scroll = ScrollView()
-        list_layout = GridLayout(cols=3, spacing=dp(6), size_hint_y=None)
-        list_layout.bind(minimum_height=list_layout.setter('height'))
-
-        for i, photo_path in enumerate(photos):
-            # v3.22.14: 回退到 v3.22.12 内嵌缩略图方案
-            # BoxLayout(垂直) = 加载中 Label(占位) + 文件名 Label + 删除按钮
-            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(150), spacing=dp(2))
-            placeholder = Label(
-                text="加载中…", font_size='11sp', color=THEME['text_dim'],
-                size_hint_y=0.65, halign='center', valign='middle'
-            )
-            item.add_widget(placeholder)
-            self._thumb_slots.append(placeholder)
-
-            fname = os.path.basename(photo_path)
-            if len(fname) > 16:
-                fname = fname[:13] + '...'
-            name_label = Label(
-                text=fname, font_size='10sp', halign='center', valign='middle',
-                size_hint_y=0.15, color=THEME['text_dim'], text_size=(0, None)
-            )
-            name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
-            item.add_widget(name_label)
-
-            del_btn = RoundedButton(
-                text="删除", font_size='11sp', size_hint_y=0.20, height=dp(32),
-                background_color=THEME['danger'], background_normal='', color=(1,1,1,1), bold=True
-            )
-            del_btn.bind(on_press=lambda x, idx=i: self._confirm_delete(idx))
-            bind_press_animation(del_btn)
-            item.add_widget(del_btn)
-
-            list_layout.add_widget(item)
-
-        scroll.add_widget(list_layout)
-        main_layout.add_widget(scroll)
-
-        del_all_btn = RoundedButton(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
-                            background_color=THEME['danger'], background_normal='',
-                            color=(1,1,1,1), bold=True)
-        del_all_btn.bind(on_press=self._confirm_delete_all)
-        main_layout.add_widget(del_all_btn)
-
-        close_btn = RoundedButton(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
-                          background_color=THEME['accent'], background_normal='',
-                          color=(1,1,1,1), bold=True)
-        close_btn.bind(on_press=self.dismiss)
-        main_layout.add_widget(close_btn)
-        self.content = main_layout
-
-        # v3.22.0: 弹窗显示后异步加载缩略图
-        self.bind(on_open=lambda *a: Clock.schedule_once(self._load_thumbs, 0.1))
-
-    def _update_content_bg(self, instance, value):
-        self._content_bg.pos = instance.pos
-        self._content_bg.size = instance.size
-
-    @classmethod
-    def _get_thumb_dir(cls):
-        if cls._THUMB_DIR is None:
-            cls._THUMB_DIR = os.path.join(APP_DIR, 'thumbs')
-            try:
-                os.makedirs(cls._THUMB_DIR, exist_ok=True)
-            except Exception:
-                pass
-        return cls._THUMB_DIR
-
-    def _ensure_thumb(self, photo_path):
-        """生成缩略图（240px），返回缓存路径；失败返回 None"""
-        try:
-            if not os.path.exists(photo_path):
-                return None
-            st = os.stat(photo_path)
-            # 缓存名：大小+修改时间+文件名，避免失效
-            safe = re.sub(r'[^\w]', '_', os.path.basename(photo_path))[:40]
-            thumb_name = "%s_%d_%s.png" % (safe, int(st.st_size), int(st.st_mtime))
-            thumb_path = os.path.join(self._get_thumb_dir(), thumb_name)
-            if os.path.exists(thumb_path):
-                return thumb_path
-            # v3.22.12: 用 with 管理文件句柄，thumbnail/save 后自动关闭
-            with PILImage.open(photo_path) as img:
-                img.thumbnail((240, 240))
-                img.save(thumb_path, 'PNG')
-            return thumb_path
-        except Exception as e:
-            app_log.error('PHOTO', '生成缩略图失败: %s' % e)
-            return None
-
-    def _load_thumbs(self, *args):
-        """v3.22.19: self.photos 已是缩略图路径列表，无需再调用 _ensure_thumb 生成。
-        后台逐张验证文件存在并调度主线程替换占位 widget。"""
-        import threading
-        def _worker():
-            for i, p in enumerate(self.photos):
-                try:
-                    # popup 已关闭则停止
-                    if self.parent is None and not self._is_open():
-                        return
-                except Exception:
-                    pass
-                # v3.22.19: 缩略图路径直接用，不再调用 _ensure_thumb（避免重复生成）
-                if p and os.path.exists(p):
-                    Clock.schedule_once(lambda dt, idx=i, t=p: self._set_thumb(idx, t), 0)
-                else:
-                    app_log.error('PHOTO', '缩略图文件不存在: %s' % p)
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _is_open(self):
-        try:
-            return self.parent is not None
-        except Exception:
-            return False
-
-    def _set_thumb(self, idx, thumb_path):
-        """v3.22.14: 回退到 v3.22.12 — 用 KivyImage 替换占位 Label
-        （v3.22.13 改为设置 Button.background_normal，回退后改回替换 widget）"""
-        placeholder = self._thumb_slots[idx]
-        parent = placeholder.parent
-        if parent is None:
-            return
-        pos_in_parent = parent.children.index(placeholder)
-        parent.remove_widget(placeholder)
-        try:
-            img = KivyImage(source=thumb_path, size_hint_y=0.65,
-                            allow_stretch=True, keep_ratio=True)
-            parent.add_widget(img, pos_in_parent)
-            self._thumb_slots[idx] = img
-        except Exception as e:
-            app_log.error('PHOTO', '设置缩略图失败 idx=%d: %s' % (idx, e))
-            err_label = Label(text="加载失败", font_size='10sp', color=THEME['danger'],
-                              size_hint_y=0.65, halign='center', valign='middle')
-            parent.add_widget(err_label, pos_in_parent)
-            self._thumb_slots[idx] = err_label
-
-    def _show_msg_safe(self, msg):
-        """v3.22.13: PhotoViewerPopup 内部用 — 无 MainScreen._show_msg 时的 fallback
-        v3.22.13 修复: 原实现仅记日志，用户看不到失败反馈（违反 v3.22.13 「Toast 反馈」目标）。
-        现改为 Android 上弹 Toast，非 Android 环境仅记录日志。"""
-        try:
-            app_log.error('UI', msg)
-        except Exception:
-            pass
-        # v3.22.13: Android 上弹 Toast 让用户看到失败原因
-        if IS_ANDROID:
-            try:
-                from jnius import autoclass
-                Toast = autoclass('android.widget.Toast')
-                PythonActivity = autoclass('org.kivy.android.PythonActivity')
-                Toast.makeText(PythonActivity.mActivity, msg, Toast.LENGTH_SHORT).show()
-            except Exception:
-                pass
-
-    def _confirm_delete(self, index):
-        """删除单张照片前弹出二次确认（v3.22.0: 白底深字可读）
-        v3.22.9: 改用 ThemedPopup，背景与标题色由基类统一处理。"""
-        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
-        content.add_widget(Label(text=f"确定要删除这张照片吗？\n此操作不可撤销。",
-                                 font_size='16sp', color=THEME['text'], halign='center'))
-        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        popup = ThemedPopup(title="确认删除",
-                      size_hint=(0.8, 0.35), auto_dismiss=True)
-        yes_btn = RoundedButton(text="确认删除", font_size='16sp', background_color=THEME['danger'],
-                         background_normal='', color=(1,1,1,1), bold=True)
-        no_btn = RoundedButton(text="取消", font_size='16sp', background_color=THEME['accent'],
-                        background_normal='', color=(1,1,1,1), bold=True)
-        def _do_delete(instance):
-            popup.dismiss()
-            self.delete_callback(self.row_index, index)
-            self.dismiss()
-        yes_btn.bind(on_release=_do_delete)
-        no_btn.bind(on_release=popup.dismiss)
-        btn_row.add_widget(yes_btn)
-        btn_row.add_widget(no_btn)
-        content.add_widget(btn_row)
-        popup.content = content
-        popup.open()
-
-    def _confirm_delete_all(self, instance):
-        """删除全部照片前弹出二次确认（v3.22.0: 白底深字可读）
-        v3.22.9: 改用 ThemedPopup，背景与标题色由基类统一处理。"""
-        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
-        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
-        content.add_widget(Label(text=f"确定要删除该客户的全部照片吗？\n此操作不可撤销！",
-                                 font_size='16sp', color=THEME['danger'], halign='center'))
-        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        popup = ThemedPopup(title="危险操作确认",
-                      size_hint=(0.85, 0.35), auto_dismiss=True)
-        yes_btn = RoundedButton(text="全部删除", font_size='16sp', background_color=THEME['danger'],
-                         background_normal='', color=(1,1,1,1), bold=True)
-        no_btn = RoundedButton(text="取消", font_size='16sp', background_color=THEME['accent'],
-                        background_normal='', color=(1,1,1,1), bold=True)
-        def _do_delete_all(instance):
-            popup.dismiss()
-            self.delete_callback(self.row_index, -1)
-            self.dismiss()
-        yes_btn.bind(on_release=_do_delete_all)
-        no_btn.bind(on_release=popup.dismiss)
-        btn_row.add_widget(yes_btn)
-        btn_row.add_widget(no_btn)
-        content.add_widget(btn_row)
-        popup.content = content
-        popup.open()
 
 
 # ============================================================
@@ -4270,7 +4079,8 @@ class RowWidget(BoxLayout):
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         # v3.22.19: 左侧 CheckBox 列（与表头 CheckBox 对齐，size_hint_x=0.08）
-        self.checkbox = CheckBox(size_hint_x=0.08, active=False)
+        # v3.22.20: 改用 ColoredCheckBox，确保颜色与背景对比明显
+        self.checkbox = ColoredCheckBox(size_hint_x=0.08, active=False)
         self.checkbox.bind(active=self._on_row_checkbox_changed)
         self.add_widget(self.checkbox)
 
@@ -4728,7 +4538,9 @@ class MainScreen(Screen):
         msg.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
         self.list_layout.add_widget(msg)
         # v3.22.0: 展示最近打开的 Excel 记录（3-5 条）
-        # v3.22.19: 每项改为 BoxLayout 横向布局（文件名按钮 | 数据指示器圆点 | 清除按钮）
+        # v3.22.19: 每项改为 BoxLayout 横向布局（文件名按钮 | 数据指示器 | 清除按钮）
+        # v3.22.20: 数据指示器由圆点 Widget 改为文字按钮（"有数据 N 项" / "无数据"），
+        #           清除按钮改为弹窗二次确认（替代原"再次确认"文本切换）。
         recent = self.config.get('recent_excel', []) or []
         if recent:
             title = Label(text="最近打开", font_size='14sp', bold=True, color=THEME['accent_dark'],
@@ -4738,7 +4550,7 @@ class MainScreen(Screen):
             for item in recent[:5]:
                 uri = item.get('uri', '')
                 name = item.get('name', 'Excel文件')
-                # 横向布局：[文件名按钮（0.78）][数据指示器圆点（0.06）][清除按钮（0.16）]
+                # 横向布局：[文件名按钮（0.66）][数据指示器按钮（0.18）][清除按钮（0.16）]
                 row_box = BoxLayout(
                     orientation='horizontal', size_hint_y=None, height=dp(50),
                     spacing=dp(4),
@@ -4746,7 +4558,7 @@ class MainScreen(Screen):
                 # 文件名按钮
                 btn = RoundedButton(
                     text=name, font_size='17sp',
-                    size_hint_x=0.78,
+                    size_hint_x=0.66,
                     background_color=THEME['bg'],
                     color=THEME['accent_dark'],
                     background_normal='',
@@ -4755,23 +4567,26 @@ class MainScreen(Screen):
                 bind_press_animation(btn)
                 row_box.add_widget(btn)
 
-                # 数据指示器圆点（绿色=有数据；灰色=无数据）
+                # v3.22.20: 数据指示器改为文字按钮（"有数据 N 项" 绿色 / "无数据" 灰色）
                 has_data = self._excel_has_data(uri)
-                dot = Widget(size_hint_x=0.06, size=(dp(12), dp(12)))
-                dot_color = THEME['success'] if has_data else THEME['text_dim']
-                with dot.canvas.before:
-                    Color(*dot_color)
-                    dot._dot_circle = Ellipse(pos=(0, 0), size=(dp(12), dp(12)))
-                # 居中绘制圆点
-                def _update_dot(inst, val, _dot_circle=dot._dot_circle):
-                    try:
-                        # 在 Widget 内部居中
-                        _dot_circle.pos = ((inst.width - dp(12)) / 2,
-                                            (inst.height - dp(12)) / 2)
-                    except Exception:
-                        pass
-                dot.bind(pos=_update_dot, size=_update_dot)
-                row_box.add_widget(dot)
+                data_count = self._get_excel_data_count(uri) if has_data else 0
+                if has_data:
+                    data_btn = RoundedButton(
+                        text="有数据 %d 项" % data_count, font_size='10sp',
+                        size_hint_x=0.18, height=dp(28),
+                        background_color=THEME['success'], background_normal='',
+                        color=(1, 1, 1, 1), bold=True,
+                    )
+                else:
+                    data_btn = RoundedButton(
+                        text="无数据", font_size='10sp',
+                        size_hint_x=0.18, height=dp(28),
+                        background_color=THEME['text_dim'], background_normal='',
+                        color=(1, 1, 1, 1),
+                    )
+                data_btn.disabled = True  # v3.22.20: 仅显示，不可点击
+                bind_press_animation(data_btn)
+                row_box.add_widget(data_btn)
 
                 # 清除按钮
                 clear_btn = RoundedButton(
@@ -4816,66 +4631,130 @@ class MainScreen(Screen):
             app_log.error('UI', '_excel_has_data 异常 uri=%s: %s' % (uri, e))
             return False
 
-    def _on_clear_excel_data(self, uri, name, btn):
-        """v3.22.19: 清除该 Excel 在 app 内的关联数据（缩略图 + visit_note）。
-        2 次确认逻辑：首次点击改文本为"再次确认"，3 秒内再次点击执行清除。"""
+    def _get_excel_data_count(self, uri):
+        """v3.22.20: 返回该 Excel 在 app 内的数据项数（用于数据指示器按钮文案）。
+        统计口径：缩略图数量（APP_DIR/thumbnails/ 下所有 .jpg 文件数）
+        + visit_note 是否存在（1 或 0）。"""
         try:
-            # 已处于"再次确认"状态 → 执行清除
-            if getattr(btn, '_confirming_clear', False):
-                btn._confirming_clear = False
-                # 取消已 schedule 的还原回调
-                if getattr(btn, '_restore_ev', None):
-                    try:
-                        btn._restore_ev.cancel()
-                    except Exception:
-                        pass
-                    btn._restore_ev = None
-                # 执行清除
-                # 1. 删除 APP_DIR/thumbnails/ 下所有内容（无法精确关联，全部清除）
-                try:
-                    import shutil
-                    thumb_root = os.path.join(APP_DIR, 'thumbnails')
-                    if os.path.isdir(thumb_root):
-                        for sub in os.listdir(thumb_root):
-                            sub_path = os.path.join(thumb_root, sub)
-                            if os.path.isdir(sub_path):
-                                shutil.rmtree(sub_path, ignore_errors=True)
-                except Exception as e:
-                    app_log.error('UI', '清除缩略图目录失败: %s' % e)
-                # 2. 删除 visit_note 文件（用 uri md5 哈希）
-                try:
-                    visit_note_path = self._get_visit_note_path(uri)
-                    if visit_note_path and os.path.exists(visit_note_path):
-                        os.remove(visit_note_path)
-                        app_log.info('IO', '已删除 visit_note: %s' % visit_note_path)
-                except Exception as e:
-                    app_log.error('IO', '删除 visit_note 失败: %s' % e)
-                # 3. 还原按钮文本
-                btn.text = "清除"
-                # 4. 显示 toast
-                try:
-                    self._show_android_toast("已清除 %s 的数据" % name)
-                except Exception:
-                    pass
-                app_log.info('UI', '已清除 Excel 数据: %s' % name)
-                # 5. 刷新最近列表
-                self._refresh_list()
-            else:
-                # 首次点击：改文本，3 秒后还原
-                btn._confirming_clear = True
-                btn.text = "再次确认"
-                def _restore_text(dt):
-                    try:
-                        btn.text = "清除"
-                        btn._confirming_clear = False
-                    except Exception:
-                        pass
-                btn._restore_ev = Clock.schedule_once(_restore_text, 3.0)
+            if not uri:
+                return 0
+            count = 0
+            # 1. 统计缩略图数量
+            thumb_root = os.path.join(APP_DIR, 'thumbnails')
+            if os.path.isdir(thumb_root):
+                for sub in os.listdir(thumb_root):
+                    sub_path = os.path.join(thumb_root, sub)
+                    if os.path.isdir(sub_path):
+                        for f in os.listdir(sub_path):
+                            if f.lower().endswith('.jpg'):
+                                count += 1
+            # 2. visit_note 是否存在
+            visit_note_path = self._get_visit_note_path(uri)
+            if visit_note_path and os.path.exists(visit_note_path):
+                count += 1
+            return count
+        except Exception as e:
+            app_log.error('UI', '_get_excel_data_count 异常 uri=%s: %s' % (uri, e))
+            return 0
+
+    def _on_clear_excel_data(self, uri, name, btn):
+        """v3.22.20: 清除该 Excel 在 app 内的关联数据（缩略图 + visit_note）。
+        改为直接弹出二次确认对话框（替代原"再次确认"文本切换逻辑，避免按钮文案状态歧义）。"""
+        try:
+            self._show_clear_confirm_dialog(uri, name)
         except Exception as e:
             app_log.error('UI', '_on_clear_excel_data 异常: %s' % e, exc_info=True)
             try:
-                btn.text = "清除"
-                btn._confirming_clear = False
+                self._show_msg("清除数据失败: %s" % str(e)[:60], THEME['danger'])
+            except Exception:
+                pass
+
+    def _show_clear_confirm_dialog(self, uri, name):
+        """v3.22.20: 清除数据二次确认对话框（替代原"再次确认"文本切换）"""
+        content = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(15))
+        # v3.22.20: 在 content 的 canvas.before 中绘制浅色背景（匹配 _show_report_confirm 有效模式）
+        with content.canvas.before:
+            Color(*THEME['card'])
+            _bg = Rectangle(pos=content.pos, size=content.size)
+        content.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
+                     size=lambda i, v: setattr(_bg, 'size', v))
+
+        title_label = Label(
+            text="即将清除：%s" % name, font_size=dp(16), bold=True,
+            color=THEME.get('text', (0.1, 0.1, 0.1, 1)),
+            size_hint_y=None, height=dp(40), halign='left'
+        )
+        title_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
+        content.add_widget(title_label)
+
+        msg_label = Label(
+            text="将删除：\n- 缩略图（已拍摄照片的预览）\n- 备注（F列备注内容）\n- 今日走访补充说明\n- 拍摄进度记录\n\n删除后无法恢复，AI 报告将无法引用此 Excel 的走访数据。",
+            font_size='13sp', color=THEME.get('text', (0.1, 0.1, 0.1, 1)),
+            halign='left', valign='top', text_size=(0, None)
+        )
+        msg_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
+        content.add_widget(msg_label)
+
+        btn_layout = BoxLayout(orientation='horizontal', spacing=dp(10), size_hint_y=None, height=dp(48))
+
+        cancel_btn = RoundedButton(
+            text="取消", font_size='15sp',
+            background_color=THEME['accent'], background_normal='',
+            color=(1, 1, 1, 1), bold=True
+        )
+        confirm_btn = RoundedButton(
+            text="确认删除", font_size='15sp',
+            background_color=THEME['danger'], background_normal='',
+            color=(1, 1, 1, 1), bold=True
+        )
+        bind_press_animation(cancel_btn)
+        bind_press_animation(confirm_btn)
+
+        popup = ThemedPopup(
+            title='确认清除数据',
+            content=content,
+            size_hint=(0.85, 0.5)
+        )
+
+        cancel_btn.bind(on_press=popup.dismiss)
+        confirm_btn.bind(on_press=lambda x: self._execute_clear_data(uri, name, popup))
+
+        btn_layout.add_widget(cancel_btn)
+        btn_layout.add_widget(confirm_btn)
+        content.add_widget(btn_layout)
+
+        popup.open()
+
+    def _execute_clear_data(self, uri, name, popup):
+        """v3.22.20: 执行清除数据（缩略图目录 + visit_note 文件）"""
+        try:
+            popup.dismiss()
+            import shutil
+            # 1. 删除缩略图目录下所有内容
+            thumb_dir = os.path.join(APP_DIR, 'thumbnails')
+            if os.path.exists(thumb_dir):
+                for sub in os.listdir(thumb_dir):
+                    sub_path = os.path.join(thumb_dir, sub)
+                    try:
+                        if os.path.isdir(sub_path):
+                            shutil.rmtree(sub_path, ignore_errors=True)
+                    except Exception as e:
+                        app_log.error('UI', '删除缩略图目录失败 %s: %s' % (sub_path, e))
+            # 2. 删除 visit_note
+            visit_note_path = self._get_visit_note_path(uri)
+            if visit_note_path and os.path.exists(visit_note_path):
+                try:
+                    os.remove(visit_note_path)
+                    app_log.info('IO', '已删除 visit_note: %s' % visit_note_path)
+                except Exception as e:
+                    app_log.error('IO', '删除 visit_note 失败: %s' % e)
+            app_log.info('UI', '已清除 Excel 数据: %s' % name)
+            self._show_msg("已清除 %s 的数据" % name, THEME['success'])
+            self._refresh_list()
+        except Exception as e:
+            app_log.error('UI', '_execute_clear_data 异常: %s' % e)
+            try:
+                self._show_msg("清除数据失败: %s" % str(e)[:60], THEME['danger'])
             except Exception:
                 pass
 
@@ -4960,7 +4839,8 @@ class MainScreen(Screen):
             self._header_rect = RoundedRectangle(pos=header.pos, size=header.size, radius=[10])
         header.bind(pos=self._update_header_rect, size=self._update_header_rect)
         # v3.22.19: 全选 CheckBox
-        self.header_checkbox = CheckBox(size_hint_x=0.08, active=False)
+        # v3.22.20: 改用 ColoredCheckBox，确保颜色与背景对比明显
+        self.header_checkbox = ColoredCheckBox(size_hint_x=0.08, active=False)
         self.header_checkbox.bind(active=self._on_select_all)
         header.add_widget(self.header_checkbox)
         header.add_widget(Label(text="客户名 / 抵押物地址", font_size='13sp', bold=True,
@@ -6138,20 +6018,22 @@ class MainScreen(Screen):
             if not thumbnails:
                 self._show_msg('该客户暂无缩略图（仅原图）')
                 return
-            # v3.22.17: 直接创建 PhotoViewerPopup 并 open()（显式设置像素尺寸，无需 Clock.schedule_once 延迟）
-            # v3.22.19: photos 参数改为缩略图路径列表，title 仍显示原照片数量
+            # v3.22.20: 改用工厂方法 _show_photo_viewer_popup 创建 Popup（替代继承 PhotoViewerPopup）。
+            # 直接用 Popup(...) 创建，与 _show_report_confirm / _show_msg 一致，确保 popup.parent 不为 None。
             try:
-                app_log.info('PHOTO', '创建 PhotoViewerPopup: thumbnails=%d' % len(thumbnails))
-                popup = PhotoViewerPopup(row_index=row_index, photos=thumbnails,
-                                         photo_count=orig_count,
-                                         progress_key=key,
-                                         delete_callback=self._on_delete_photo)
-                popup.open()
-                app_log.info('PHOTO', 'PhotoViewerPopup.open() 已调用')
+                app_log.info('PHOTO', '创建照片查看 Popup（工厂方法）: thumbnails=%d' % len(thumbnails))
+                popup = self._show_photo_viewer_popup(
+                    row_index=row_index,
+                    thumbnails=thumbnails,
+                    photo_count=orig_count,
+                    progress_key=key,
+                    delete_callback=self._on_delete_photo,
+                )
+                app_log.info('PHOTO', '照片查看 Popup 已创建并 open: parent=%s' % (popup.parent,))
                 # v3.22.17: 延迟 0.2 秒记录 popup 状态诊断日志
                 Clock.schedule_once(lambda dt: self._log_popup_status(popup), 0.2)
             except Exception as e:
-                app_log.error('UI', '创建/打开 PhotoViewerPopup 异常 row=%d: %s' % (row_index, e), exc_info=True)
+                app_log.error('UI', '创建/打开照片查看 Popup 异常 row=%d: %s' % (row_index, e), exc_info=True)
                 try:
                     self._show_msg('查看已拍失败: %s' % str(e))
                 except Exception as e2:
@@ -6171,6 +6053,201 @@ class MainScreen(Screen):
                 popup.pos, popup.size, popup.opacity, popup.parent))
         except Exception as e:
             app_log.error('UI', '_log_popup_status 异常: %s' % e)
+
+    def _show_photo_viewer_popup(self, row_index, thumbnails, photo_count, progress_key, delete_callback):
+        """v3.22.20: 工厂方法创建照片查看 Popup（替代继承 PhotoViewerPopup）
+        直接用 Popup(...) 创建，与 _show_report_confirm / _show_msg 一致，确保 popup.parent 不为 None。
+        原 PhotoViewerPopup 继承 Popup 并在 __init__ 中设置 size_hint=(None,None) + 显式 size + center，
+        实测 popup 创建成功但 parent=None 未被加入 Window — 改为简单 Popup(...) 创建方式。"""
+        main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
+        # v3.22.20: 在 content 的 canvas.before 中绘制浅色背景（匹配 _show_report_confirm 有效模式）
+        with main_layout.canvas.before:
+            Color(*THEME['card'])
+            _bg = Rectangle(pos=main_layout.pos, size=main_layout.size)
+        main_layout.bind(pos=lambda i, v: setattr(_bg, 'pos', v),
+                         size=lambda i, v: setattr(_bg, 'size', v))
+
+        scroll = ScrollView()
+        list_layout = GridLayout(cols=3, spacing=dp(6), size_hint_y=None)
+        list_layout.bind(minimum_height=list_layout.setter('height'))
+
+        thumb_slots = []  # 占位 widget 列表，用于异步加载缩略图
+
+        for i, photo_path in enumerate(thumbnails):
+            item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(150), spacing=dp(2))
+            placeholder = Label(
+                text="加载中…", font_size='11sp', color=THEME['text_dim'],
+                size_hint_y=0.65, halign='center', valign='middle'
+            )
+            item.add_widget(placeholder)
+            thumb_slots.append(placeholder)
+
+            fname = os.path.basename(photo_path)
+            if len(fname) > 16:
+                fname = fname[:13] + '...'
+            name_label = Label(
+                text=fname, font_size='10sp', halign='center', valign='middle',
+                size_hint_y=0.15, color=THEME['text_dim'], text_size=(0, None)
+            )
+            name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
+            item.add_widget(name_label)
+
+            del_btn = RoundedButton(
+                text="删除", font_size='11sp', size_hint_y=0.20, height=dp(32),
+                background_color=THEME['danger'], background_normal='', color=(1, 1, 1, 1), bold=True
+            )
+            # v3.22.20: lambda 延迟绑定 popup（popup 在方法末尾才创建，lambda 执行时已存在）
+            del_btn.bind(on_press=lambda x, idx=i: self._confirm_delete_photo(
+                idx, _popup_ref[0], thumbnails, progress_key, delete_callback, row_index))
+            bind_press_animation(del_btn)
+            item.add_widget(del_btn)
+
+            list_layout.add_widget(item)
+
+        scroll.add_widget(list_layout)
+        main_layout.add_widget(scroll)
+
+        del_all_btn = RoundedButton(text="删除全部照片（重拍）", font_size='15sp', size_hint_y=None, height=dp(52),
+                                    background_color=THEME['danger'], background_normal='',
+                                    color=(1, 1, 1, 1), bold=True)
+        del_all_btn.bind(on_press=lambda x: self._confirm_delete_photo(
+            -1, _popup_ref[0], thumbnails, progress_key, delete_callback, row_index))
+        bind_press_animation(del_all_btn)
+        main_layout.add_widget(del_all_btn)
+
+        close_btn = RoundedButton(text="关闭", font_size='16sp', size_hint_y=None, height=dp(52),
+                                  background_color=THEME['accent'], background_normal='',
+                                  color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(close_btn)
+        main_layout.add_widget(close_btn)
+
+        # v3.22.20: 直接用 Popup(...) 创建（不继承），与 _show_report_confirm 一致
+        popup = Popup(
+            title='已拍照片 (%d张)' % photo_count,
+            content=main_layout,
+            size_hint=(0.92, 0.8),
+            auto_dismiss=False,
+            title_color=THEME['accent_dark'],
+            separator_color=THEME['card_border'],
+        )
+        # v3.22.20: close_btn 用 lambda 引用 popup（避免在 popup 创建前求值 popup.dismiss）
+        close_btn.bind(on_press=lambda *a: popup.dismiss())
+
+        # v3.22.20: 用 _popup_ref 供上方 del_btn / del_all_btn lambda 引用（闭包变量无法在创建后修改，用列表容器）
+        _popup_ref = [popup]
+
+        # v3.22.20: 异步加载缩略图（on_open 后延迟 0.1s）
+        popup.bind(on_open=lambda *a: Clock.schedule_once(
+            lambda dt: self._load_thumbs_into(thumb_slots, thumbnails), 0.1))
+
+        popup.open()
+        return popup
+
+    def _load_thumbs_into(self, thumb_slots, thumbnails):
+        """v3.22.20: 异步加载缩略图到 popup 内的占位 widget（替代原 PhotoViewerPopup._load_thumbs/_set_thumb）
+        每张图用独立线程加载，避免大图同步解码阻塞 UI；加载完成后在主线程替换占位 Label 为 KivyImage。"""
+        def _load_one(idx, path, slot):
+            try:
+                def _load():
+                    try:
+                        if not (path and os.path.exists(path)):
+                            app_log.error('PHOTO', '缩略图文件不存在: %s' % path)
+                            def _set_err(dt):
+                                try:
+                                    slot.text = '加载失败'
+                                except Exception:
+                                    pass
+                            Clock.schedule_once(_set_err, 0)
+                            return
+                        # v3.22.20: 用 KivyImage 加载（参考原 _set_thumb 实现）
+                        def _update(dt):
+                            try:
+                                parent = slot.parent
+                                if parent is None:
+                                    return  # slot 已不在树中（popup 已关闭）
+                                pos_in_parent = parent.children.index(slot)
+                                parent.remove_widget(slot)
+                                try:
+                                    img = KivyImage(source=path, size_hint_y=0.65,
+                                                    allow_stretch=True, keep_ratio=True)
+                                    parent.add_widget(img, pos_in_parent)
+                                    thumb_slots[idx] = img
+                                except Exception as e:
+                                    app_log.error('PHOTO', '设置缩略图失败 idx=%d: %s' % (idx, e))
+                                    err_label = Label(text="加载失败", font_size='10sp', color=THEME['danger'],
+                                                      size_hint_y=0.65, halign='center', valign='middle')
+                                    parent.add_widget(err_label, pos_in_parent)
+                                    thumb_slots[idx] = err_label
+                            except Exception as e:
+                                app_log.error('PHOTO', '更新缩略图 widget 失败: %s' % e)
+                        Clock.schedule_once(_update, 0)
+                    except Exception as e:
+                        app_log.error('PHOTO', '加载缩略图失败 %s: %s' % (path, e))
+                        def _set_err(dt):
+                            try:
+                                slot.text = '加载失败'
+                            except Exception:
+                                pass
+                        Clock.schedule_once(_set_err, 0)
+                threading.Thread(target=_load, daemon=True).start()
+            except Exception as e:
+                app_log.error('PHOTO', '_load_one 异常: %s' % e)
+
+        for idx, (slot, path) in enumerate(zip(thumb_slots, thumbnails)):
+            _load_one(idx, path, slot)
+
+    def _confirm_delete_photo(self, photo_index, popup, thumbnails, progress_key, delete_callback, row_index):
+        """v3.22.20: 删除照片二次确认（替代原 PhotoViewerPopup._confirm_delete / _confirm_delete_all）
+        photo_index == -1: 删除全部；photo_index >= 0: 删除单张。
+        确认后调用 delete_callback(row_index, photo_index) 执行实际删除，并关闭 popup。"""
+        is_delete_all = (photo_index == -1)
+        if is_delete_all:
+            title = "危险操作确认"
+            msg = "确定要删除该客户的全部照片吗？\n此操作不可撤销！"
+            msg_color = THEME['danger']
+            yes_text = "全部删除"
+        else:
+            title = "确认删除"
+            msg = "确定要删除这张照片吗？\n此操作不可撤销。"
+            msg_color = THEME['text']
+            yes_text = "确认删除"
+
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(10))
+        content.add_widget(Label(text=msg, font_size='16sp', color=msg_color, halign='center'))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        confirm_popup = ThemedPopup(title=title, size_hint=(0.8, 0.35), auto_dismiss=True)
+
+        yes_btn = RoundedButton(text=yes_text, font_size='16sp', background_color=THEME['danger'],
+                                background_normal='', color=(1, 1, 1, 1), bold=True)
+        no_btn = RoundedButton(text="取消", font_size='16sp', background_color=THEME['accent'],
+                               background_normal='', color=(1, 1, 1, 1), bold=True)
+        bind_press_animation(yes_btn)
+        bind_press_animation(no_btn)
+
+        def _do_delete(instance):
+            try:
+                confirm_popup.dismiss()
+                # v3.22.20: 调用 MainScreen._on_delete_photo 执行实际删除（原图 + 缩略图 + 进度）
+                delete_callback(row_index, photo_index)
+                # 删除后关闭照片查看 popup（避免显示已删除的缩略图）
+                try:
+                    popup.dismiss()
+                except Exception as e:
+                    app_log.error('PHOTO', '关闭照片查看 popup 失败: %s' % e)
+            except Exception as e:
+                app_log.error('PHOTO', '_confirm_delete_photo _do_delete 异常: %s' % e, exc_info=True)
+                try:
+                    self._show_msg('删除照片失败: %s' % str(e))
+                except Exception:
+                    pass
+
+        yes_btn.bind(on_release=_do_delete)
+        no_btn.bind(on_release=confirm_popup.dismiss)
+        btn_row.add_widget(yes_btn)
+        btn_row.add_widget(no_btn)
+        content.add_widget(btn_row)
+        confirm_popup.content = content
+        confirm_popup.open()
 
     def _on_delete_photo(self, row_index, photo_index):
         if row_index >= len(self.rows):
@@ -6787,12 +6864,22 @@ class AIScreen(Screen):
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
 
     def _on_input_focus(self, instance, value):
-        """v3.22.10: 简化 - 焦点变化时仅滚动聊天到底部。键盘遮挡由 softinput_mode='pan'（系统级）+ _on_keyboard_height padding（双保险）处理。"""
+        """v3.22.10: 简化 - 焦点变化时仅滚动聊天到底部。键盘遮挡由 softinput_mode='pan'（系统级）+ _on_keyboard_height padding（双保险）处理。
+        v3.22.20: 抽出 _scroll_chat_to_bottom 方法，便于复用与维护。"""
         try:
             if value:
-                Clock.schedule_once(lambda dt: setattr(self.chat_scroll, 'scroll_y', 0), 0.3)
+                Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.3)
         except Exception as e:
             app_log.error('AI', '_on_input_focus 异常: %s' % e)
+
+    def _scroll_chat_to_bottom(self):
+        """v3.22.20: 滚动聊天 ScrollView 到底部，确保最新输入可见。
+        scroll_y=0 表示滚动到底部（Kivy ScrollView 约定）。"""
+        try:
+            if hasattr(self, 'chat_scroll') and self.chat_scroll is not None:
+                self.chat_scroll.scroll_y = 0  # 0 = 底部
+        except Exception as e:
+            app_log.error('AI', '_scroll_chat_to_bottom 异常: %s' % e)
 
     def _on_keyboard_height(self, instance, height):
         """v3.22.9: 键盘高度变化时调整 input_row 的 bottom padding。
