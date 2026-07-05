@@ -199,6 +199,7 @@ D:\hermes\loan_photo_app\
 | 2026-07-04 | v3.22.16 | PhotoViewerPopup 可见性终极修复 — 显式设置 self.size=self.center 替代 size_hint + 移除 Clock.schedule_once 延迟包装 |
 | 2026-07-05 | v3.22.17 | PhotoViewerPopup auto_dismiss 终极修复 — 增加 self.auto_dismiss=False + 全项目 Bug 审计修复 9 处 |
 | 2026-07-05 | v3.22.18 | PhotoViewerPopup 背景渲染修复（content 背景 + 权限补全） |
+| 2026-07-05 | v3.22.19 | 综合增强：缩略图方案 + 键盘修复 + AI 提示词 + 表头全选行选择反选 + 最近列表管理 |
 
 ---
 

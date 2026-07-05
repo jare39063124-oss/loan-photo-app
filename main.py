@@ -121,12 +121,13 @@ from kivy.uix.image import Image as KivyImage
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.slider import Slider
+from kivy.uix.widget import Widget  # v3.22.19: 数据指示器圆点容器
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
 from kivy.clock import Clock, mainthread
 from kivy.logger import Logger
 from kivy.core.window import Window
 from kivy.utils import platform
-from kivy.graphics import Color, Rectangle, Line, RoundedRectangle
+from kivy.graphics import Color, Rectangle, Line, RoundedRectangle, Ellipse
 from kivy.metrics import dp, sp
 from kivy.properties import ListProperty  # v3.22.5: RoundedButton.background_color 可观察属性
 from kivy.storage.jsonstore import JsonStore
@@ -440,6 +441,45 @@ class RoundedButton(ButtonBehavior, Label):
                  width=1.5)
 
 
+class RoundedSpinnerOption(SpinnerOption):
+    """v3.22.19: Spinner 下拉项带 dp(8) 圆角倒角。
+    继承 SpinnerOption（其本身为 Button 子类）以满足 Kivy Spinner.option_cls 工厂要求。
+    用 canvas.before 绘制圆角背景，避免默认 BorderImage 直角覆盖。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.background_normal = ''
+        self.background_down = ''
+        self.background_color = (0, 0, 0, 0)  # 透明，由 canvas.before 绘制
+        self.color = (1, 1, 1, 1)  # 白色文字（深蓝底配白字）
+        self._opt_radius = [dp(8)] * 4
+        with self.canvas.before:
+            Color(*THEME['accent_dark'])
+            self._opt_bg = RoundedRectangle(pos=self.pos, size=self.size, radius=self._opt_radius)
+            Color(0, 0, 0, 0.18)
+            self._opt_border = Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
+                width=1.0)
+        self.bind(pos=self._update_opt_bg, size=self._update_opt_bg, state=self._update_opt_bg)
+
+    def _update_opt_bg(self, *args):
+        # v3.22.19: pos/size/state 变化时重绘圆角背景（state='down' 时变暗提供按压反馈）
+        try:
+            r, g, b, a = THEME['accent_dark']
+            if self.state == 'down':
+                r, g, b = r * 0.85, g * 0.85, b * 0.85
+            self.canvas.before.clear()
+            with self.canvas.before:
+                Color(r, g, b, a)
+                self._opt_bg = RoundedRectangle(pos=self.pos, size=self.size, radius=self._opt_radius)
+                Color(0, 0, 0, 0.18)
+                self._opt_border = Line(
+                    rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
+                    width=1.0)
+        except Exception:
+            pass
+
+
 # ============================================================
 # v3.20.0: 全局日志器 — 记录全量 app 日志（Excel/拍照/备注/AI/生命周期等）
 # 轮转策略：文件超过 500KB 时保留最近 256KB
@@ -745,6 +785,8 @@ THEME = {
     # v3.22.2: 当前拍摄行高亮配色（浅蓝底 + 蓝色边）
     'highlight_bg': (0.89, 0.95, 0.99, 1),     # 浅蓝底 #E3F2FD（与白卡对比清晰）
     'highlight_border': (0.13, 0.59, 0.95, 1), # 活力蓝边 #2196F3（= accent）
+    # v3.22.19: 行选中态背景（淡蓝），与 highlight_bg 区分（更浅）
+    'info': (0.85, 0.92, 1.0, 1.0),
 }
 
 # === 拍照类型 ===
@@ -786,6 +828,30 @@ def clean_filename(s):
     for ch in '/\\:*?"<>|':
         s = s.replace(ch, '_')
     return s.strip()
+
+def _extract_route_name(excel_filename):
+    """v3.22.19: 从 Excel 文件名提取线路名，用于 AI 报告默认文件名
+    规则：
+    - 优先匹配 "线路X" 或 "线路X" 模式（如 "线路四" → "四"；"线路4" → "4"）
+    - 其次匹配日期模式 "M.D盘点表" → "M.D"（如 "7.5盘点表" → "7.5"）
+    - 再次匹配纯日期 "20260705"
+    - 都不匹配则回退 "抵押物抵债资产"
+    供 ReportGenerator.generate_with_ai 与 MainScreen._save_report_to_user 共用，避免重复代码。"""
+    if not excel_filename:
+        return "抵押物抵债资产"
+    # 匹配 "线路四" 或 "线路4" 等
+    m = re.search(r'线路([一二三四五六七八九十0-9]+)', excel_filename)
+    if m:
+        return m.group(1)
+    # 匹配 "7.5盘点表" 或 "7.5 盘点表"
+    m = re.search(r'(\d+\.\d+)\s*盘点', excel_filename)
+    if m:
+        return m.group(1)
+    # 匹配纯日期 "20260705"
+    m = re.search(r'(\d{8})', excel_filename)
+    if m:
+        return m.group(1)
+    return "抵押物抵债资产"
 
 # ============================================================
 # 配置管理器
@@ -1121,6 +1187,102 @@ class ProgressManager:
                     snap[k] = {'count': 0, 'remark': '', 'types': {}, 'photos': []}
         return snap
 
+    # ============================================================
+    # v3.22.19: 缩略图管理 — 拍照后异步生成压缩缩略图保存到 app 私有目录，
+    # "查看已拍"改读缩略图，规避 Android Scoped Storage 访问原图的权限问题。
+    # ============================================================
+    @staticmethod
+    def generate_thumbnail(original_path, progress_key):
+        """v3.22.19: 用 PIL 打开原图，最长边缩放至 480px（保持宽高比），JPEG quality=70，
+        保存到 APP_DIR/thumbnails/<progress_key>/<basename>.jpg。
+        失败时仅记录日志，不阻断主流程（调用方在异步线程中执行）。"""
+        try:
+            if not original_path or not os.path.exists(original_path):
+                app_log.error('PHOTO', 'generate_thumbnail: 原图不存在 %s' % original_path)
+                return None
+            if not progress_key:
+                app_log.error('PHOTO', 'generate_thumbnail: progress_key 为空')
+                return None
+            thumb_dir = os.path.join(APP_DIR, 'thumbnails', progress_key)
+            os.makedirs(thumb_dir, exist_ok=True)
+            # 缩略图文件名：原 basename 去扩展名 + .jpg（无扩展名则加 .jpg）
+            basename = os.path.basename(original_path)
+            name_base, ext = os.path.splitext(basename)
+            if not name_base:
+                name_base = basename  # 极端情况：basename 没有扩展名
+            thumb_name = name_base + '.jpg'
+            thumb_path = os.path.join(thumb_dir, thumb_name)
+            # v3.22.19: 用 with 管理 PIL 图像句柄，避免句柄泄漏
+            with PILImage.open(original_path) as img:
+                img = img.convert('RGB')
+                # 最长边缩放至 480px，保持宽高比
+                max_edge = 480
+                w, h = img.size
+                if max(w, h) > max_edge:
+                    if w >= h:
+                        new_w = max_edge
+                        new_h = int(h * (max_edge / w))
+                    else:
+                        new_h = max_edge
+                        new_w = int(w * (max_edge / h))
+                    img = img.resize((new_w, new_h), PILImage.LANCZOS)
+                img.save(thumb_path, 'JPEG', quality=70)
+            app_log.info('PHOTO', '缩略图已生成: %s -> %s' % (basename, thumb_path))
+            return thumb_path
+        except Exception as e:
+            app_log.error('PHOTO', 'generate_thumbnail 异常 %s: %s' % (original_path, e), exc_info=True)
+            return None
+
+    @staticmethod
+    def get_thumbnails(key):
+        """v3.22.19: 返回 APP_DIR/thumbnails/<key>/ 下所有 .jpg 文件路径列表（按文件名排序）。
+        目录不存在时返回空列表。"""
+        try:
+            if not key:
+                return []
+            thumb_dir = os.path.join(APP_DIR, 'thumbnails', key)
+            if not os.path.isdir(thumb_dir):
+                return []
+            files = [f for f in os.listdir(thumb_dir) if f.lower().endswith('.jpg')]
+            files.sort()
+            return [os.path.join(thumb_dir, f) for f in files]
+        except Exception as e:
+            app_log.error('PHOTO', 'get_thumbnails 异常 key=%s: %s' % (key, e))
+            return []
+
+    @staticmethod
+    def delete_thumbnail(key, filename):
+        """v3.22.19: 删除单个缩略图文件。
+        filename 可以是完整路径或仅文件名。"""
+        try:
+            if not key or not filename:
+                return
+            thumb_dir = os.path.join(APP_DIR, 'thumbnails', key)
+            # 支持 filename 是完整路径或仅文件名
+            if os.path.isabs(filename):
+                target = filename
+            else:
+                target = os.path.join(thumb_dir, filename)
+            if os.path.exists(target):
+                os.remove(target)
+                app_log.info('PHOTO', '缩略图已删除: %s' % target)
+        except Exception as e:
+            app_log.error('PHOTO', 'delete_thumbnail 异常 %s/%s: %s' % (key, filename, e))
+
+    @staticmethod
+    def delete_all_thumbnails(key):
+        """v3.22.19: 删除整个 <key>/ 目录及其内容（用 shutil.rmtree）"""
+        try:
+            if not key:
+                return
+            import shutil
+            thumb_dir = os.path.join(APP_DIR, 'thumbnails', key)
+            if os.path.isdir(thumb_dir):
+                shutil.rmtree(thumb_dir, ignore_errors=True)
+                app_log.info('PHOTO', '缩略图目录已删除: %s' % thumb_dir)
+        except Exception as e:
+            app_log.error('PHOTO', 'delete_all_thumbnails 异常 key=%s: %s' % (key, e))
+
 # ============================================================
 # Excel 读取器
 # ============================================================
@@ -1336,6 +1498,11 @@ class ReportGenerator:
         "具有代表性的户型，已批量标记为同类型，无需为每户单独拍照。在报告中应合并表述为"
         "「同类型户型」，可在抵押物情况中说明「该抵押物与同楼盘代表性户型为同类型，"
         "已现场勘查代表性户型」，现状描述与风险备注可参照同类型代表性户型的勘查结论填写。\n"
+        "【每客户仅 1 行 — 强制规则】同一客户不论抵押房产数量"
+        "（住宅、商业、车位、办公、厂房等所有类型），SHALL 仅生成 1 行数据。"
+        "即使 Excel 中该客户有 200+ 条记录、覆盖多栋楼/多个地址/多种类型，"
+        "报告中对该客户只输出一条 JSON 对象，绝不允许多行。"
+        "「抵押物情况」字段应合并表述为「共计盘点 N 处，位置为 XX、YY…」。\n"
         "【同楼盘多房间合并描述】当同一借款人抵押同一栋楼的多个房间号"
         "（如 A大街12号101、102、201、202 等，Excel 中可能对应 200+ 条记录）时：\n"
         "1. 「抵押物情况」列应合并表述为「共计盘点 N 处，位置为 XX栋YY号、ZZ号...」，"
@@ -1347,6 +1514,47 @@ class ReportGenerator:
         "现场据楼盘销售介绍楼内两种户型（均已拍摄完毕），未拍摄房间为01或02房间镜像，"
         "同一房间号不同楼层面积存在细微差别，因此未逐户拍摄。」\n"
         "4. 即使 Excel 中该客户有 200+ 条记录，报告中只生成 1 行，不重复描述。\n"
+        "【多地址分号成行】v3.22.19: 当一个客户存在多个地址的抵押物时"
+        "（如 弘马大街123号5xx、弘马大街123号4xx、小田屯组 等），"
+        "在「现状描述」单元格内每个地址单独标号、单独成行，格式：\n"
+        "1. <地址1>：<现状描述>\n"
+        "2. <地址2>：<现状描述>\n"
+        "3. <地址3>：<现状描述>\n"
+        "注意：每个地址占一行，用换行符 \\n 分隔；编号从 1 开始；地址取自 Excel 地址列；"
+        "「现状描述」字段内的换行需用 \\n 转义写入 JSON 字符串。\n"
+        "【同地址 4+ 房间号合并】v3.22.19: 同一地址项下存在 4 个及以上房间号时"
+        "（如 弘马大街123号 项下有 101、102、201、202、207 等），视为同一地址"
+        "（弘马大街123号），LLM SHALL 根据补充说明和备注内容合并描述现状。\n"
+        "判断逻辑：地址前缀相同（如「弘马大街123号」）+ 项下房间号 ≥ 4 个 → 视为同一地址。"
+        "此时「现状描述」单元格内仅生成 1 条该地址的描述，但若各房间号现状不同，"
+        "可在同一地址条目内用顿号或分号列出各房间号的不同情况，"
+        "不为每个房间号单独标号成行。\n"
+        "【示例】客户「张三」有以下抵押物：\n"
+        "- 弘马大街123号5xx（客房层）\n"
+        "- 弘马大街123号4xx（客房层）\n"
+        "- 弘马大街123号107（一楼门面）\n"
+        "- 弘马大街123号207（二楼，照比107多一个月亮门至后门区域）\n"
+        "- 弘马大街123号101（与201同空间，201性质疑似错误）\n"
+        "- 小田屯组（108-2-208-1/2）（已打通为一整栋房产）\n"
+        "补充说明：\n"
+        "- 弘马大街123号5xx、4xx 为两层房产，电梯到达4楼实际为4楼半，"
+        "向下/上半层通向4楼及5楼客房层，走访抵押物为客房层\n"
+        "- 107 月亮门至大门口为房证面积\n"
+        "- 207 照比107多一个月亮门至后门区域\n"
+        "- 101 与 201 在一个空间内，201性质为住宅疑似错误\n"
+        "- 小田屯组（108-2-208-1/2）已打通为一整栋房产，2楼清水，3楼半简装半清水\n"
+        "期望输出（仅 1 行）：\n"
+        "{\"name\":\"张三\","
+        "\"detail\":\"共计盘点 6 处，位置为弘马大街123号（5xx、4xx、107、207、101）及小田屯组\","
+        "\"status\":\"1. 弘马大街123号5xx、4xx：两层房产，电梯到达4楼实际为4楼半，"
+        "向下/上半层分别通向4楼及5楼客房层，走访抵押物为客房层\\n"
+        "2. 弘马大街123号107：月亮门至大门口为房证面积\\n"
+        "3. 弘马大街123号207：照比107多一个月亮门至后门区域\\n"
+        "4. 弘马大街123号101：与201在同一空间内，201性质为住宅疑似错误\\n"
+        "5. 小田屯组（108-2-208-1/2）：已打通为一整栋房产，2楼清水，3楼半简装半清水\","
+        "\"risk\":\"（根据实际情况评估）\"}\n"
+        "注意：弘马大街123号 项下有 5 个房间号（≥4），视为同一地址但每个房间号现状不同，"
+        "因此在「现状描述」内按房间号分号成行；小田屯组为独立地址单独成行。\n"
         "仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。"
         "格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]"
     )
@@ -1423,7 +1631,8 @@ class ReportGenerator:
         """构建发送给 AI 的用户提示词
         v3.22.0: 同一客户多处抵押物已合并；严格约束备注不得编造。
         v3.22.14: visit_note 参数 — 今日走访补充说明，附加到 user prompt 末尾，
-                  与 system prompt 附加双管齐下，强化 AI 对合并描述同楼盘多房间的引导。"""
+                  与 system prompt 附加双管齐下，强化 AI 对合并描述同楼盘多房间的引导。
+        v3.22.19: 按地址前缀分组，标注 4+ 房间号的同地址，引导 LLM 在「现状描述」内分号成行。"""
         lines = ["以下是今日现场勘查记录。同一客户可能有多处抵押物，已合并为一条。\n"]
         for i, r in enumerate(records, 1):
             addrs = r['address']
@@ -1438,23 +1647,80 @@ class ReportGenerator:
                 ptype_str = "、".join(sorted(set(p for p in ptypes if p)))
             else:
                 ptype_str = ptypes or ''
-            lines.append(
-                "【客户%d】名称：%s | 抵押物共%d处 | 地址：%s | 类型：%s | 拍照数：%d | 勘查备注：%s"
-                % (i, r['name'], count, addr_str, ptype_str or '未注明',
-                   r['photo_count'], r['remark'] or '无')
-            )
-        lines.append("\n要求：")
-        lines.append("1. 每位客户生成一条日报表内容。")
+            # v3.22.19: 按地址前缀分组，标注 4+ 房间号的同地址
+            addr_lines, merge_hints = self._format_address_grouping(addrs)
+            lines.append("【客户%d】名称：%s | 抵押物共%d处 | 类型：%s | 拍照数：%d"
+                         % (i, r['name'], count, ptype_str or '未注明', r['photo_count']))
+            if addr_lines:
+                lines.append("  地址列表：")
+                for al in addr_lines:
+                    lines.append("    - " + al)
+            else:
+                lines.append("  地址：%s" % (addr_str or '无'))
+            # 同地址合并提示
+            for hint in merge_hints:
+                lines.append("  [同地址合并提示] " + hint)
+            lines.append("  勘查备注：%s" % (r['remark'] or '无'))
+            lines.append("")
+        lines.append("要求：")
+        lines.append("1. 每位客户生成一条日报表内容（仅 1 行，不论抵押房产数量）。")
         lines.append("2. 「抵押物/抵债资产具体情况」字段：当客户有多处时表述为「共计盘点 N 处，位置为 XX、XX…」；仅1处时直接写地址。")
-        lines.append("3. 「现状描述」「备注」字段必须严格基于上述「勘查备注」内容填写，严禁编造未提供的信息；备注为「无」时留空或写「无」。")
-        lines.append("4. 请按 JSON 数组返回，每个元素含 name/detail/status/risk 四字段，顺序与客户一致。")
-        lines.append("5. 【重要】严禁使用「等」字省略！备注和地址中提及的所有人名、地点、使用人必须完整列出。")
+        lines.append("3. 「现状描述」字段：多地址客户按地址分号成行（1. <地址1>：...\\n 2. <地址2>：...）；同地址 4+ 房间号合并为 1 条。")
+        lines.append("4. 「现状描述」「备注」字段必须严格基于上述「勘查备注」内容填写，严禁编造未提供的信息；备注为「无」时留空或写「无」。")
+        lines.append("5. 请按 JSON 数组返回，每个元素含 name/detail/status/risk 四字段，顺序与客户一致。")
+        lines.append("6. 【重要】严禁使用「等」字省略！备注和地址中提及的所有人名、地点、使用人必须完整列出。")
         lines.append("   例如备注「抵押物由张三、李四、王五使用」→报告中写「由张三、李四、王五使用」，禁止「由张三等人使用」。")
         prompt = "\n".join(lines)
         # v3.22.14: 走访补充说明显式附加到 user prompt（双管齐下，强化 AI 引导）
         if visit_note:
             prompt += "\n\n今日走访补充说明（请重点参考此说明生成报告，特别是合并描述同楼盘多房间的情况）：\n" + visit_note
         return prompt
+
+    def _format_address_grouping(self, addrs):
+        """v3.22.19: 按地址前缀分组，返回 (addr_lines, merge_hints)
+        判断逻辑：地址前缀相同（取最后一个「号」或「栋」之前含该字的子串）
+        + 项下房间号 ≥ 4 → 视为同一地址，输出合并提示。
+        addr_lines: 每个地址的展示行（同地址 4+ 时合并为 1 行展示）
+        merge_hints: 同地址合并提示文本列表"""
+        import re as _re
+        if not isinstance(addrs, list):
+            addrs = [addrs] if addrs else []
+        if not addrs:
+            return [], []
+
+        def _prefix(a):
+            # 贪心匹配到最后一个「号」或「栋」
+            m = _re.search(r'^(.*[号栋])', a)
+            if m:
+                return m.group(1)
+            return a  # 无「号/栋」，整串作为前缀
+
+        groups = {}  # prefix -> list of (full_addr, room_part)
+        order = []
+        for a in addrs:
+            if not a:
+                continue
+            p = _prefix(a)
+            room = a[len(p):].strip() if len(a) > len(p) else ""
+            if p not in groups:
+                groups[p] = []
+                order.append(p)
+            groups[p].append((a, room))
+
+        addr_lines = []
+        merge_hints = []
+        for p in order:
+            items = groups[p]
+            if len(items) >= 4:
+                rooms = "、".join((r or "（无房间号）") for _, r in items)
+                addr_lines.append("%s（项下 %d 个房间号：%s）" % (p, len(items), rooms))
+                merge_hints.append(
+                    "%s 项下有 %d 个房间号（≥4），视为同一地址，但每个房间号现状可能不同，"
+                    "请在「现状描述」内按房间号分号成行" % (p, len(items)))
+            else:
+                for full_a, _ in items:
+                    addr_lines.append(full_a)
+        return addr_lines, merge_hints
 
     def _fallback_detail(self, r):
         """v3.22.0: 构造 detail 兜底文案 — 适配合并结构（按 count 分支）"""
@@ -1675,7 +1941,9 @@ class ReportGenerator:
         else:
             summary = "本次报告基于%s生成，共计%d个客户，其中有外访%d户已生成报告，%d个客户没有外访未生成报告" % (
                 excel_name, total, visited_count, not_visited_count)
-        out_path = os.path.join(APP_DIR, "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str())
+        # v3.22.19: 默认文件名改为"线路四XX（日期）现场勘查日报表.xlsx"，XX 从 Excel 文件名提取线路名
+        route_name = _extract_route_name(excel_filename or "")
+        out_path = os.path.join(APP_DIR, "线路四%s（%s）现场勘查日报表.xlsx" % (route_name, get_date_str()))
         try:
             self._fill_template(items, out_path, summary_text=summary)
             return True, out_path, "日报表已生成（已外访%d户，未外访%d户）" % (visited_count, not_visited_count)
@@ -3097,6 +3365,62 @@ def bind_press_animation(btn, scale=0.94, duration=0.08):
     btn.bind(on_touch_up=_on_up)
 
 
+def _scroll_input_to_visible_func(popup, text_input):
+    """v3.22.19: 软键盘弹出后，将 popup 内 text_input 滚动到可见区域。
+    实现：
+      1) 估算键盘高度（resize 模式下 Window.height 已收缩，差值即键盘高度）
+      2) 若 text_input 顶部高于可见区顶部（被键盘遮挡）：
+         - 优先在 popup 内查找 ScrollView 并 scroll_to(text_input)
+         - 退路：整体上移 popup（设置 pos_hint={'top': 0.98}）
+    """
+    try:
+        kb_height = 0
+        try:
+            # Kivy 在 resize 模式下 Window.height 已收缩，system_size 仍保留原全屏尺寸
+            if hasattr(Window, 'system_size'):
+                kb_height = max(0, int(Window.system_size[1] - Window.height))
+        except Exception:
+            kb_height = 0
+        # 获取 text_input 在 Window 坐标系下的位置
+        try:
+            ti_y = text_input.to_window(text_input.x, text_input.y)[1]
+            ti_top = ti_y + text_input.height
+        except Exception:
+            return
+        visible_top = Window.height - kb_height
+        # 若 text_input 顶部高于可见区顶部 → 被键盘遮挡
+        if ti_top > visible_top:
+            # 在 popup 内查找 ScrollView 并尝试 scroll_to
+            found_sv = [False]
+            from kivy.uix.scrollview import ScrollView as _SV
+            def _find_scroll(widget):
+                if found_sv[0]:
+                    return
+                if isinstance(widget, _SV):
+                    try:
+                        widget.scroll_to(text_input)
+                        found_sv[0] = True
+                    except Exception:
+                        pass
+                    return
+                for child in getattr(widget, 'children', []) or []:
+                    _find_scroll(child)
+            content = getattr(popup, 'content', None)
+            if content is not None:
+                _find_scroll(content)
+            # 若 ScrollView 滚动后仍未可见，尝试整体上移 popup（pos_hint）
+            if not found_sv[0]:
+                try:
+                    popup.pos_hint = {'top': 0.98}
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            app_log.info('UI', '_scroll_input_to_visible_func 异常: %s' % e)
+        except Exception:
+            pass
+
+
 class CardWidget(BoxLayout):
     """卡片式容器
     v3.19.0: 明亮浅色主题——纯白卡片 + 浅灰描边 + 大圆角，更有层次感。
@@ -3170,7 +3494,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.18", font_size='12sp',
+            text="v3.22.19", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3353,6 +3677,9 @@ class VisitNoteDialog(ThemedPopup):
             size_hint_y=0.42,
             hint_text='在此输入今日走访补充说明…',
         )
+        # v3.22.19: 聚焦时延迟滚动到可见区域，避免键盘遮挡输入框
+        self.text_input.bind(focus=lambda inst, val: Clock.schedule_once(
+            lambda dt: _scroll_input_to_visible_func(self, self.text_input), 0.1) if val else None)
         content.add_widget(self.text_input)
 
         # 按钮行
@@ -3402,9 +3729,11 @@ class PhotoViewerPopup(Popup):
     v3.22.18: 直接继承 Popup，背景绘制在 content.canvas.before（匹配 _show_report_confirm 有效模式）"""
     _THUMB_DIR = None  # 缩略图缓存目录（惰性初始化）
 
-    def __init__(self, row_index, photos, delete_callback, **kwargs):
+    def __init__(self, row_index, photos, delete_callback,
+                 photo_count=None, progress_key=None, **kwargs):
         super().__init__(**kwargs)
-        self.title = f"已拍照片 ({len(photos)}张)"
+        # v3.22.19: photos 含义改为缩略图路径列表；title 仍显示原照片数量（photo_count）
+        self.title = f"已拍照片 (%d张)" % (photo_count if photo_count is not None else len(photos))
         self.title_color = THEME['accent_dark']
         self.separator_color = THEME['card_border']
         self.auto_dismiss = False  # v3.22.17: 防止被打开它的同一触摸事件立即关闭
@@ -3412,7 +3741,9 @@ class PhotoViewerPopup(Popup):
         self.size = (int(Window.width * 0.92), int(Window.height * 0.8))
         self.center = (Window.width / 2, Window.height / 2)
         self.row_index = row_index
-        self.photos = photos
+        self.photos = photos  # v3.22.19: 缩略图路径列表
+        self.photo_count = photo_count if photo_count is not None else len(photos)
+        self.progress_key = progress_key  # v3.22.19: 用于删除缩略图
         self.delete_callback = delete_callback
         self._thumb_slots = []  # 每项图片占位 widget，索引对应 photos
 
@@ -3512,7 +3843,8 @@ class PhotoViewerPopup(Popup):
             return None
 
     def _load_thumbs(self, *args):
-        """后台线程逐张生成缩略图，主线程替换占位 widget"""
+        """v3.22.19: self.photos 已是缩略图路径列表，无需再调用 _ensure_thumb 生成。
+        后台逐张验证文件存在并调度主线程替换占位 widget。"""
         import threading
         def _worker():
             for i, p in enumerate(self.photos):
@@ -3522,9 +3854,11 @@ class PhotoViewerPopup(Popup):
                         return
                 except Exception:
                     pass
-                thumb = self._ensure_thumb(p)
-                if thumb:
-                    Clock.schedule_once(lambda dt, idx=i, t=thumb: self._set_thumb(idx, t), 0)
+                # v3.22.19: 缩略图路径直接用，不再调用 _ensure_thumb（避免重复生成）
+                if p and os.path.exists(p):
+                    Clock.schedule_once(lambda dt, idx=i, t=p: self._set_thumb(idx, t), 0)
+                else:
+                    app_log.error('PHOTO', '缩略图文件不存在: %s' % p)
         threading.Thread(target=_worker, daemon=True).start()
 
     def _is_open(self):
@@ -3888,18 +4222,22 @@ class RowWidget(BoxLayout):
     # 不经过菜单 dismiss 步骤，避免 Kivy 同一事件循环中状态冲突导致
     # PhotoViewerPopup 静默不显示；也避免滚动列表时误触发菜单。
     # 移除长按多选相关代码（multi_select / on_long_press / _long_press_*）
+    # v3.22.19: 改为水平布局 [CheckBox(0.08) | 内容列(0.92)]，新增行选择能力。
+    #   选中状态独立于 done（实际拍摄）状态，仅用于"标记完成"辅助 AI 报告。
     def __init__(self, row_index, borrower, address_general, address_precise, property_type,
                  progress_key, progress_mgr,
                  remark="", excel_row_index=None, serial="",
                  photo_callback=None, view_photos_callback=None, remark_callback=None,
+                 selected_callback=None,
                  **kwargs):
         super().__init__(**kwargs)
-        self.orientation = 'vertical'
+        # v3.22.19: 改为水平布局 — 左侧 CheckBox + 右侧垂直内容列
+        self.orientation = 'horizontal'
         self.size_hint_y = None
         self._base_height = dp(90)  # v3.22.2: 删除竖版计数器(100dp) 后下调
         self.height = self._base_height
         self.padding = [dp(10), dp(8), dp(10), dp(8)]
-        self.spacing = dp(4)
+        self.spacing = dp(6)
 
         self.row_index = row_index
         self.borrower = borrower
@@ -3919,6 +4257,10 @@ class RowWidget(BoxLayout):
         self.photo_callback = photo_callback
         self.view_photos_callback = view_photos_callback
         self.remark_callback = remark_callback
+        # v3.22.19: 行选择回调 + 选中状态
+        self.selected_callback = selected_callback
+        self._selected = False  # 选中状态（独立于 done 实际拍摄状态）
+        self._updating_row_checkbox = False  # 防止 CheckBox 回调循环的标志位
 
         with self.canvas.before:
             Color(*THEME['card'])
@@ -3926,6 +4268,14 @@ class RowWidget(BoxLayout):
             Color(*THEME['card_border'])
             self.bg_border = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(16)), width=1.5)
         self.bind(pos=self._update_bg, size=self._update_bg)
+
+        # v3.22.19: 左侧 CheckBox 列（与表头 CheckBox 对齐，size_hint_x=0.08）
+        self.checkbox = CheckBox(size_hint_x=0.08, active=False)
+        self.checkbox.bind(active=self._on_row_checkbox_changed)
+        self.add_widget(self.checkbox)
+
+        # v3.22.19: 右侧内容列（垂直 BoxLayout 包裹原有 name + addr + spacer + btn_row）
+        content = BoxLayout(orientation='vertical', size_hint_x=0.92, spacing=dp(4))
 
         full_address = (address_general + address_precise).strip()
         addr_display = full_address if full_address else "（无地址）"
@@ -3951,7 +4301,7 @@ class RowWidget(BoxLayout):
         self.name_label.bind(width=self._update_name_text_size)
         self.name_label.text_size = (None, None)
         self.name_label.bind(texture_size=self._update_heights)
-        self.add_widget(self.name_label)
+        content.add_widget(self.name_label)
 
         # 地址+性质（自动换行，灰色小字）
         self.addr_label = Label(
@@ -3964,10 +4314,10 @@ class RowWidget(BoxLayout):
         self.addr_label.bind(width=self._update_addr_text_size)
         self.addr_label.text_size = (None, None)
         self.addr_label.bind(texture_size=self._update_heights)
-        self.add_widget(self.addr_label)
+        content.add_widget(self.addr_label)
 
         # 间隔
-        self.add_widget(Label(size_hint_y=None, height=dp(4)))
+        content.add_widget(Label(size_hint_y=None, height=dp(4)))
 
         # v3.22.14: 恢复内嵌按钮行 — view_btn.on_press 直接调用 _on_view_photos
         # 不经过菜单 dismiss 步骤，避免 PhotoViewerPopup 静默不显示
@@ -4018,10 +4368,40 @@ class RowWidget(BoxLayout):
         )
         btn_row.add_widget(self.type_status_label)
 
-        self.add_widget(btn_row)
+        content.add_widget(btn_row)
+        self.add_widget(content)
 
         self._update_type_status()
         Clock.schedule_once(lambda dt: self._update_heights(), 0)
+
+    def _on_row_checkbox_changed(self, checkbox, value):
+        """v3.22.19: 行 CheckBox 状态变化回调 — 通知 MainScreen 更新 _row_selected"""
+        if self._updating_row_checkbox:
+            return
+        try:
+            if self.selected_callback:
+                self.selected_callback(self.row_index, value)
+        except Exception as e:
+            app_log.error('UI', '_on_row_checkbox_changed 异常 row=%d: %s' % (self.row_index, e))
+        # 更新自身选中态背景
+        self._selected = bool(value)
+        self._update_bg()
+
+    def set_selected(self, selected):
+        """v3.22.19: 由 MainScreen 调用，更新行 CheckBox 选中状态（避免回调循环用标志位）。
+        选中状态独立于 done（实际拍摄）状态。"""
+        self._updating_row_checkbox = True
+        try:
+            self.checkbox.active = bool(selected)
+        except Exception:
+            pass
+        self._updating_row_checkbox = False
+        self._selected = bool(selected)
+        self._update_bg()
+
+    def update_selected_display(self):
+        """v3.22.19: 刷新选中态背景显示（由 MainScreen 在反选/全选后调用）"""
+        self._update_bg()
 
     def _on_photo(self, instance):
         """v3.22.14: 拍照按钮回调（直接调用 MainScreen._on_photo_request）"""
@@ -4088,10 +4468,15 @@ class RowWidget(BoxLayout):
         # v3.22.2: 高亮态切换底色与边色，重绘整个 canvas.before
         # v3.22.3: 倒角 dp(8)→dp(12)，边框 width 1→1.2 增强可见性
         # v3.22.4: 倒角 dp(12)→dp(16)，边框 width 1.2→1.5 进一步增强可见性
+        # v3.22.19: 新增 _selected 选中态（淡蓝底），优先级低于 _highlighted（当前拍摄行）
         if getattr(self, '_highlighted', False):
             bg_color = THEME['highlight_bg']
             border_color = THEME['highlight_border']
             border_width = 2.5
+        elif getattr(self, '_selected', False):
+            bg_color = THEME['info']
+            border_color = THEME['accent']
+            border_width = 1.8
         else:
             bg_color = THEME['card']
             border_color = THEME['card_border']
@@ -4189,6 +4574,10 @@ class MainScreen(Screen):
         self._view_photos_last_time = 0  # v3.22.11: _on_view_photos 防抖时间戳
         self.current_visit_note = ''  # v3.22.13: 当前 Excel 的今日走访补充说明
         self.current_visit_note_excel_path = ''  # v3.22.13: 当前 visit_note 对应的 Excel 路径
+        # v3.22.19: 全选 / 行选择状态（独立于实际拍摄状态，仅用于"标记完成"辅助 AI 报告）
+        self._all_selected = False  # 表头 CheckBox 是否处于全选态
+        self._row_selected = set()  # 记录选中的行号（row_index）
+        self._updating_checkbox = False  # 防止 CheckBox 回调循环的标志位
         # v3.22.0: 从配置初始化日志开关（默认关闭）
         app_log.set_enabled(self.config.get('log_enabled', False))
 
@@ -4253,6 +4642,8 @@ class MainScreen(Screen):
             background_color=THEME['accent_dark'], background_normal='',
             color=(1, 1, 1, 1), bold=True,
             sync_height=True,
+            # v3.22.19: 下拉项使用带 dp(8) 圆角倒角的自定义 SpinnerOption
+            option_cls=RoundedSpinnerOption,
         )
         self.search_field_spinner.bind(text=self._on_search_field_change)
         toolbar.add_widget(self.search_field_spinner)
@@ -4271,6 +4662,11 @@ class MainScreen(Screen):
         bind_press_animation(search_btn)
         toolbar.add_widget(search_btn)
         parent.add_widget(toolbar)
+
+        # v3.22.19: 表头从 list_layout 中抽出，固定在 ScrollView 上方（不随列表滚动）
+        # 布局顺序：[toolbar] [header_row(固定)] [scroll_view(含 list_layout)] [footer]
+        self.header_row = self._build_header_row()
+        parent.add_widget(self.header_row)
 
         self.scroll_view = ScrollView(do_scroll_x=False, do_scroll_y=True)
         self.list_layout = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[dp(8), dp(6), dp(8), dp(6)])
@@ -4318,6 +4714,11 @@ class MainScreen(Screen):
         self.list_layout.clear_widgets()
         if self.rows:
             return
+        # v3.22.19: 无数据时隐藏固定表头（避免 CheckBox 干扰空状态布局）
+        if hasattr(self, 'header_row'):
+            self.header_row.height = 0
+            self.header_row.opacity = 0
+            self.header_row.disabled = True
         msg = Label(
             text="暂无数据\n\n点击「打开Excel」加载客户清单",
             font_size='15sp', color=THEME['text_dim'],
@@ -4327,6 +4728,7 @@ class MainScreen(Screen):
         msg.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
         self.list_layout.add_widget(msg)
         # v3.22.0: 展示最近打开的 Excel 记录（3-5 条）
+        # v3.22.19: 每项改为 BoxLayout 横向布局（文件名按钮 | 数据指示器圆点 | 清除按钮）
         recent = self.config.get('recent_excel', []) or []
         if recent:
             title = Label(text="最近打开", font_size='14sp', bold=True, color=THEME['accent_dark'],
@@ -4336,16 +4738,146 @@ class MainScreen(Screen):
             for item in recent[:5]:
                 uri = item.get('uri', '')
                 name = item.get('name', 'Excel文件')
+                # 横向布局：[文件名按钮（0.78）][数据指示器圆点（0.06）][清除按钮（0.16）]
+                row_box = BoxLayout(
+                    orientation='horizontal', size_hint_y=None, height=dp(50),
+                    spacing=dp(4),
+                )
+                # 文件名按钮
                 btn = RoundedButton(
-                    text=name, font_size='17sp',  # v3.22.2: 14sp → 17sp 加大
-                    size_hint_y=None, height=dp(50),  # v3.22.2: 42 → 50 配合字体
+                    text=name, font_size='17sp',
+                    size_hint_x=0.78,
                     background_color=THEME['bg'],
                     color=THEME['accent_dark'],
                     background_normal='',
                 )
                 btn.bind(on_press=lambda inst, u=uri: self._open_recent_excel(u))
                 bind_press_animation(btn)
-                self.list_layout.add_widget(btn)
+                row_box.add_widget(btn)
+
+                # 数据指示器圆点（绿色=有数据；灰色=无数据）
+                has_data = self._excel_has_data(uri)
+                dot = Widget(size_hint_x=0.06, size=(dp(12), dp(12)))
+                dot_color = THEME['success'] if has_data else THEME['text_dim']
+                with dot.canvas.before:
+                    Color(*dot_color)
+                    dot._dot_circle = Ellipse(pos=(0, 0), size=(dp(12), dp(12)))
+                # 居中绘制圆点
+                def _update_dot(inst, val, _dot_circle=dot._dot_circle):
+                    try:
+                        # 在 Widget 内部居中
+                        _dot_circle.pos = ((inst.width - dp(12)) / 2,
+                                            (inst.height - dp(12)) / 2)
+                    except Exception:
+                        pass
+                dot.bind(pos=_update_dot, size=_update_dot)
+                row_box.add_widget(dot)
+
+                # 清除按钮
+                clear_btn = RoundedButton(
+                    text="清除", font_size='13sp',
+                    size_hint_x=0.16,
+                    background_color=THEME['danger'], background_normal='',
+                    color=(1, 1, 1, 1), bold=True,
+                )
+                clear_btn.bind(on_press=lambda inst, u=uri, n=name: self._on_clear_excel_data(u, n, inst))
+                bind_press_animation(clear_btn)
+                row_box.add_widget(clear_btn)
+
+                self.list_layout.add_widget(row_box)
+
+    def _excel_has_data(self, uri):
+        """v3.22.19: 推断 app 内是否有该 Excel（uri）关联的数据。
+        简化方案：检查 APP_DIR/thumbnails/ 下是否有任何 .jpg 文件
+        AND visit_notes/<md5(uri)>.txt 是否存在。
+        由于 progress_key 是 borrower+addr 的哈希，不直接关联 Excel，
+        仅做粗略判断（任一缩略图存在即视为有数据）。"""
+        try:
+            if not uri:
+                return False
+            # 检查缩略图目录是否有任何 .jpg 文件
+            thumb_root = os.path.join(APP_DIR, 'thumbnails')
+            has_thumb = False
+            if os.path.isdir(thumb_root):
+                for sub in os.listdir(thumb_root):
+                    sub_path = os.path.join(thumb_root, sub)
+                    if os.path.isdir(sub_path):
+                        for f in os.listdir(sub_path):
+                            if f.lower().endswith('.jpg'):
+                                has_thumb = True
+                                break
+                    if has_thumb:
+                        break
+            # 检查 visit_note 是否存在（用 uri md5 哈希推断文件名）
+            visit_note_path = self._get_visit_note_path(uri)
+            has_visit_note = bool(visit_note_path and os.path.exists(visit_note_path))
+            return has_thumb or has_visit_note
+        except Exception as e:
+            app_log.error('UI', '_excel_has_data 异常 uri=%s: %s' % (uri, e))
+            return False
+
+    def _on_clear_excel_data(self, uri, name, btn):
+        """v3.22.19: 清除该 Excel 在 app 内的关联数据（缩略图 + visit_note）。
+        2 次确认逻辑：首次点击改文本为"再次确认"，3 秒内再次点击执行清除。"""
+        try:
+            # 已处于"再次确认"状态 → 执行清除
+            if getattr(btn, '_confirming_clear', False):
+                btn._confirming_clear = False
+                # 取消已 schedule 的还原回调
+                if getattr(btn, '_restore_ev', None):
+                    try:
+                        btn._restore_ev.cancel()
+                    except Exception:
+                        pass
+                    btn._restore_ev = None
+                # 执行清除
+                # 1. 删除 APP_DIR/thumbnails/ 下所有内容（无法精确关联，全部清除）
+                try:
+                    import shutil
+                    thumb_root = os.path.join(APP_DIR, 'thumbnails')
+                    if os.path.isdir(thumb_root):
+                        for sub in os.listdir(thumb_root):
+                            sub_path = os.path.join(thumb_root, sub)
+                            if os.path.isdir(sub_path):
+                                shutil.rmtree(sub_path, ignore_errors=True)
+                except Exception as e:
+                    app_log.error('UI', '清除缩略图目录失败: %s' % e)
+                # 2. 删除 visit_note 文件（用 uri md5 哈希）
+                try:
+                    visit_note_path = self._get_visit_note_path(uri)
+                    if visit_note_path and os.path.exists(visit_note_path):
+                        os.remove(visit_note_path)
+                        app_log.info('IO', '已删除 visit_note: %s' % visit_note_path)
+                except Exception as e:
+                    app_log.error('IO', '删除 visit_note 失败: %s' % e)
+                # 3. 还原按钮文本
+                btn.text = "清除"
+                # 4. 显示 toast
+                try:
+                    self._show_android_toast("已清除 %s 的数据" % name)
+                except Exception:
+                    pass
+                app_log.info('UI', '已清除 Excel 数据: %s' % name)
+                # 5. 刷新最近列表
+                self._refresh_list()
+            else:
+                # 首次点击：改文本，3 秒后还原
+                btn._confirming_clear = True
+                btn.text = "再次确认"
+                def _restore_text(dt):
+                    try:
+                        btn.text = "清除"
+                        btn._confirming_clear = False
+                    except Exception:
+                        pass
+                btn._restore_ev = Clock.schedule_once(_restore_text, 3.0)
+        except Exception as e:
+            app_log.error('UI', '_on_clear_excel_data 异常: %s' % e, exc_info=True)
+            try:
+                btn.text = "清除"
+                btn._confirming_clear = False
+            except Exception:
+                pass
 
     def _saf_display_name(self, uri_str):
         """v3.22.0: 查询 SAF URI 对应的文件显示名"""
@@ -4418,6 +4950,8 @@ class MainScreen(Screen):
                 self._show_msg("该文件已移除，已从记录中删除", THEME['warning'])
 
     def _build_header_row(self):
+        # v3.22.19: 表头新增最左侧 CheckBox（全选/反选），列宽调整：
+        # [CheckBox(0.08)] [客户名/地址(0.52)] [操作(0.40)]
         header = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36),
                            padding=[dp(10), dp(4), dp(10), dp(4)], spacing=dp(6))
         with header.canvas.before:
@@ -4425,10 +4959,14 @@ class MainScreen(Screen):
             Color(*THEME['accent'])
             self._header_rect = RoundedRectangle(pos=header.pos, size=header.size, radius=[10])
         header.bind(pos=self._update_header_rect, size=self._update_header_rect)
+        # v3.22.19: 全选 CheckBox
+        self.header_checkbox = CheckBox(size_hint_x=0.08, active=False)
+        self.header_checkbox.bind(active=self._on_select_all)
+        header.add_widget(self.header_checkbox)
         header.add_widget(Label(text="客户名 / 抵押物地址", font_size='13sp', bold=True,
-                                color=(1, 1, 1, 1), size_hint_x=0.6, halign='left'))
+                                color=(1, 1, 1, 1), size_hint_x=0.52, halign='left'))
         header.add_widget(Label(text="操作", font_size='13sp', bold=True,
-                                color=(1, 1, 1, 1), size_hint_x=0.4, halign='center'))
+                                color=(1, 1, 1, 1), size_hint_x=0.40, halign='center'))
         return header
 
     def _update_titlebar_rect(self, instance, *args):
@@ -4704,6 +5242,12 @@ class MainScreen(Screen):
             app_log.info('EXCEL', '开始加载 Excel: %s' % os.path.basename(path))
             reader = ExcelReader(path)
             self.headers, self.rows = reader.load()
+            # v3.22.19: 切换 Excel 时清空选中状态（_all_selected / _row_selected）
+            # 行号语义已变（新 Excel 的行号与旧 Excel 不同），旧选中集合不再有意义
+            self._all_selected = False
+            self._row_selected.clear()
+            if hasattr(self, 'header_checkbox'):
+                self.header_checkbox.active = False
             # v3.22.7: Excel 重新加载时清空 RowWidget 缓存（行数据已变，旧缓存失效）
             self._row_widget_cache = {}
             # v3.22.5: 切换 Excel 时清理行号备注，使新 Excel F 列为备注唯一真相源
@@ -4809,8 +5353,12 @@ class MainScreen(Screen):
             self._update_progress()
             return
 
-        # 添加表头
-        self.list_layout.add_widget(self._build_header_row())
+        # v3.22.19: 表头已固定在 list_layout 外（_build_ui 中添加为 header_row 实例属性），
+        # 此处不再 add 到 list_layout；同时确保表头可见（数据存在时）。
+        if hasattr(self, 'header_row'):
+            self.header_row.height = dp(36)
+            self.header_row.opacity = 1
+            self.header_row.disabled = False
 
         # v3.20.0: 搜索结果数提示
         if q:
@@ -4894,7 +5442,12 @@ class MainScreen(Screen):
                 photo_callback=self._on_photo_request,
                 view_photos_callback=self._on_view_photos,
                 remark_callback=self._on_remark_request,
+                # v3.22.19: 行选择回调（通知 MainScreen 更新 _row_selected）
+                selected_callback=self._on_row_selected,
             )
+            # v3.22.19: 若该行已处于 _row_selected 中（如全选后刷新），恢复 CheckBox 选中态
+            if i in self._row_selected:
+                rw.set_selected(True)
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
             # v3.22.7: 按 row_index 缓存，供 _refresh_list 增量刷新复用
@@ -5435,6 +5988,20 @@ class MainScreen(Screen):
     def _on_photo_saved(self, row_index, filename, ctx=None):
         self._refresh_row_done(row_index)
         self.camera_mgr._dbg(f"[OK] 已保存: {filename}", show_toast=True)
+        # v3.22.19: 异步生成压缩缩略图保存到 app 私有目录，规避 Scoped Storage 访问原图权限问题
+        # ctx 中含 key（progress_key），filename 是原图 basename（保存在 APP_DIR 下）
+        try:
+            _key = ctx.get('key') if ctx else None
+            if _key and filename:
+                _orig_path = os.path.join(APP_DIR, filename)
+                # 后台线程生成缩略图，避免阻塞 UI 线程
+                threading.Thread(
+                    target=ProgressManager.generate_thumbnail,
+                    args=(_orig_path, _key),
+                    daemon=True
+                ).start()
+        except Exception as e:
+            app_log.error('PHOTO', '_on_photo_saved 异步生成缩略图启动失败: %s' % e, exc_info=True)
         # v3.20.0: 连拍下一张时传递同一 ctx
         if ctx:
             self._launch_next_photo(ctx)
@@ -5457,6 +6024,66 @@ class MainScreen(Screen):
             if getattr(rw, 'row_index', -1) == row_index:
                 return rw
         return None
+
+    def _scroll_input_to_visible(self, popup, text_input):
+        """v3.22.19: 软键盘弹出后，将 popup 内 text_input 滚动到可见区域（薄包装，
+        实际逻辑见模块级 _scroll_input_to_visible_func 函数）。"""
+        _scroll_input_to_visible_func(popup, text_input)
+
+    def _on_select_all(self, checkbox, value):
+        """v3.22.19: 表头全选 CheckBox 触发 — 勾选则全选所有行，取消则清空选中。
+        用 _updating_checkbox 标志位避免与 _on_row_selected 形成回调循环。"""
+        if self._updating_checkbox:
+            return
+        self._updating_checkbox = True
+        try:
+            self._all_selected = bool(value)
+            if value:
+                self._row_selected = set(range(len(self.rows)))
+            else:
+                self._row_selected.clear()
+            # 更新所有 RowWidget 显示（用 set_selected 避免回调循环）
+            for rw in self.row_widgets:
+                try:
+                    rw.set_selected(rw.row_index in self._row_selected)
+                except Exception as e:
+                    app_log.error('UI', '_on_select_all set_selected 异常 row=%d: %s' % (rw.row_index, e))
+            self._update_progress()
+        except Exception as e:
+            app_log.error('UI', '_on_select_all 异常: %s' % e)
+        finally:
+            self._updating_checkbox = False
+
+    def _on_row_selected(self, row_index, value):
+        """v3.22.19: 单行 CheckBox 状态变化回调（作为 RowWidget 的 selected_callback）。
+        维护 _row_selected 集合，并同步表头 CheckBox 状态（避免回调循环用 _updating_checkbox）。
+        反选逻辑：全选态下取消某行 → 表头取消勾选，其他行保持选中。"""
+        if self._updating_checkbox:
+            return
+        self._updating_checkbox = True
+        try:
+            if value:
+                self._row_selected.add(row_index)
+            else:
+                self._row_selected.discard(row_index)
+            # 同步表头 CheckBox 状态
+            total = len(self.rows)
+            if total > 0 and len(self._row_selected) == total:
+                # 全部选中 → 表头勾选
+                self._all_selected = True
+                self.header_checkbox.active = True
+            elif self._all_selected and not value:
+                # 全选状态下取消某行 → 表头取消勾选（其他行保持选中）
+                self._all_selected = False
+                self.header_checkbox.active = False
+            # 更新对应 RowWidget 显示
+            rw = self._get_row_widget(row_index)
+            if rw:
+                rw.update_selected_display()
+        except Exception as e:
+            app_log.error('UI', '_on_row_selected 异常 row=%d: %s' % (row_index, e))
+        finally:
+            self._updating_checkbox = False
 
     # ============================================================
     # v3.22.9: Android Toast 通用工具方法
@@ -5502,16 +6129,22 @@ class MainScreen(Screen):
                 self._show_msg('无法打开此客户的照片（行数据丢失）')
                 return
             key = rw.progress_key
-            photos = self.progress_mgr.get_photos(key)
-            app_log.info('PHOTO', '查看已拍: 客户=%s, key=%s, 照片数=%d' % (
-                rw.borrower, key[:8], len(photos)))
-            if not photos:
-                self._show_msg('该客户暂无照片（或照片文件已被系统清理）')
+            # v3.22.19: 改读缩略图（保存在 app 私有目录，规避 Scoped Storage 权限问题）
+            thumbnails = self.progress_mgr.get_thumbnails(key)
+            # 仍记录原照片数量（仅用于日志诊断）
+            orig_count = self.progress_mgr.get_photo_count(key)
+            app_log.info('PHOTO', '查看已拍: 客户=%s, key=%s, 原图数=%d, 缩略图数=%d' % (
+                rw.borrower, key[:8], orig_count, len(thumbnails)))
+            if not thumbnails:
+                self._show_msg('该客户暂无缩略图（仅原图）')
                 return
             # v3.22.17: 直接创建 PhotoViewerPopup 并 open()（显式设置像素尺寸，无需 Clock.schedule_once 延迟）
+            # v3.22.19: photos 参数改为缩略图路径列表，title 仍显示原照片数量
             try:
-                app_log.info('PHOTO', '创建 PhotoViewerPopup: photos=%d' % len(photos))
-                popup = PhotoViewerPopup(row_index=row_index, photos=photos,
+                app_log.info('PHOTO', '创建 PhotoViewerPopup: thumbnails=%d' % len(thumbnails))
+                popup = PhotoViewerPopup(row_index=row_index, photos=thumbnails,
+                                         photo_count=orig_count,
+                                         progress_key=key,
                                          delete_callback=self._on_delete_photo)
                 popup.open()
                 app_log.info('PHOTO', 'PhotoViewerPopup.open() 已调用')
@@ -5549,7 +6182,7 @@ class MainScreen(Screen):
         full_addr = (address_general + address_precise).strip()
         key = self.progress_mgr._make_key(borrower, full_addr)
         if photo_index == -1:
-            # 删除全部：先删文件，再清进度
+            # 删除全部：先删原图文件、缩略图目录，再清进度
             photos = self.progress_mgr.get_photos(key)
             for p in photos:
                 try:
@@ -5558,18 +6191,44 @@ class MainScreen(Screen):
                 except Exception as e:
                     app_log.error('PHOTO', '删除照片文件失败 %s: %s' % (p, e))
             self.progress_mgr.delete_all_photos(key)
+            # v3.22.19: 同步删除全部缩略图
+            self.progress_mgr.delete_all_thumbnails(key)
             self._show_msg("已删除该客户全部照片", THEME['warning'])
         else:
-            # 删除单张
+            # v3.22.19: photo_index 是缩略图列表的索引。
+            # 缩略图与原图同名（仅扩展名不同），通过文件名匹配找到对应原图删除，
+            # 避免缩略图排序与原图列表顺序不一致导致删错。
+            thumbnails = self.progress_mgr.get_thumbnails(key)
             photos = self.progress_mgr.get_photos(key)
-            if photo_index < len(photos):
-                p = photos[photo_index]
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception as e:
-                    app_log.error('PHOTO', '删除照片文件失败 %s: %s' % (p, e))
-            self.progress_mgr.delete_photo(key, photo_index)
+            thumb_to_delete = None
+            if photo_index < len(thumbnails):
+                thumb_to_delete = thumbnails[photo_index]
+                thumb_basename = os.path.basename(thumb_to_delete)
+                thumb_name_base = os.path.splitext(thumb_basename)[0]
+                # 在原图列表中按 basename 匹配（去扩展名相同）
+                matched_orig_idx = None
+                matched_orig_path = None
+                for i, p in enumerate(photos):
+                    orig_name_base = os.path.splitext(os.path.basename(p))[0]
+                    if orig_name_base == thumb_name_base:
+                        matched_orig_idx = i
+                        matched_orig_path = p
+                        break
+                # 删除原图
+                if matched_orig_path is not None:
+                    try:
+                        if os.path.exists(matched_orig_path):
+                            os.remove(matched_orig_path)
+                    except Exception as e:
+                        app_log.error('PHOTO', '删除照片文件失败 %s: %s' % (matched_orig_path, e))
+                    # 删除原图进度记录（用匹配到的原图索引）
+                    self.progress_mgr.delete_photo(key, matched_orig_idx)
+                else:
+                    app_log.warning('PHOTO', '未找到与缩略图 %s 匹配的原图' % thumb_basename)
+                # 删除缩略图文件
+                self.progress_mgr.delete_thumbnail(key, thumb_to_delete)
+            else:
+                app_log.error('PHOTO', 'photo_index=%d 超出缩略图列表范围 %d' % (photo_index, len(thumbnails)))
             self._show_msg("照片已删除", THEME['warning'])
         Clock.schedule_once(lambda dt: self._refresh_row_done(row_index), 0)
 
@@ -5615,6 +6274,9 @@ class MainScreen(Screen):
             size_hint_y=None, height=dp(200),
             hint_text="请输入备注内容...",
         )
+        # v3.22.19: 聚焦时延迟滚动到可见区域，避免键盘遮挡输入框
+        text_input.bind(focus=lambda inst, val: Clock.schedule_once(
+            lambda dt: self._scroll_input_to_visible(popup, text_input), 0.1) if val else None)
         scroll.add_widget(text_input)
         layout.add_widget(scroll)
 
@@ -5749,7 +6411,22 @@ class MainScreen(Screen):
         try:
             records = self.report_generator._collect_records(self.rows, self.progress_mgr)
             total = len(records)
-            visited_count = sum(1 for r in records if r.get('photo_count', 0) > 0)
+            # v3.22.19: 已选中的行（_row_selected）也视为已外访（独立于实际拍摄状态，
+            # 仅用于"标记完成"辅助 AI 报告统计）。
+            # 注意：records 按 borrower 分组（同一客户多处抵押物合并为一条记录），
+            # 不能直接用 enumerate(records) 的索引匹配 row_index。
+            # 改为建立 borrower → row_indices 映射，若该客户的任一行被选中即视为已外访。
+            borrower_to_rows = {}
+            for i, row in enumerate(self.rows):
+                b = row[1] if len(row) > 1 else ""
+                if b:
+                    borrower_to_rows.setdefault(b, set()).add(i)
+            visited_count = sum(
+                1 for r in records
+                if r.get('photo_count', 0) > 0
+                or any(ri in self._row_selected
+                       for ri in borrower_to_rows.get(r.get('name', ''), set()))
+            )
             not_visited_count = total - visited_count
             # v3.22.6: 统计同类型标记数（已标记且无照片的视为同类型未拍照）
             batch_marked_count = len([r for r in records
@@ -5986,7 +6663,11 @@ class MainScreen(Screen):
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             intent.setType(JString("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
             # v3.22.3: 显式用 JString 包装，确保 putExtra(String, String) 重载被选中
-            default_name = "抵押物、抵债资产现场勘查日报表%s.xlsx" % get_date_str()
+            # v3.22.19: 默认文件名改为"线路四XX（日期）现场勘查日报表.xlsx"
+            excel_name = os.path.basename(self.excel_path) if self.excel_path else ""
+            route_name = self._extract_route_name(excel_name)
+            date_str = get_date_str()
+            default_name = "线路四%s（%s）现场勘查日报表.xlsx" % (route_name, date_str)
             intent.putExtra(Intent.EXTRA_TITLE, JString(default_name))
             self._report_save_code = 0x201
             PythonActivity.mActivity.startActivityForResult(intent, self._report_save_code)
@@ -5994,6 +6675,15 @@ class MainScreen(Screen):
         except Exception as e:
             app_log.error('REPORT', 'SAF 保存请求失败: %s' % e)
             self._show_msg("已保存到app内部：%s" % src_path, THEME['success'])
+
+    def _extract_route_name(self, excel_filename):
+        """v3.22.19: 从 Excel 文件名提取线路名（委托模块级函数，避免重复代码）
+        规则：
+        - 优先匹配 "线路X" 模式（如 "线路四" → "四"）
+        - 其次匹配日期模式 "M.D盘点表" → "M.D"
+        - 再次匹配纯日期 "20260705"
+        - 都不匹配则回退 "抵押物抵债资产" """
+        return _extract_route_name(excel_filename)
 
 
 # ============================================================
@@ -6269,7 +6959,10 @@ class LoanPhotoApp(App):
         Window.clearcolor = THEME['bg']
         # v3.22.0: 全局 resize 模式 — 键盘弹出时窗口收缩，搜索框/输入框不被顶出屏幕
         # v3.22.10: resize 在 Android SDL2 不工作（Kivy 官方文档），改用 pan 让系统自动上移窗口
-        Window.softinput_mode = 'pan'
+        # v3.22.19: 改回 resize 模式 — 配合 _scroll_input_to_visible 辅助方法，
+        #            备注弹窗 / AI 补充说明 / 搜索框聚焦时主动滚动到可见区域，
+        #            避免 pan 模式下整个主屏幕被推高导致布局错乱。
+        Window.softinput_mode = 'resize'
 
         # 拦截Android返回键：边缘滑动不直接退出App，而是返回上一页面
         Window.bind(on_keyboard=self._on_keyboard)

@@ -114,7 +114,7 @@ if ($apks.Count -gt 0) {
     $finalSize = [math]::Round((Get-Item $destPath).Length / 1MB, 2)
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host "  v3.22.18 APK READY!" -ForegroundColor Green
+    Write-Host "  v3.22.19 APK READY!" -ForegroundColor Green
     Write-Host "  File: $finalApkName"
     Write-Host "  Size: ${finalSize} MB"
     Write-Host "  Path: $destPath"
