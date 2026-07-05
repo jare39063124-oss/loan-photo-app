@@ -9,7 +9,7 @@
 | 项目 | 内容 |
 |------|------|
 | **项目名称** | 资产盘点专项拍照工具 |
-| **版本** | v3.22.17 |
+| **版本** | v3.22.18 |
 | **适用单位** | 抚顺银行风险管理部 |
 | **问题咨询电话** | 15940454123 |
 | **本地路径** | `D:\hermes\loan_photo_app\` |
@@ -198,6 +198,7 @@ D:\hermes\loan_photo_app\
 | 2026-07-04 | v3.22.15 | PhotoViewerPopup 可见性终极修复（ThemedPopup background='' 禁用默认 atlas 背景）+ _on_view_photos 延迟 0.1s 创建+open + 防抖 1500ms + popup 状态诊断日志 |
 | 2026-07-04 | v3.22.16 | PhotoViewerPopup 可见性终极修复 — 显式设置 self.size=self.center 替代 size_hint + 移除 Clock.schedule_once 延迟包装 |
 | 2026-07-05 | v3.22.17 | PhotoViewerPopup auto_dismiss 终极修复 — 增加 self.auto_dismiss=False + 全项目 Bug 审计修复 9 处 |
+| 2026-07-05 | v3.22.18 | PhotoViewerPopup 背景渲染修复（content 背景 + 权限补全） |
 
 ---
 

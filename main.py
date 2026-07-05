@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.17
+资产盘点专项拍照工具 App - v3.22.18
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -3170,7 +3170,7 @@ class WelcomeScreen(Screen):
 
         # 版本
         root.add_widget(Label(
-            text="v3.22.17", font_size='12sp',
+            text="v3.22.18", font_size='12sp',
             color=THEME['text_dim'],
             size_hint_y=None, height=dp(24),
         ))
@@ -3396,15 +3396,17 @@ class VisitNoteDialog(ThemedPopup):
 # 照片查看弹窗
 # ============================================================
 
-class PhotoViewerPopup(ThemedPopup):
+class PhotoViewerPopup(Popup):
     """v3.22.0: 异步加载缩略图，避免大图同步解码导致"查看已拍"卡顿；
     浅色背景白底深字，确保删除确认弹窗可读。
-    v3.22.9: 继承 ThemedPopup，背景与标题色由基类统一处理。"""
+    v3.22.18: 直接继承 Popup，背景绘制在 content.canvas.before（匹配 _show_report_confirm 有效模式）"""
     _THUMB_DIR = None  # 缩略图缓存目录（惰性初始化）
 
     def __init__(self, row_index, photos, delete_callback, **kwargs):
         super().__init__(**kwargs)
         self.title = f"已拍照片 ({len(photos)}张)"
+        self.title_color = THEME['accent_dark']
+        self.separator_color = THEME['card_border']
         self.auto_dismiss = False  # v3.22.17: 防止被打开它的同一触摸事件立即关闭
         self.size_hint = (None, None)
         self.size = (int(Window.width * 0.92), int(Window.height * 0.8))
@@ -3415,7 +3417,11 @@ class PhotoViewerPopup(ThemedPopup):
         self._thumb_slots = []  # 每项图片占位 widget，索引对应 photos
 
         main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
-        # v3.22.9: 背景由 ThemedPopup.canvas.before 统一绘制，此处不再重复
+        # v3.22.18: 在 content 的 canvas.before 中绘制浅色背景（匹配 _show_report_confirm 有效模式）
+        with main_layout.canvas.before:
+            Color(*THEME['card'])
+            self._content_bg = Rectangle(pos=main_layout.pos, size=main_layout.size)
+        main_layout.bind(pos=self._update_content_bg, size=self._update_content_bg)
         scroll = ScrollView()
         list_layout = GridLayout(cols=3, spacing=dp(6), size_hint_y=None)
         list_layout.bind(minimum_height=list_layout.setter('height'))
@@ -3469,6 +3475,10 @@ class PhotoViewerPopup(ThemedPopup):
 
         # v3.22.0: 弹窗显示后异步加载缩略图
         self.bind(on_open=lambda *a: Clock.schedule_once(self._load_thumbs, 0.1))
+
+    def _update_content_bg(self, instance, value):
+        self._content_bg.pos = instance.pos
+        self._content_bg.size = instance.size
 
     @classmethod
     def _get_thumb_dir(cls):
@@ -6365,13 +6375,17 @@ class LoanPhotoApp(App):
                     main_screen.on_activity_result(request_code, result_code, intent)
 
     def _request_permissions(self):
+        # v3.22.18: 补全 Android 11+ 存储权限 + Android 13+ 媒体权限
         try:
             if ANDROID_API >= 33:
+                # Android 13+: 细粒度媒体权限替代 READ_EXTERNAL_STORAGE
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION]
+                         Permission.ACCESS_COARSE_LOCATION, Permission.READ_MEDIA_IMAGES]
             elif ANDROID_API >= 30:
+                # Android 11-12: 仍需要 READ_EXTERNAL_STORAGE
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION]
+                         Permission.ACCESS_COARSE_LOCATION,
+                         Permission.READ_EXTERNAL_STORAGE]
             else:
                 perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
                          Permission.ACCESS_COARSE_LOCATION,
