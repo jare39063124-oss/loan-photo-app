@@ -2,7 +2,7 @@ $repo = "jare39063124-oss/loan-photo-app"
 $apiBase = "https://api.github.com/repos/$repo"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $projectDir = "D:\hermes\loan_photo_app"
-$finalApkName = "loan-photo-tool-v3.22.21.apk"
+$finalApkName = "loan-photo-tool-v3.22.22.apk"
 $destPath = Join-Path $desktop $finalApkName
 
 Write-Host "=== Step 1: Git Push (retry every 60s) ===" -ForegroundColor Cyan
