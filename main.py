@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.22
+资产盘点专项拍照工具 App - v3.22.23
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -1531,6 +1531,46 @@ class ExcelWriter:
 # 报告生成器
 # ============================================================
 
+def _room_sort_key(room_str):
+    """v3.22.23: 房间号 2 位分组排序键。
+    从右起按 2 位分组：末组（最后 2 位）为组2，其余为组1。
+    返回 (组1, 组2) 元组用于升序排序。
+    示例："101"→(1,1)、"1201"→(12,1)、"201"→(2,1)、"1202"→(12,2)。
+    非数字房间号返回 (inf, inf) 排到末尾。"""
+    import re as _re
+    if not room_str:
+        return (float('inf'), float('inf'))
+    # 提取房间号中的数字部分（去除"号"、"室"等后缀）
+    m = _re.search(r'(\d+)', str(room_str))
+    if not m:
+        return (float('inf'), float('inf'))
+    digits = m.group(1)
+    # 从右起按 2 位分组
+    if len(digits) <= 2:
+        # 1-2 位房间号：组1=0，组2=完整数字
+        return (0, int(digits))
+    # 末 2 位为组2，其余为组1
+    group2 = int(digits[-2:])
+    group1 = int(digits[:-2])
+    return (group1, group2)
+
+
+def _address_sort_key(addr):
+    """v3.22.23: 地址排序键 — 按地址前缀（最后"号"或"栋"之前）+ 房间号 2 位分组排序。
+    确保同前址房间号相邻且按组1主、组2次升序排列。"""
+    import re as _re
+    if not addr:
+        return (("", ), (float('inf'), float('inf')))
+    m = _re.search(r'^(.*[号栋])', addr)
+    if m:
+        prefix = m.group(1)
+        room = addr[len(prefix):].strip()
+    else:
+        prefix = addr
+        room = ""
+    return (prefix, _room_sort_key(room))
+
+
 class ReportGenerator:
     """日报表生成器 v3.19.2: 基于内置模板，调用 AI 根据备注+Excel内容
     生成专业的"现状描述"与"风险备注"，保存到用户指定位置。"""
@@ -1538,92 +1578,39 @@ class ReportGenerator:
     TEMPLATE_NAME = 'report_template.xlsx'
 
     REPORT_SYSTEM_PROMPT = (
-        "你是银行抵押物、抵债资产现场勘查日报表撰写助手。"
-        "根据勘查人员提供的客户名称、抵押物地址、抵押物类型、备注与拍照情况，"
-        "为每位客户撰写日报表中的三列内容：\n"
-        "1. 抵押物情况(detail)：概括盘点了几处、什么类型的抵押物及地址位置\n"
-        "2. 现状描述(status)：客观描述抵押物当前使用状态(自用/出租/闲置)、位置楼层、"
-        "装修、维护情况等\n"
-        "3. 风险备注(risk)：评估是否存在风险(如闲置、渗水裂缝、价格波动、用途变更等)，"
-        "给出关注建议；无风险则说明整体状态良好暂无异常\n"
-        "要求：语言专业、简洁，符合银行风控用语；严格基于勘查人员提供的备注内容填写，"
-        "严禁编造备注中未提及的信息；备注为「无」或为空时，仅客观描述抵押物类型与地址，不得杜撰现状或风险。\n"
-        "【重要】严禁使用「等」字省略信息！备注中提及的所有人名、地址、使用人、"
-        "使用情况必须完整列出，不得遗漏。例如备注写「抵押物由张三、李四、王五使用」，"
-        "报告中必须写「由张三、李四、王五使用」，不得简写为「由张三等人使用」。\n"
-        "v3.22.6 同类型说明：对于标记为「同类型」的抵押物，这些是借款人抵押整栋楼盘中"
-        "具有代表性的户型，已批量标记为同类型，无需为每户单独拍照。在报告中应合并表述为"
-        "「同类型户型」，可在抵押物情况中说明「该抵押物与同楼盘代表性户型为同类型，"
-        "已现场勘查代表性户型」，现状描述与风险备注可参照同类型代表性户型的勘查结论填写。\n"
-        "【每客户仅 1 行 — 强制规则】同一客户不论抵押房产数量"
-        "（住宅、商业、车位、办公、厂房等所有类型），SHALL 仅生成 1 行数据。"
-        "即使 Excel 中该客户有 200+ 条记录、覆盖多栋楼/多个地址/多种类型，"
-        "报告中对该客户只输出一条 JSON 对象，绝不允许多行。"
-        "「抵押物情况」字段应合并表述为「共计盘点 N 处，位置为 XX、YY…」。\n"
-        "【同楼盘多房间合并描述】当同一借款人抵押同一栋楼的多个房间号"
-        "（如 A大街12号101、102、201、202 等，Excel 中可能对应 200+ 条记录）时：\n"
-        "1. 「抵押物情况」列应合并表述为「共计盘点 N 处，位置为 XX栋YY号、ZZ号...」，"
-        "不要为每个房间号单独生成一行；\n"
-        "2. 「现状描述」列应描述整栋楼的整体状态，不重复每个房间的具体描述；\n"
-        "3. 当走访补充说明中提到「同房型一致」「镜像关系」「不同楼层面积存在细小差别」时，"
-        "应在「现状描述」中合并说明，参考样板："
-        "「该项目已经建设完成，正在出售阶段，其中28、29、30、31号楼为高层，"
-        "现场据楼盘销售介绍楼内两种户型（均已拍摄完毕），未拍摄房间为01或02房间镜像，"
-        "同一房间号不同楼层面积存在细微差别，因此未逐户拍摄。」\n"
-        "4. 即使 Excel 中该客户有 200+ 条记录，报告中只生成 1 行，不重复描述。\n"
-        "【多地址分号成行】v3.22.19: 当一个客户存在多个地址的抵押物时"
-        "（如 弘马大街123号5xx、弘马大街123号4xx、小田屯组 等），"
-        "在「现状描述」单元格内每个地址单独标号、单独成行，格式：\n"
-        "1. <地址1>：<现状描述>\n"
-        "2. <地址2>：<现状描述>\n"
-        "3. <地址3>：<现状描述>\n"
-        "注意：每个地址占一行，用换行符 \\n 分隔；编号从 1 开始；地址取自 Excel 地址列；"
-        "「现状描述」字段内的换行需用 \\n 转义写入 JSON 字符串。\n"
-        "【同地址 4+ 房间号合并】v3.22.19: 同一地址项下存在 4 个及以上房间号时"
-        "（如 弘马大街123号 项下有 101、102、201、202、207 等），视为同一地址"
-        "（弘马大街123号），LLM SHALL 根据补充说明和备注内容合并描述现状。\n"
-        "判断逻辑：地址前缀相同（如「弘马大街123号」）+ 项下房间号 ≥ 4 个 → 视为同一地址。"
-        "此时「现状描述」单元格内仅生成 1 条该地址的描述，但若各房间号现状不同，"
-        "可在同一地址条目内用顿号或分号列出各房间号的不同情况，"
-        "不为每个房间号单独标号成行。\n"
-        "【多选拍摄说明】v3.22.21: 当用户多选多个条目（如同一客户的多处抵押物）"
-        "并拍摄一张照片时，这些条目共享同一张照片（相册中实际仅一张物理照片，"
-        "但所有选中条目均标记为已拍摄该类型）。多选的语义是「同一客户的多处抵押物"
-        "共享一张照片」（基于备注共性或基础位置一致等原因）。AI 日报表的「现状描述」"
-        "中应体现：这些条目因全选共享同一张照片（基于备注共性/基础位置一致），"
-        "合并描述其拍摄情况，不为每个共享条目单独描述照片内容。\n"
-        "【示例】客户「张三」有以下抵押物：\n"
-        "- 弘马大街123号5xx（客房层）\n"
-        "- 弘马大街123号4xx（客房层）\n"
-        "- 弘马大街123号107（一楼门面）\n"
-        "- 弘马大街123号207（二楼，照比107多一个月亮门至后门区域）\n"
-        "- 弘马大街123号101（与201同空间，201性质疑似错误）\n"
-        "- 小田屯组（108-2-208-1/2）（已打通为一整栋房产）\n"
-        "补充说明：\n"
-        "- 弘马大街123号5xx、4xx 为两层房产，电梯到达4楼实际为4楼半，"
-        "向下/上半层通向4楼及5楼客房层，走访抵押物为客房层\n"
-        "- 107 月亮门至大门口为房证面积\n"
-        "- 207 照比107多一个月亮门至后门区域\n"
-        "- 101 与 201 在一个空间内，201性质为住宅疑似错误\n"
-        "- 小田屯组（108-2-208-1/2）已打通为一整栋房产，2楼清水，3楼半简装半清水\n"
-        "期望输出（仅 1 行）：\n"
-        "{\"name\":\"张三\","
-        "\"detail\":\"共计盘点 6 处，位置为弘马大街123号（5xx、4xx、107、207、101）及小田屯组\","
-        "\"status\":\"1. 弘马大街123号5xx、4xx：两层房产，电梯到达4楼实际为4楼半，"
-        "向下/上半层分别通向4楼及5楼客房层，走访抵押物为客房层\\n"
-        "2. 弘马大街123号107：月亮门至大门口为房证面积\\n"
-        "3. 弘马大街123号207：照比107多一个月亮门至后门区域\\n"
-        "4. 弘马大街123号101：与201在同一空间内，201性质为住宅疑似错误\\n"
-        "5. 小田屯组（108-2-208-1/2）：已打通为一整栋房产，2楼清水，3楼半简装半清水\","
-        "\"risk\":\"（根据实际情况评估）\"}\n"
-        "注意：弘马大街123号 项下有 5 个房间号（≥4），视为同一地址但每个房间号现状不同，"
-        "因此在「现状描述」内按房间号分号成行；小田屯组为独立地址单独成行。\n"
-        "仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。"
-        "格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]"
+        "你是银行抵押物、抵债资产现场勘查日报表撰写助手。\n"
+        "【最高优先级 — 必须参考】\n"
+        "1. 「今日走访补充说明」是勘查人员现场实地记录的第一手资料，你 MUST 逐字逐句参考并融入报告，严禁忽略。\n"
+        "2. 「勘查备注」是 Excel 中该抵押物的历史备注，你 MUST 完整引用相关信息，严禁遗漏。\n"
+        "3. 若补充说明或备注为空，仅客观描述抵押物类型与地址，不得杜撰现状或风险。\n"
+        "【结构强制】\n"
+        "4. 同一客户不论抵押房产数量（住宅、商业、车位、办公、厂房等所有类型），SHALL 仅生成 1 行 JSON 对象。\n"
+        "5. 「抵押物情况」(detail) 字段整合表述为「共计盘点 N 处，位置为 XX、YY…」。\n"
+        "6. 同一借款人抵押同一栋楼的多个房间号时，合并表述，不为每个房间号单独成行。\n"
+        "【实地说明要求】\n"
+        "7. 「现状描述」(status) 字段 MUST 包含实地勘查说明，描述抵押物当前使用状态(自用/出租/闲置)、"
+        "位置楼层、装修、维护情况等。\n"
+        "8. 同一客户不同抵押物的现状差异 MUST 在 status 字段内整合描述，每个地址单独标号成行：\n"
+        "   1. <地址1>：<现状描述>\\n"
+        "   2. <地址2>：<现状描述>\\n"
+        "9. 同地址 4+ 房间号时合并为 1 条描述，若各房间号现状不同，在同条目内用分号列出。\n"
+        "10. 多选拍摄说明：多选多个条目共享一张照片时（基于备注共性或基础位置一致），"
+        "status 中应体现这些条目因全选共享同一张照片，合并描述拍摄情况。\n"
+        "【禁止编造与省略】\n"
+        "11. 严禁编造备注/补充说明中未提及的信息。\n"
+        "12. 严禁使用「等」字省略！备注中提及的所有人名、地点、使用人、使用情况必须完整列出。\n"
+        "    例如备注「抵押物由张三、李四、王五使用」→ 报告中写「由张三、李四、王五使用」，禁止「由张三等人使用」。\n"
+        "13. 语言专业、简洁，符合银行风控用语。\n"
+        "【输出格式】\n"
+        "14. 仅返回 JSON 数组，不要包含任何解释文字或 markdown 代码块标记。\n"
+        "15. 格式：[{\"name\":\"客户名\",\"detail\":\"抵押物情况\",\"status\":\"现状描述\",\"risk\":\"风险备注\"}, ...]\n"
+        "16. 「现状描述」字段内的换行需用 \\n 转义写入 JSON 字符串。"
     )
 
     def __init__(self):
         self.template_path = self._resolve_template()
+        # v3.22.23: 上一次 AI 报告质量校验结果（'ok'/'low'），供 MainScreen 读取展示提示
+        self.last_report_quality = 'ok'
 
     def _resolve_template(self):
         """定位内置模板（打包目录优先）"""
@@ -1678,9 +1665,11 @@ class ReportGenerator:
         for name, g in groups.items():
             # 合并备注：去重保留所有非空备注
             merged_remark = "；".join(sorted(set(r for r in g['remarks'] if r))) or ""
+            # v3.22.23: 对地址列表按"地址前缀 + 房间号排序键"排序，确保同前缀房间号相邻且有序
+            sorted_addresses = sorted(g['addresses'], key=lambda a: _address_sort_key(a))
             records.append({
                 'name': name,
-                'address': g['addresses'],          # list
+                'address': sorted_addresses,          # list（已排序）
                 'property_type': g['property_types'], # list
                 'remark': merged_remark,
                 'photo_count': g['photo_count'],
@@ -1723,7 +1712,7 @@ class ReportGenerator:
             # 同地址合并提示
             for hint in merge_hints:
                 lines.append("  [同地址合并提示] " + hint)
-            lines.append("  勘查备注：%s" % (r['remark'] or '无'))
+            lines.append("  【勘查备注 — 必须参考】：%s" % (r['remark'] or '无'))
             lines.append("")
         lines.append("要求：")
         lines.append("1. 每位客户生成一条日报表内容（仅 1 行，不论抵押房产数量）。")
@@ -1734,9 +1723,11 @@ class ReportGenerator:
         lines.append("6. 【重要】严禁使用「等」字省略！备注和地址中提及的所有人名、地点、使用人必须完整列出。")
         lines.append("   例如备注「抵押物由张三、李四、王五使用」→报告中写「由张三、李四、王五使用」，禁止「由张三等人使用」。")
         prompt = "\n".join(lines)
-        # v3.22.14: 走访补充说明显式附加到 user prompt（双管齐下，强化 AI 引导）
+        # v3.22.23: 走访补充说明与勘查备注显式标注"必须参考"，强化 AI 引导
         if visit_note:
-            prompt += "\n\n今日走访补充说明（请重点参考此说明生成报告，特别是合并描述同楼盘多房间的情况）：\n" + visit_note
+            prompt += "\n\n【今日走访补充说明 — 必须参考，严禁忽略】\n" + visit_note
+            prompt += "\n\n⚠ 重要提醒：上述补充说明是实地勘查的第一手资料，你 MUST 在「现状描述」字段中逐字逐句融入。"
+            prompt += "若忽略补充说明或备注内容，报告将被标记为低质量退回重生成。"
         return prompt
 
     def _format_address_grouping(self, addrs):
@@ -1774,6 +1765,8 @@ class ReportGenerator:
         merge_hints = []
         for p in order:
             items = groups[p]
+            # v3.22.23: 按房间号 2 位分组排序（组1主、组2次，升序）
+            items = sorted(items, key=lambda x: _room_sort_key(x[1]))
             if len(items) >= 4:
                 rooms = "、".join((r or "（无房间号）") for _, r in items)
                 addr_lines.append("%s（项下 %d 个房间号：%s）" % (p, len(items), rooms))
@@ -1868,6 +1861,46 @@ class ReportGenerator:
             'status': '现场勘查完成，已拍照%d张，整体状态正常。' % r['photo_count'],
             'risk': '经实地走访抵押物，目前整体状态较好，暂无异常情况。',
         } for r in records]
+
+    def _validate_ai_response(self, ai_records, records, visit_note):
+        """v3.22.23: 校验 AI 响应是否充分参考了补充说明与备注。
+        检查 status 字段是否包含 visit_note 中的关键信息片段（关键词匹配）。
+        返回 'ok' 或 'low'。"""
+        try:
+            if not visit_note or not visit_note.strip():
+                return 'ok'
+            # 提取 visit_note 中的关键信息片段（按标点分句，取含数字/地址的片段）
+            import re as _re
+            sentences = _re.split(r'[；;\n。.]', visit_note)
+            keywords = []
+            for s in sentences:
+                s = s.strip()
+                if len(s) >= 4 and (_re.search(r'\d', s) or '号' in s or '栋' in s or '楼' in s):
+                    keywords.append(s)
+            if not keywords:
+                return 'ok'
+            # 检查 AI 输出的 status 字段是否包含这些关键片段（模糊匹配：去除空格后子串匹配）
+            low_count = 0
+            for ar in ai_records:
+                status = ar.get('status', '') or ''
+                status_clean = _re.sub(r'\s+', '', status)
+                matched = 0
+                for kw in keywords:
+                    kw_clean = _re.sub(r'\s+', '', kw)
+                    if len(kw_clean) >= 4 and kw_clean in status_clean:
+                        matched += 1
+                # 若有 50% 以上关键片段未匹配，标记该记录为低质量
+                if keywords and matched < len(keywords) * 0.3:
+                    low_count += 1
+                    app_log.warning('AI', 'v3.22.23: 客户 %s 报告可能未充分参考补充说明（matched %d/%d）' % (
+                        ar.get('name', '?'), matched, len(keywords)))
+            if low_count > 0:
+                app_log.warning('AI', 'v3.22.23: %d/%d 客户报告标记为低质量（未充分参考补充说明）' % (low_count, len(ai_records)))
+                return 'low'
+            return 'ok'
+        except Exception as e:
+            app_log.error('AI', '_validate_ai_response 异常: %s' % e)
+            return 'ok'
 
     def _validate_items(self, items, records):
         """v3.20.0: 校验 AI 返回的 items，补全缺失字段，清理特殊字符"""
@@ -1995,6 +2028,8 @@ class ReportGenerator:
         if not ok:
             return False, None, "AI生成失败：%s" % ai_text
         items = self._parse_ai_response(ai_text, visited_records)
+        # v3.22.23: 校验 AI 是否充分参考了补充说明（结果存于实例，供 MainScreen 读取展示提示）
+        self.last_report_quality = self._validate_ai_response(items, visited_records, visit_note)
         # 汇总说明行（基于导入Excel文件名 + 客户外访统计）
         excel_name = excel_filename or "未命名"
         # v3.22.6: 如有同类型标记，汇总文案合并表述「代表性户型+同类型」
@@ -3746,11 +3781,12 @@ class VisitNoteDialog(ThemedPopup):
     说明按 Excel 文件路径 md5 哈希持久化到 APP_DIR/visit_notes/ 目录。
     """
 
-    def __init__(self, initial_text='', on_confirm=None, **kwargs):
+    def __init__(self, initial_text='', on_confirm=None, on_save=None, **kwargs):
         """v3.22.13: 初始化
         Args:
             initial_text: 预填的文本（从持久化加载）
             on_confirm: 确认回调，签名为 on_confirm(text: str)
+            on_save: v3.22.23 独立保存回调，签名为 on_save(text: str)（不 dismiss 不生成报表）
         """
         super().__init__(**kwargs)
         self.title = '今日走访补充说明'
@@ -3761,6 +3797,7 @@ class VisitNoteDialog(ThemedPopup):
         self.pos_hint = {'top': 0.95}
 
         self._on_confirm_callback = on_confirm
+        self._on_save_callback = on_save  # v3.22.23: 独立保存回调
         self._initial_text = initial_text
 
         content = self._build_content()
@@ -3811,8 +3848,8 @@ class VisitNoteDialog(ThemedPopup):
             lambda dt: _scroll_input_to_visible_func(self, self.text_input), 0.1) if val else None)
         content.add_widget(self.text_input)
 
-        # 按钮行
-        btn_row = BoxLayout(orientation='horizontal', spacing=dp(8), size_hint_y=0.15)
+        # 按钮行（v3.22.23: 3 按钮 — 取消/保存/生成日报表）
+        btn_row = BoxLayout(orientation='horizontal', spacing=dp(6), size_hint_y=0.15)
 
         btn_cancel = RoundedButton(
             text='取消', font_size='14sp',
@@ -3821,6 +3858,15 @@ class VisitNoteDialog(ThemedPopup):
         )
         btn_cancel.bind(on_press=self.dismiss)
         btn_row.add_widget(btn_cancel)
+
+        # v3.22.23: 新增"保存"按钮 — 仅持久化不生成报表
+        btn_save = RoundedButton(
+            text='保存', font_size='14sp',
+            background_color=THEME['accent'], background_normal='',
+            color=(1, 1, 1, 1),
+        )
+        btn_save.bind(on_press=self._on_save)
+        btn_row.add_widget(btn_save)
 
         btn_confirm = RoundedButton(
             text='生成日报表', font_size='14sp',
@@ -3842,6 +3888,23 @@ class VisitNoteDialog(ThemedPopup):
                 self._on_confirm_callback(text)
         except Exception as e:
             app_log.error('UI', 'VisitNoteDialog._on_confirm 异常: %s' % e, exc_info=True)
+
+    def _on_save(self, instance):
+        """v3.22.23: 保存按钮回调 — 仅持久化文本，不 dismiss 不生成报表"""
+        text = self.text_input.text or ''
+        try:
+            if self._on_save_callback:
+                self._on_save_callback(text)
+            # Toast 提示已保存（不 dismiss，允许继续编辑）
+            try:
+                from jnius import autoclass
+                Toast = autoclass('android.widget.Toast')
+                PythonActivity = autoclass('org.kivy.android.PythonActivity')
+                Toast.makeText(PythonActivity.mActivity, '已保存', Toast.LENGTH_SHORT).show()
+            except Exception:
+                app_log.info('UI', '保存按钮 Toast fallback（非 Android）')
+        except Exception as e:
+            app_log.error('UI', 'VisitNoteDialog._on_save 异常: %s' % e, exc_info=True)
 
     def get_text(self):
         """获取输入文本"""
@@ -4467,6 +4530,7 @@ class MainScreen(Screen):
         # v3.22.19: 全选 / 行选择状态（独立于实际拍摄状态，仅用于"标记完成"辅助 AI 报告）
         self._all_selected = False  # 表头 CheckBox 是否处于全选态
         self._row_selected = set()  # 记录选中的行号（row_index）
+        self._matched_indices = []  # v3.22.23: 当前搜索匹配的行索引全集（用于全选作用域）
         self._updating_checkbox = False  # 防止 CheckBox 回调循环的标志位
         # v3.22.0: 从配置初始化日志开关（默认关闭）
         app_log.set_enabled(self.config.get('log_enabled', False))
@@ -4681,51 +4745,110 @@ class MainScreen(Screen):
 
                 self.list_layout.add_widget(row_box)
 
+    def _get_excel_data_index_path(self):
+        """v3.22.23: 返回 excel_data_index.json 路径（记录 excel_uri_md5 -> [progress_keys] 映射）"""
+        return os.path.join(APP_DIR, 'excel_data_index.json')
+
+    def _load_excel_data_index(self):
+        """v3.22.23: 加载 excel_data_index.json，返回 {excel_uri_md5: [progress_key, ...]} 字典"""
+        try:
+            path = self._get_excel_data_index_path()
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    import json as _json
+                    return _json.load(f)
+        except Exception as e:
+            app_log.error('IO', '_load_excel_data_index 异常: %s' % e)
+        return {}
+
+    def _save_excel_data_index(self, index):
+        """v3.22.23: 持久化 excel_data_index.json"""
+        try:
+            path = self._get_excel_data_index_path()
+            import json as _json
+            with open(path, 'w', encoding='utf-8') as f:
+                _json.dump(index, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            app_log.error('IO', '_save_excel_data_index 异常: %s' % e)
+
+    def _record_excel_data_keys(self, uri):
+        """v3.22.23: 加载 Excel 后记录该 uri 对应的所有 progress_keys 到索引"""
+        try:
+            if not uri or not self.rows:
+                return
+            import hashlib as _hashlib
+            uri_md5 = _hashlib.md5(uri.encode('utf-8')).hexdigest()
+            # 收集所有行的 progress_key
+            keys = []
+            for row in self.rows:
+                borrower = row[1] if len(row) > 1 else ""
+                addr_general = row[2] if len(row) > 2 else ""
+                addr_precise = row[3] if len(row) > 3 else ""
+                full_addr = (addr_general + addr_precise).strip()
+                if borrower:
+                    pk = self.progress_mgr._make_key(borrower, full_addr)
+                    if pk and pk not in keys:
+                        keys.append(pk)
+            index = self._load_excel_data_index()
+            index[uri_md5] = keys
+            self._save_excel_data_index(index)
+            app_log.info('IO', 'v3.22.23: 已记录 Excel %s 的 %d 个 progress_keys' % (uri[:30], len(keys)))
+        except Exception as e:
+            app_log.error('IO', '_record_excel_data_keys 异常: %s' % e)
+
     def _excel_has_data(self, uri):
         """v3.22.19: 推断 app 内是否有该 Excel（uri）关联的数据。
-        简化方案：检查 APP_DIR/thumbnails/ 下是否有任何 .jpg 文件
-        AND visit_notes/<md5(uri)>.txt 是否存在。
-        由于 progress_key 是 borrower+addr 的哈希，不直接关联 Excel，
-        仅做粗略判断（任一缩略图存在即视为有数据）。"""
+        v3.22.23: 改为基于 excel_data_index.json 判断，仅检查该 Excel 关联的缩略图。"""
         try:
             if not uri:
                 return False
-            # 检查缩略图目录是否有任何 .jpg 文件
+            import hashlib as _hashlib
+            uri_md5 = _hashlib.md5(uri.encode('utf-8')).hexdigest()
+            index = self._load_excel_data_index()
+            keys = index.get(uri_md5)
+            if keys is None:
+                # 兼容旧数据：回退到全量判断
+                return self._get_excel_data_count_legacy(uri) > 0
+            # 检查该 Excel 的任何 progress_key 是否有缩略图
             thumb_root = os.path.join(APP_DIR, 'thumbnails')
-            has_thumb = False
             if os.path.isdir(thumb_root):
-                for sub in os.listdir(thumb_root):
-                    sub_path = os.path.join(thumb_root, sub)
-                    if os.path.isdir(sub_path):
-                        for f in os.listdir(sub_path):
+                for pk in keys:
+                    pk_dir = os.path.join(thumb_root, pk)
+                    if os.path.isdir(pk_dir):
+                        for f in os.listdir(pk_dir):
                             if f.lower().endswith('.jpg'):
-                                has_thumb = True
-                                break
-                    if has_thumb:
-                        break
-            # 检查 visit_note 是否存在（用 uri md5 哈希推断文件名）
+                                return True
+            # 检查 visit_note 是否存在
             visit_note_path = self._get_visit_note_path(uri)
-            has_visit_note = bool(visit_note_path and os.path.exists(visit_note_path))
-            return has_thumb or has_visit_note
+            if visit_note_path and os.path.exists(visit_note_path):
+                return True
+            return False
         except Exception as e:
             app_log.error('UI', '_excel_has_data 异常 uri=%s: %s' % (uri, e))
             return False
 
     def _get_excel_data_count(self, uri):
         """v3.22.20: 返回该 Excel 在 app 内的数据项数（用于数据指示器按钮文案）。
-        统计口径：缩略图数量（APP_DIR/thumbnails/ 下所有 .jpg 文件数）
-        + visit_note 是否存在（1 或 0）。"""
+        v3.22.23: 改为基于 excel_data_index.json 映射，仅统计该 Excel 关联的缩略图，不再全量扫描。"""
         try:
             if not uri:
                 return 0
+            import hashlib as _hashlib
+            uri_md5 = _hashlib.md5(uri.encode('utf-8')).hexdigest()
+            index = self._load_excel_data_index()
+            keys = index.get(uri_md5)
+            if keys is None:
+                # 兼容旧数据：无索引条目时回退到全量计数（提示用户重新加载以建立索引）
+                app_log.info('IO', 'v3.22.23: Excel %s 无索引条目，回退全量计数' % uri[:30])
+                return self._get_excel_data_count_legacy(uri)
             count = 0
-            # 1. 统计缩略图数量
+            # 1. 仅统计属于该 Excel 的 progress_keys 对应的缩略图
             thumb_root = os.path.join(APP_DIR, 'thumbnails')
             if os.path.isdir(thumb_root):
-                for sub in os.listdir(thumb_root):
-                    sub_path = os.path.join(thumb_root, sub)
-                    if os.path.isdir(sub_path):
-                        for f in os.listdir(sub_path):
+                for pk in keys:
+                    pk_dir = os.path.join(thumb_root, pk)
+                    if os.path.isdir(pk_dir):
+                        for f in os.listdir(pk_dir):
                             if f.lower().endswith('.jpg'):
                                 count += 1
             # 2. visit_note 是否存在
@@ -4735,6 +4858,26 @@ class MainScreen(Screen):
             return count
         except Exception as e:
             app_log.error('UI', '_get_excel_data_count 异常 uri=%s: %s' % (uri, e))
+            return 0
+
+    def _get_excel_data_count_legacy(self, uri):
+        """v3.22.23: 旧版全量计数逻辑（兼容无索引数据）"""
+        try:
+            count = 0
+            thumb_root = os.path.join(APP_DIR, 'thumbnails')
+            if os.path.isdir(thumb_root):
+                for sub in os.listdir(thumb_root):
+                    sub_path = os.path.join(thumb_root, sub)
+                    if os.path.isdir(sub_path):
+                        for f in os.listdir(sub_path):
+                            if f.lower().endswith('.jpg'):
+                                count += 1
+            visit_note_path = self._get_visit_note_path(uri)
+            if visit_note_path and os.path.exists(visit_note_path):
+                count += 1
+            return count
+        except Exception as e:
+            app_log.error('UI', '_get_excel_data_count_legacy 异常: %s' % e)
             return 0
 
     def _on_clear_excel_data(self, uri, name, btn):
@@ -4828,6 +4971,17 @@ class MainScreen(Screen):
                     app_log.info('IO', '已删除 visit_note: %s' % visit_note_path)
                 except Exception as e:
                     app_log.error('IO', '删除 visit_note 失败: %s' % e)
+            # v3.22.23: 从 excel_data_index 中删除该 uri 条目
+            try:
+                import hashlib as _hashlib
+                uri_md5 = _hashlib.md5(uri.encode('utf-8')).hexdigest()
+                index = self._load_excel_data_index()
+                if uri_md5 in index:
+                    del index[uri_md5]
+                    self._save_excel_data_index(index)
+                    app_log.info('IO', 'v3.22.23: 已从索引删除 Excel %s' % uri[:30])
+            except Exception as e:
+                app_log.error('IO', '清除 excel_data_index 条目异常: %s' % e)
             app_log.info('UI', '已清除 Excel 数据: %s' % name)
             self._show_msg("已清除 %s 的数据" % name, THEME['success'])
             self._refresh_list()
@@ -5190,6 +5344,16 @@ class MainScreen(Screen):
         except Exception as e:
             app_log.error('IO', '_save_visit_note 异常: %s' % e, exc_info=True)
 
+    def _save_visit_note_only(self, text):
+        """v3.22.23: 仅保存走访补充说明，不触发生成报表"""
+        try:
+            self.current_visit_note = text or ''
+            if self.current_visit_note_excel_path:
+                self._save_visit_note(self.current_visit_note_excel_path, text or '')
+                app_log.info('IO', 'v3.22.23: 走访补充说明已保存（%d 字符）' % len(text or ''))
+        except Exception as e:
+            app_log.error('IO', '_save_visit_note_only 异常: %s' % e, exc_info=True)
+
     def _load_excel_path(self, path, display_name=None, source_uri=None):
         if not path or not os.path.exists(path):
             self._show_msg("文件不存在或路径无效", THEME['danger'])
@@ -5243,6 +5407,8 @@ class MainScreen(Screen):
             _name = display_name or os.path.basename(path)
             self._add_recent_excel(_uri, _name)
             self._refresh_list()
+            # v3.22.23: 记录该 Excel 的 progress_keys 到索引，用于最近文件计数隔离
+            self._record_excel_data_keys(_uri)
             # v3.22.13: 加载 visit_note（按当前 Excel 路径持久化）
             self.current_visit_note_excel_path = path
             self.current_visit_note = self._load_visit_note(path)
@@ -5282,6 +5448,7 @@ class MainScreen(Screen):
 
         self.list_layout.clear_widgets()
         self.row_widgets = []
+        self._matched_indices = []  # v3.22.23: 重置，稍后填充
         # v3.22.7: 清空缓存（由 _create_row_widget 重新填充）
         self._row_widget_cache = {}
         self.scroll_view.scroll_y = 1
@@ -5308,6 +5475,8 @@ class MainScreen(Screen):
                 if q in val:
                     matched_indices.append(i)
 
+        self._matched_indices = matched_indices  # v3.22.23: 保存匹配行全集供全选使用
+
         if not self.rows:
             self._show_empty_state()
             self._update_progress()
@@ -5323,7 +5492,7 @@ class MainScreen(Screen):
         # v3.20.0: 搜索结果数提示
         if q:
             search_info = Label(
-                text="找到 %d 条匹配" % len(matched_indices),
+                text="找到 %d 条匹配（全选将选中全部 %d 条）" % (len(matched_indices), len(matched_indices)),
                 font_size='13sp', color=THEME['accent_dark'],
                 size_hint_y=None, height=dp(28), halign='left', valign='middle',
             )
@@ -6043,21 +6212,22 @@ class MainScreen(Screen):
         _scroll_input_to_visible_func(popup, text_input)
 
     def _on_select_all(self, checkbox, value):
-        """v3.22.22: 表头全选 CheckBox 触发 — 勾选仅选中当前搜索过滤后可见的行（self.row_widgets），
-        取消则仅清空可见行的选中态（保留不可见行选中态不变）。
+        """v3.22.23: 表头全选 CheckBox 触发 — 勾选选中当前搜索条件下的全部匹配行
+        （self._matched_indices，如搜索"阳光路1号楼"匹配 100 条则全选 100 条），
+        而非仅已渲染可见行。取消则清空全部匹配行的选中态。
         用 _updating_checkbox 标志位避免与 _on_row_selected 形成回调循环。"""
         if self._updating_checkbox:
             return
         self._updating_checkbox = True
         try:
             self._all_selected = bool(value)
-            visible_indices = {rw.row_index for rw in self.row_widgets}
+            matched_indices = set(self._matched_indices) if hasattr(self, '_matched_indices') else set()
             if value:
-                # 仅选中当前可见行（搜索过滤后的匹配行）
-                self._row_selected |= visible_indices
+                # 选中当前搜索匹配的全部行（含未渲染行）
+                self._row_selected |= matched_indices
             else:
-                # 仅清空当前可见行的选中态，保留不可见行选中态
-                self._row_selected -= visible_indices
+                # 清空当前搜索匹配的全部行选中态
+                self._row_selected -= matched_indices
             # 更新所有 RowWidget 显示（用 set_selected 避免回调循环）
             for rw in self.row_widgets:
                 try:
@@ -6082,10 +6252,10 @@ class MainScreen(Screen):
                 self._row_selected.add(row_index)
             else:
                 self._row_selected.discard(row_index)
-            # 同步表头 CheckBox 状态（v3.22.22: 分母改为当前可见行数）
-            visible_indices = {rw.row_index for rw in self.row_widgets}
-            visible_selected = len(visible_indices & self._row_selected)
-            if visible_indices and visible_selected == len(visible_indices):
+            # 同步表头 CheckBox 状态（v3.22.23: 分母改为当前搜索匹配行数 self._matched_indices）
+            matched_indices = set(self._matched_indices) if hasattr(self, '_matched_indices') else set()
+            matched_selected = len(matched_indices & self._row_selected)
+            if matched_indices and matched_selected == len(matched_indices):
                 # 全部选中 → 表头勾选
                 self._all_selected = True
                 self.header_checkbox.active = True
@@ -6626,6 +6796,7 @@ class MainScreen(Screen):
             dialog = VisitNoteDialog(
                 initial_text=self.current_visit_note,
                 on_confirm=_on_confirm,
+                on_save=self._save_visit_note_only,  # v3.22.23: 独立保存回调
             )
             dialog.open()
         except Exception as e:
@@ -6708,6 +6879,17 @@ class MainScreen(Screen):
             size_hint_y=None, height=dp(40)
         )
         content.add_widget(title_label)
+
+        # v3.22.23: 上一次 AI 报告质量为 low 时，在弹窗顶部提示用户人工核对
+        if getattr(self, '_report_quality', 'ok') == 'low':
+            quality_hint = Label(
+                text='⚠ 提示：AI 报告可能未充分参考补充说明，请人工核对',
+                font_size='12sp', color=THEME['danger'],
+                size_hint_y=None, height=dp(30),
+                halign='center', valign='middle',
+            )
+            quality_hint.bind(width=lambda i, v: setattr(i, 'text_size', (v, None)))
+            content.add_widget(quality_hint)
 
         # 进度信息
         # v3.22.6: 如有同类型标记，进度文案含「另有S户标记为同类型」
@@ -6886,9 +7068,14 @@ class MainScreen(Screen):
                     btn.disabled = False
                 except Exception:
                     pass
+                # v3.22.23: 读取 AI 报告质量校验结果，供下次 _show_report_confirm 展示提示
+                self._report_quality = getattr(self.report_generator, 'last_report_quality', 'ok')
                 if ok and path:
                     self._pending_report_path = path
-                    self._show_msg(m + "，正在选择保存位置…", THEME['success'])
+                    extra_hint = ''
+                    if self._report_quality == 'low':
+                        extra_hint = '\n⚠ 提示：AI 报告可能未充分参考补充说明，请人工核对'
+                    self._show_msg(m + "，正在选择保存位置…" + extra_hint, THEME['success'])
                     self._save_report_to_user(path)
                 else:
                     self._show_msg(m, THEME['danger'])
