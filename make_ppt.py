@@ -860,7 +860,7 @@ def create_presentation():
     # 实际上PPT页码需重新生成，这里更新page 12的显示
     # 由于python-pptx不易修改已添加元素，重新生成更稳妥，但为效率我们只更新output
     
-    output_path = r"C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.9.0.pptx"
+    output_path = r"C:\Users\Administrator\Desktop\资产盘点拍照工具-使用说明书-v3.22.22.pptx"
     prs.save(output_path)
     print(f"PPT已成功生成：{output_path}")
     return output_path

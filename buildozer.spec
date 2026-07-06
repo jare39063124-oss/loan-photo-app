@@ -10,7 +10,7 @@ version = 3.22.21
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius,requests,certifi,urllib3
 
-android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,READ_MEDIA_IMAGES,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
+android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION
 android.api = 35
 android.minapi = 24
 android.ndk = 28c

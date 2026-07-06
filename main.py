@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.21
+资产盘点专项拍照工具 App - v3.22.22
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -474,6 +474,63 @@ class RoundedSpinnerOption(SpinnerOption):
                 self._opt_bg = RoundedRectangle(pos=self.pos, size=self.size, radius=self._opt_radius)
                 Color(0, 0, 0, 0.18)
                 self._opt_border = Line(
+                    rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
+                    width=1.0)
+        except Exception:
+            pass
+
+
+# ============================================================
+# v3.22.22: RoundedSpinner — 圆角 Spinner，根治搜索类别倒角未生效问题
+# 原生 Spinner 的 background_image 是 BorderImage 直角纹理，即使设置
+# background_normal='' 仍覆盖 canvas.before 的圆角。本类清空所有背景纹理，
+# 由 canvas.before 全权绘制圆角实色背景 + 边框，与 RoundedButton 视觉一致。
+# ============================================================
+class RoundedSpinner(Spinner):
+    """v3.22.22: 圆角 Spinner — 在 canvas.before 绘制 RoundedRectangle 背景（radius=dp(8)）。
+    根治搜索类别 Spinner 倒角未生效问题：原生 Spinner 的 background_image 是 BorderImage
+    直角纹理，即使 background_normal='' 仍覆盖 canvas.before 的圆角。本类清空所有背景纹理属性，
+    由 canvas.before 全权绘制圆角实色背景 + 边框，与 RoundedButton / RoundedSpinnerOption 视觉一致。"""
+
+    def __init__(self, radius=None, **kwargs):
+        super().__init__(**kwargs)
+        # v3.22.22: 清空所有默认背景纹理（BorderImage 直角），改由 canvas.before 绘制圆角
+        self.background_normal = ''
+        self.background_down = ''
+        self.background_disabled_normal = ''
+        self.background_disabled_down = ''
+        # background_image / dropdown_background 也清空，防止直角纹理覆盖
+        try:
+            self.background_image = ''
+        except Exception:
+            pass
+        try:
+            self.dropdown_background = ''
+        except Exception:
+            pass
+
+        if radius is None:
+            radius = [dp(8)] * 4
+        self._rs_radius = list(radius)
+
+        # 绑定重绘：pos/size/state 变化时重绘圆角背景
+        self.bind(pos=self._draw_spinner_bg, size=self._draw_spinner_bg,
+                  state=self._draw_spinner_bg, background_color=self._draw_spinner_bg)
+        self._draw_spinner_bg()
+
+    def _draw_spinner_bg(self, *args):
+        try:
+            self.canvas.before.clear()
+            with self.canvas.before:
+                # state='down'（下拉展开时）变暗，提供视觉反馈
+                r, g, b, a = self.background_color
+                if self.state == 'down':
+                    r, g, b = r * 0.85, g * 0.85, b * 0.85
+                Color(r, g, b, a)
+                RoundedRectangle(pos=self.pos, size=self.size, radius=self._rs_radius)
+                # 圆角边框，增强倒角辨识
+                Color(0, 0, 0, 0.18)
+                Line(
                     rounded_rectangle=(self.x, self.y, self.width, self.height, dp(8)),
                     width=1.0)
         except Exception:
@@ -4468,7 +4525,7 @@ class MainScreen(Screen):
             _cur_field = '地址'
             self.config.set('search_field', '地址')
             self.config.save()
-        self.search_field_spinner = Spinner(
+        self.search_field_spinner = RoundedSpinner(
             text=_cur_field,
             values=['客户名', '序号', '地址', '备注'],
             font_size='13sp', size_hint_x=0.20,
@@ -5986,17 +6043,21 @@ class MainScreen(Screen):
         _scroll_input_to_visible_func(popup, text_input)
 
     def _on_select_all(self, checkbox, value):
-        """v3.22.19: 表头全选 CheckBox 触发 — 勾选则全选所有行，取消则清空选中。
+        """v3.22.22: 表头全选 CheckBox 触发 — 勾选仅选中当前搜索过滤后可见的行（self.row_widgets），
+        取消则仅清空可见行的选中态（保留不可见行选中态不变）。
         用 _updating_checkbox 标志位避免与 _on_row_selected 形成回调循环。"""
         if self._updating_checkbox:
             return
         self._updating_checkbox = True
         try:
             self._all_selected = bool(value)
+            visible_indices = {rw.row_index for rw in self.row_widgets}
             if value:
-                self._row_selected = set(range(len(self.rows)))
+                # 仅选中当前可见行（搜索过滤后的匹配行）
+                self._row_selected |= visible_indices
             else:
-                self._row_selected.clear()
+                # 仅清空当前可见行的选中态，保留不可见行选中态
+                self._row_selected -= visible_indices
             # 更新所有 RowWidget 显示（用 set_selected 避免回调循环）
             for rw in self.row_widgets:
                 try:
@@ -6021,9 +6082,10 @@ class MainScreen(Screen):
                 self._row_selected.add(row_index)
             else:
                 self._row_selected.discard(row_index)
-            # 同步表头 CheckBox 状态
-            total = len(self.rows)
-            if total > 0 and len(self._row_selected) == total:
+            # 同步表头 CheckBox 状态（v3.22.22: 分母改为当前可见行数）
+            visible_indices = {rw.row_index for rw in self.row_widgets}
+            visible_selected = len(visible_indices & self._row_selected)
+            if visible_indices and visible_selected == len(visible_indices):
                 # 全部选中 → 表头勾选
                 self._all_selected = True
                 self.header_checkbox.active = True
@@ -6154,23 +6216,21 @@ class MainScreen(Screen):
             item = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(220), spacing=dp(2))
             placeholder = Label(
                 text="加载中…", font_size='11sp', color=THEME['text_dim'],
-                size_hint_y=0.65, halign='center', valign='middle'
+                size_hint_y=0.78, halign='center', valign='middle'
             )
             item.add_widget(placeholder)
             thumb_slots.append(placeholder)
 
             fname = os.path.basename(photo_path)
-            if len(fname) > 16:
-                fname = fname[:13] + '...'
             name_label = Label(
-                text=fname, font_size='10sp', halign='center', valign='middle',
-                size_hint_y=0.15, color=THEME['text_dim'], text_size=(0, None)
+                text=fname, font_size='12sp', halign='center', valign='middle',
+                size_hint_y=0.13, color=THEME['text_dim'], text_size=(0, None)
             )
             name_label.bind(width=lambda inst, val: setattr(inst, 'text_size', (val, None)))
             item.add_widget(name_label)
 
             del_btn = RoundedButton(
-                text="删除", font_size='11sp', size_hint_y=0.20, height=dp(32),
+                text="删除", font_size='11sp', size_hint_y=0.09, height=dp(28),
                 background_color=THEME['danger'], background_normal='', color=(1, 1, 1, 1), bold=True
             )
             # v3.22.20: lambda 延迟绑定 popup（popup 在方法末尾才创建，lambda 执行时已存在）
@@ -6277,14 +6337,14 @@ class MainScreen(Screen):
                                 pos_in_parent = parent.children.index(slot)
                                 parent.remove_widget(slot)
                                 try:
-                                    img = KivyImage(source=display_path, size_hint_y=0.65,
+                                    img = KivyImage(source=display_path, size_hint_y=0.78,
                                                     allow_stretch=True, keep_ratio=True)
                                     parent.add_widget(img, pos_in_parent)
                                     thumb_slots[idx] = img
                                 except Exception as e:
                                     app_log.error('PHOTO', '设置缩略图失败 idx=%d: %s' % (idx, e))
                                     err_label = Label(text="加载失败", font_size='10sp', color=THEME['danger'],
-                                                      size_hint_y=0.65, halign='center', valign='middle')
+                                                      size_hint_y=0.78, halign='center', valign='middle')
                                     parent.add_widget(err_label, pos_in_parent)
                                     thumb_slots[idx] = err_label
                             except Exception as e:
@@ -6974,40 +7034,16 @@ class AIScreen(Screen):
         self.input_row.add_widget(send_btn)
         layout.add_widget(self.input_row)
 
-        # v3.22.21: 键盘遮挡修复 — 在布局底部添加可变高度 spacer。
-        # 键盘弹出时 spacer.height = 键盘高度，把 input_row 顶到键盘上方。
-        # 旧方案（v3.22.9）用 input_row.padding，但 input_row 是固定高度(dp(50))
-        # 的 BoxLayout，padding 仅在内部缩进子组件，不改变布局位置，input_row
-        # 仍在屏幕底部被键盘遮挡 — 这正是 v3.22.20 修复未生效的根因。
-        # spacer 在垂直 BoxLayout 中占据底部空间，scroll(size_hint_y=1) 自动收缩，
-        # input_row 随之上移到键盘上方。
-        self.keyboard_spacer = Widget(size_hint_y=None, height=0)
-        layout.add_widget(self.keyboard_spacer)
-
         self.add_widget(layout)
 
         # 欢迎消息
         self._add_message("assistant", "您好！我是AI拍摄助手，可以帮您查询拍摄进度。请问有什么需要？")
 
     def _on_input_focus(self, instance, value):
-        """v3.22.21: 焦点变化时滚动聊天到底部 + 兜底读取键盘高度。
-        旧方案仅依赖 on_keyboard_height 事件，但该事件在部分 Android 机型上
-        时机不稳定或与 focus 时序错开，导致 spacer 未及时撑开。
-        现增加兜底：聚焦后延迟读取 Window.keyboard_height，若 spacer 高度与
-        实际键盘高度不符则主动校正。"""
+        """v3.22.22: 焦点变化时滚动聊天到底部。resize 模式下 Window 自动收缩，无需 spacer 兜底。"""
         try:
             if value:
                 Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.3)
-                # v3.22.21: 兜底 — 延迟读取 Window.keyboard_height 校正 spacer
-                def _check_kb_height(dt):
-                    try:
-                        kh = Window.keyboard_height
-                        if kh > 0 and self.keyboard_spacer.height != kh:
-                            self.keyboard_spacer.height = kh
-                            Clock.schedule_once(lambda d: self._scroll_chat_to_bottom(), 0.1)
-                    except Exception:
-                        pass
-                Clock.schedule_once(_check_kb_height, 0.5)
         except Exception as e:
             app_log.error('AI', '_on_input_focus 异常: %s' % e)
 
@@ -7021,33 +7057,33 @@ class AIScreen(Screen):
             app_log.error('AI', '_scroll_chat_to_bottom 异常: %s' % e)
 
     def _on_keyboard_height(self, instance, height):
-        """v3.22.21: 键盘高度变化时撑开/收起 keyboard_spacer，把 input_row 顶到键盘上方。
-        替代 v3.22.9 的 input_row.padding 方案（padding 不改变固定高度 BoxLayout 的位置）。
-        Window.on_keyboard_height 是 Kivy Android 反映软键盘高度变化的标准事件。"""
+        """v3.22.22: 键盘高度变化时滚动聊天到底部（resize 模式下 Window 自动收缩布局，
+        无需手动撑开 spacer）。Window.on_keyboard_height 是 Kivy Android 反映软键盘高度变化的标准事件。"""
         try:
             if height > 0:
-                # 键盘弹出：spacer 撑开到键盘高度，input_row 上移到键盘上方
-                self.keyboard_spacer.height = height
-                # 延迟滚动聊天记录到底部（等键盘完全弹出）
-                Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.2)
-            else:
-                # 键盘收起：spacer 归零，恢复布局
-                self.keyboard_spacer.height = 0
+                # 键盘弹出：延迟滚动聊天记录到底部（等 resize 完成后布局稳定）
+                Clock.schedule_once(lambda dt: self._scroll_chat_to_bottom(), 0.3)
         except Exception as e:
             app_log.error('AI', '_on_keyboard_height 异常: %s' % e)
 
+    def on_enter(self):
+        """v3.22.22: 进入 AI 界面时切换到 resize 键盘模式，使整个布局收缩到键盘上方。"""
+        try:
+            Window.softinput_mode = 'resize'
+        except Exception as e:
+            app_log.error('AI', 'on_enter 设置 softinput_mode 异常: %s' % e)
+
     def on_leave(self):
-        """v3.22.21: 离开 AI 界面时收起键盘并归零 spacer。
-        不再解绑 on_keyboard_height — 旧版解绑后无 on_enter 重新绑定，
-        导致首次离开后再进入 AIScreen 时键盘事件永久失效（v3.22.20 修复未生效的另一根因）。
-        保持绑定到 app 生命周期，修改 spacer 在非可见时无副作用。"""
+        """v3.22.22: 离开 AI 界面时收起键盘并恢复默认 softinput_mode。
+        v3.22.21 的 keyboard_spacer 方案已移除（未真正收缩 scrollview，聊天内容仍被遮挡），
+        改用 Window.softinput_mode='resize' 让整个布局收缩到键盘上方。"""
         try:
             # 离开时收起键盘
             if self.input_field:
                 self.input_field.focus = False
-            # 归零 spacer，避免下次进入时残留键盘高度
-            if hasattr(self, 'keyboard_spacer'):
-                self.keyboard_spacer.height = 0
+            # v3.22.22: softinput_mode 保持全局 'resize'（在 build() 中设置），
+            # 主界面搜索框等同样依赖该模式，此处不切换以免破坏其他界面。
+            # Window.softinput_mode = 'resize'  # 已是全局默认，无需重复设置
         except Exception as e:
             app_log.error('AI', 'on_leave 异常: %s' % e)
 
@@ -7317,21 +7353,13 @@ class LoanPhotoApp(App):
                     main_screen.on_activity_result(request_code, result_code, intent)
 
     def _request_permissions(self):
-        # v3.22.18: 补全 Android 11+ 存储权限 + Android 13+ 媒体权限
+        # v3.22.22: 精简权限 — 移除 READ_MEDIA_IMAGES / READ_EXTERNAL_STORAGE / WRITE_EXTERNAL_STORAGE。
+        # 原因：查看已拍读取 app 私有目录 APP_DIR/thumbnails/（无需媒体权限）；
+        # 拍照通过 Camera Intent 返回的 URI 由 grantUriPermission 临时授权（无需持久 READ 权限）；
+        # 缩略图保存到 app 私有目录（无需 WRITE_EXTERNAL_STORAGE）。
         try:
-            if ANDROID_API >= 33:
-                # Android 13+: 细粒度媒体权限替代 READ_EXTERNAL_STORAGE
-                perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION, Permission.READ_MEDIA_IMAGES]
-            elif ANDROID_API >= 30:
-                # Android 11-12: 仍需要 READ_EXTERNAL_STORAGE
-                perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION,
-                         Permission.READ_EXTERNAL_STORAGE]
-            else:
-                perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
-                         Permission.ACCESS_COARSE_LOCATION,
-                         Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE]
+            perms = [Permission.CAMERA, Permission.ACCESS_FINE_LOCATION,
+                     Permission.ACCESS_COARSE_LOCATION]
             request_permissions(perms)
         except Exception:
             pass
