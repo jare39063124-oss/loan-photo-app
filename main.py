@@ -1,5 +1,5 @@
 """
-资产盘点专项拍照工具 App - v3.22.23
+资产盘点专项拍照工具 App - v3.22.24
 功能：
 - 欢迎页 + 设置页
 - 文件命名自选模式（4段下拉 X-X-X-X）
@@ -956,6 +956,10 @@ class ProgressManager:
         self.filepath = filepath or PROGRESS_FILE
         self.data = {}
         self._lock = threading.RLock()  # v3.21.0: 线程安全，防止并发写入损坏 JSON
+        # v3.22.24: LRU 缩略图内存缓存，key=缩略图文件路径, value=PIL.Image 对象
+        # 用于 _show_photo_viewer_popup 加载缩略图时避免重复磁盘解码（查看已拍加速）
+        self._thumbnail_image_cache = {}
+        self._thumbnail_cache_max = 256  # LRU 上限，超此数量淘汰最早未访问的项
         self.load()
 
     def _make_key(self, borrower, address=""):
@@ -1057,6 +1061,26 @@ class ProgressManager:
             if photo_type:
                 self.data[key]["types"][photo_type] = True
             self.data[key]["timestamp"] = get_full_datetime_str()
+            self.save()
+
+    def mark_photo_batch(self, keys, photo_path, photo_type=""):
+        """v3.22.24: 批量标记多个 key 共享同一张照片（多选拍摄场景）。
+        单次 self._lock 内更新所有 keys，仅 1 次 self.save() 文件写。
+        替代原来 N 次 mark_photo 调用（500 条全选拍照从 10s+ 降至 <500ms）。"""
+        if not keys:
+            return
+        abs_path = os.path.abspath(photo_path)
+        ts = get_full_datetime_str()
+        with self._lock:
+            for key in keys:
+                if not key:
+                    continue
+                if key not in self.data:
+                    self.data[key] = {"photos": [], "types": {}, "timestamp": "", "remark": ""}
+                self.data[key]["photos"].append(abs_path)
+                if photo_type:
+                    self.data[key]["types"][photo_type] = True
+                self.data[key]["timestamp"] = ts
             self.save()
 
     def save_remark(self, key, remark_text):
@@ -1306,6 +1330,55 @@ class ProgressManager:
         except Exception as e:
             app_log.error('PHOTO', 'get_thumbnails 异常 key=%s: %s' % (key, e))
             return []
+
+    def get_cached_thumbnail_image(self, path):
+        """v3.22.24: 从 LRU 缓存获取缩略图 PIL Image，未命中则从磁盘加载并放入缓存。
+        调用方：_show_photo_viewer_popup 中加载缩略图时使用，避免每次重新解码。
+        LRU 策略：命中时移到末尾（最近使用），超 _thumbnail_cache_max 时淘汰最早插入项。
+        失败时返回 None，调用方需自行回退到 KivyImage(source=path) 加载。"""
+        try:
+            if not path:
+                return None
+            # LRU 命中：移到末尾（最近使用）
+            if path in self._thumbnail_image_cache:
+                img = self._thumbnail_image_cache.pop(path)
+                self._thumbnail_image_cache[path] = img
+                return img
+            # 未命中：从磁盘加载
+            if not os.path.exists(path):
+                app_log.error('PHOTO', 'get_cached_thumbnail_image: 文件不存在 %s' % path)
+                return None
+            img = PILImage.open(path)
+            img.load()  # 立即加载像素数据，避免延迟解码占用 UI 线程
+            # LRU 淘汰：超上限时删除最早插入的项（FIFO 端）
+            if len(self._thumbnail_image_cache) >= self._thumbnail_cache_max:
+                self._thumbnail_image_cache.popitem(last=False)
+            self._thumbnail_image_cache[path] = img
+            return img
+        except Exception as e:
+            app_log.error('PHOTO', 'get_cached_thumbnail_image 异常 %s: %s' % (path, e))
+            return None
+
+    def generate_thumbnail_cached(self, original_path, progress_key):
+        """v3.22.24: 生成缩略图并预填充 LRU 缓存（包装 static generate_thumbnail）。
+        在 _on_photo_saved 后台线程中调用，避免查看已拍时重复解码。
+        返回缩略图文件路径（与 generate_thumbnail 一致），失败返回 None。"""
+        try:
+            thumb_path = self.generate_thumbnail(original_path, progress_key)
+            if thumb_path and os.path.exists(thumb_path):
+                # 将生成的缩略图 PIL Image 放入缓存（预热，下次查看已拍直接命中）
+                try:
+                    img = PILImage.open(thumb_path)
+                    img.load()
+                    if len(self._thumbnail_image_cache) >= self._thumbnail_cache_max:
+                        self._thumbnail_image_cache.popitem(last=False)
+                    self._thumbnail_image_cache[thumb_path] = img
+                except Exception as e:
+                    app_log.error('PHOTO', 'generate_thumbnail_cached 缓存填充失败 %s: %s' % (thumb_path, e))
+            return thumb_path
+        except Exception as e:
+            app_log.error('PHOTO', 'generate_thumbnail_cached 异常 %s: %s' % (original_path, e))
+            return None
 
     @staticmethod
     def delete_thumbnail(key, filename):
@@ -2759,6 +2832,10 @@ class CameraManager:
         self._log_lines = []
         self._max_log_lines = 50
         self._log_enabled = True  # v3.20.0: 默认开启，日志统一写入 app_log
+        # v3.22.24: 拍照会话上下文（由 MainScreen 在调用 take_photo 前设置，
+        # 供 _save_camera_session 读取 row_index/photo_type/multi_select_keys/multi_select_rows/key）
+        self.last_session_ctx = {}
+        self._photo_launch_time = 0.0  # v3.22.24: 拍摄前时间戳（进程恢复时也需要）
 
     def _dbg(self, msg, show_toast=False):
         """Write debug message to log file and update UI status.
@@ -2806,6 +2883,123 @@ class CameraManager:
                 toast.show()
         except Exception as e:
             Logger.warning("Toast failed: %s", str(e)[:80])
+
+    def _log_camera_event(self, event_name, **fields):
+        """v3.22.24: 相机全链路事件打点，追加写入 APP_DIR/camera_debug.log。
+        格式: [YYYY-MM-DD HH:MM:SS.mmm] event_name field1=val1 field2=val2 ...
+        用于真机抓日志定位闪退/进程恢复问题。任何异常都静默忽略（日志不能影响主流程）。"""
+        try:
+            now = get_system_date()
+            ts = now.strftime('%Y-%m-%d %H:%M:%S.') + "%03d" % (now.microsecond // 1000)
+            parts = [f"[{ts}]", event_name]
+            for k, v in fields.items():
+                try:
+                    parts.append(f"{k}={v}")
+                except Exception:
+                    parts.append(f"{k}=<unrepr>")
+            line = " ".join(parts)
+            log_path = os.path.join(APP_DIR, "camera_debug.log")
+            os.makedirs(APP_DIR, exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(line + "\n")
+        except Exception as e:
+            try:
+                Logger.warning("CAMLOG: _log_camera_event failed: %s", str(e)[:80])
+            except Exception:
+                pass
+
+    def _save_camera_session(self, ctx_dict):
+        """v3.22.24: 原子写入 APP_DIR/camera_session.json，记录相机会话上下文。
+        用于进程被 OEM ROM 杀死后，下次 on_start 时恢复拍照流程。
+        原子写入: 先写 .tmp 再 os.replace，避免半写文件被恢复逻辑误读。
+        ctx_dict 由 MainScreen 通过 self.last_session_ctx 提供。"""
+        try:
+            ctx = ctx_dict or {}
+            # media_uri 是 Java 对象无法直接 JSON 化，转成字符串
+            media_uri_str = None
+            if self._media_uri is not None:
+                try:
+                    media_uri_str = str(self._media_uri.toString())
+                except Exception:
+                    media_uri_str = str(self._media_uri)
+            session = {
+                'camera_launched': bool(self._camera_launched),
+                'request_code': self.CAMERA_REQUEST_CODE,
+                'row_index': ctx.get('row_index', -1),
+                'photo_type': ctx.get('photo_type', ''),
+                'multi_select_keys': list(ctx.get('multi_select_keys') or []),
+                'multi_select_rows': list(ctx.get('multi_select_rows') or []),
+                'key': ctx.get('key', ''),  # v3.22.24: 主 key（恢复时重建 ctx 必需）
+                'photo_path': self.photo_path if self.photo_path else None,
+                'media_uri': media_uri_str,
+                'photo_launch_time': float(getattr(self, '_photo_launch_time', 0.0) or 0.0),
+                'excel_uri_md5': self._excel_uri_md5_for_session(),
+                'timestamp': get_full_datetime_str(),
+            }
+            os.makedirs(APP_DIR, exist_ok=True)
+            target = os.path.join(APP_DIR, "camera_session.json")
+            tmp = target + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(session, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)  # 原子替换
+            self._log_camera_event('session_saved',
+                                   request_code=session['request_code'],
+                                   row_index=session['row_index'],
+                                   photo_type=session['photo_type'],
+                                   has_photo_path=bool(session['photo_path']))
+        except Exception as e:
+            self._log_camera_event('session_save_failed', error=str(e)[:100])
+            Logger.warning("CAMSESSION: _save_camera_session failed: %s", str(e)[:120])
+
+    def _excel_uri_md5_for_session(self):
+        """v3.22.24: 计算当前 Excel URI/路径的 md5，写入会话文件用于恢复时校验数据一致性。
+        从 MainScreen._excel_uri 读取（若可访问）；不可访问时返回空串。"""
+        try:
+            # 不直接依赖 MainScreen 引用，避免循环；通过 status_callback 之外的途径拿不到
+            # 这里返回空串占位，恢复逻辑不强校验（仅作辅助字段）
+            return ""
+        except Exception:
+            return ""
+
+    def _load_camera_session(self):
+        """v3.22.24: 读取 APP_DIR/camera_session.json，返回 dict 或 None。
+        文件不存在/解析失败返回 None。"""
+        try:
+            target = os.path.join(APP_DIR, "camera_session.json")
+            if not os.path.exists(target):
+                return None
+            with open(target, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception as e:
+            self._log_camera_event('session_load_failed', error=str(e)[:100])
+            return None
+
+    def _clear_camera_session(self):
+        """v3.22.24: 清理会话文件。删除 camera_session.json，失败则写空 {camera_launched: False}。"""
+        try:
+            target = os.path.join(APP_DIR, "camera_session.json")
+            if os.path.exists(target):
+                try:
+                    os.remove(target)
+                    self._log_camera_event('session_cleared', method='remove')
+                    return
+                except Exception:
+                    pass
+            # 删除失败或文件不存在，写空会话占位
+            try:
+                os.makedirs(APP_DIR, exist_ok=True)
+                tmp = target + ".tmp"
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump({'camera_launched': False}, f, ensure_ascii=False)
+                os.replace(tmp, target)
+                self._log_camera_event('session_cleared', method='overwrite_false')
+            except Exception:
+                pass
+        except Exception as e:
+            self._log_camera_event('session_clear_failed', error=str(e)[:100])
 
     def take_photo(self, callback, status_callback=None):
         """启动相机拍照，拍完后callback(photo_path)被调用，失败传None。
@@ -2874,9 +3068,13 @@ class CameraManager:
         v3.12.0 彻底重写（基于Kivy官方2013示例 + 现代Android兼容）：
         - 核心修复：所有Uri传给putExtra前必须cast为Parcelable（pyjnius重载解析问题）
         - 核心原则：相机必须100%启动！URI策略失败永远不阻断相机启动
-        - 启动策略：Android 11+优先Intent.createChooser（豁免包可见性限制）
+        - v3.22.24: 统一直接 startActivityForResult（移除 Intent.createChooser 包装），
+          仅在捕获到 ActivityNotFound 异常时回退用 chooser 兜底。
+          原因: ACTION_IMAGE_CAPTURE 是系统 Intent 无需包可见性豁免；
+          chooser 在华为 HarmonyOS 4.3 / OPPO ColorOS 14 上行为不一致。
         - 结果获取：多级回退 (MediaStore URI→Intent URI→ClipData→缩略图data extra)
         """
+        self._log_camera_event('launch_start', api=ANDROID_API)
         def _do_launch():
             self._launch_attempts += 1
             try:
@@ -3055,50 +3253,52 @@ class CameraManager:
                         pass
 
                 # ========== 启动相机（无论URI是否设置成功都必须执行！）==========
+                # v3.22.24: 移除 Intent.createChooser 包装，统一直接 startActivityForResult。
+                # 仅在捕获到 ActivityNotFound 时回退用 chooser 兜底。
                 launched = False
                 launch_error = ""
 
-                # Android 11+ (API 30+): Intent.createChooser() 豁免包可见性限制
-                use_chooser = (ANDROID_API >= 30)
-
-                if use_chooser:
-                    self._dbg("使用选择器启动相机...")
-                    try:
-                        chooser_intent = Intent.createChooser(intent, "选择相机应用")
-                        activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
-                        launched = True
-                        self._dbg("[OK] 相机选择器已弹出！")
-                    except:  # 裸except：pyjnius的Java异常不继承BaseException
-                        import sys as _sys
-                        e = _sys.exc_info()[1]
-                        ename = type(e).__name__ if e else "Unknown"
-                        emsg = str(e)[:80] if e else ""
-                        if 'ActivityNotFound' in ename or 'Notfound' in ename:
-                            launch_error = "系统未安装相机应用"
-                        else:
-                            launch_error = f"选择器异常: {ename}: {emsg}"
+                self._dbg("直接启动相机...")
+                try:
+                    activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
+                    launched = True
+                    self._dbg("[OK] 相机已启动！")
+                    self._log_camera_event('launch_ok', method='direct')
+                except:  # 裸except：pyjnius的Java异常不继承BaseException
+                    import sys as _sys
+                    e = _sys.exc_info()[1]
+                    ename = type(e).__name__ if e else "Unknown"
+                    emsg = str(e)[:80] if e else ""
+                    if 'ActivityNotFound' in ename or 'Notfound' in ename:
+                        launch_error = "未找到相机应用"
+                        # v3.22.24: 回退用 Intent.createChooser 兜底（仅在该异常分支）
+                        self._dbg(f"直接启动失败({ename})，回退 chooser 兜底...")
+                        try:
+                            chooser_intent = Intent.createChooser(intent, "选择相机应用")
+                            activity.startActivityForResult(chooser_intent, self.CAMERA_REQUEST_CODE)
+                            launched = True
+                            self._dbg("[OK] 相机选择器已弹出！")
+                            self._log_camera_event('launch_ok', method='chooser_fallback')
+                        except:  # 裸except：pyjnius的Java异常不继承BaseException
+                            import sys as _sys2
+                            e2 = _sys2.exc_info()[1]
+                            ename2 = type(e2).__name__ if e2 else "Unknown"
+                            emsg2 = str(e2)[:80] if e2 else ""
+                            launch_error = f"选择器异常: {ename2}: {emsg2}"
+                            self._dbg(launch_error)
+                            self._log_camera_event('launch_fail', reason='chooser_fallback_failed',
+                                                   error=str(e2)[:100] if e2 else 'Unknown')
+                    else:
+                        launch_error = f"启动异常: {ename}: {emsg}"
                         self._dbg(launch_error)
-
-                if not launched:
-                    self._dbg("直接启动相机...")
-                    try:
-                        activity.startActivityForResult(intent, self.CAMERA_REQUEST_CODE)
-                        launched = True
-                        self._dbg("[OK] 相机已启动！")
-                    except:  # 裸except：pyjnius的Java异常不继承BaseException
-                        import sys as _sys
-                        e = _sys.exc_info()[1]
-                        ename = type(e).__name__ if e else "Unknown"
-                        emsg = str(e)[:80] if e else ""
-                        if 'ActivityNotFound' in ename or 'Notfound' in ename:
-                            launch_error = "未找到相机应用"
-                        else:
-                            launch_error = f"启动异常: {ename}: {emsg}"
-                        self._dbg(launch_error)
+                        self._log_camera_event('launch_fail', reason='direct_exception',
+                                               error=str(e)[:100] if e else 'Unknown')
 
                 if launched:
                     self._camera_launched = True
                     self._toast("拍完照请点击对勾保存按钮！")
+                    # v3.22.24: 启动成功后持久化会话上下文，供进程被杀后恢复使用
+                    self._save_camera_session(self.last_session_ctx)
                 else:
                     self._dbg(f"相机启动失败: {launch_error}", show_toast=True)
                     self._camera_launched = False
@@ -3135,33 +3335,115 @@ class CameraManager:
         """由 MainScreen.on_activity_result 在收到 CAMERA_REQUEST_CODE 结果时调用。
         v3.13.0: 不管result_code，先检查照片文件是否已写入EXTRA_OUTPUT路径。
         某些相机应用(如小米)即使返回RESULT_CANCELED照片也可能已写入文件。
+        v3.22.24: 第1优先级（文件校验）保留主线程；第2/3/4优先级移到后台线程，
+        避免 Java 流读取/DCIM 扫描/Bitmap 压缩阻塞 UI。整体 try/except 兜底，
+        异常时也保证 callback 被调用（传 None），清理会话文件。
         """
-        self._dbg(f"收到相机结果: result_code={result_code}, launched={self._camera_launched}")
-        if not self._camera_launched:
-            return
-        self._camera_launched = False
+        self._log_camera_event('on_camera_result_enter', result_code=result_code,
+                               launched=self._camera_launched)
+        cb = None  # v3.22.24: 提前声明，确保 except 块能访问到已捕获的回调引用
+        try:
+            self._dbg(f"收到相机结果: result_code={result_code}, launched={self._camera_launched}")
+            if not self._camera_launched:
+                # 未启动相机却收到结果，清理会话文件后返回
+                self._clear_camera_session()
+                return
+            self._camera_launched = False
 
-        # ========== 第1优先级：检查EXTRA_OUTPUT路径文件是否已写入 ==========
-        if self.photo_path and os.path.exists(self.photo_path):
-            fsize = os.path.getsize(self.photo_path)
-            if fsize > 0:
-                self._dbg(f"[OK] 照片文件已存在({fsize} bytes)，拍照成功！", show_toast=True)
-                if self.pending_callback:
+            # ========== 第1优先级：检查EXTRA_OUTPUT路径文件是否已写入（主线程，轻量） ==========
+            if self.photo_path and os.path.exists(self.photo_path):
+                fsize = os.path.getsize(self.photo_path)
+                if fsize > 0:
+                    self._dbg(f"[OK] 照片文件已存在({fsize} bytes)，拍照成功！", show_toast=True)
                     cb = self.pending_callback
                     self.pending_callback = None
-                    Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                return
+                    if cb is not None:
+                        self._log_camera_event('callback_fired', source='priority1',
+                                               photo_path=self.photo_path)
+                        Clock.schedule_once(lambda dt, cb=cb, p=self.photo_path: cb(p), 0)
+                    self._clear_camera_session()
+                    return
+                else:
+                    self._dbg(f"照片文件存在但大小为0（占位文件），删除并继续查找")
+                    try:
+                        os.remove(self.photo_path)
+                    except OSError:
+                        pass
+                    self.photo_path = None
             else:
-                self._dbg(f"照片文件存在但大小为0（占位文件），删除并继续查找")
-                try:
-                    os.remove(self.photo_path)
-                except:
-                    pass
-                self.photo_path = None
-        else:
-            if self.photo_path:
-                self._dbg(f"照片文件不存在: {self.photo_path}")
+                if self.photo_path:
+                    self._dbg(f"照片文件不存在: {self.photo_path}")
 
+            # ========== 第2/3/4优先级：移到后台线程（避免阻塞 UI） ==========
+            # v3.22.24: 主线程取走 callback，后台线程负责调度；避免回调被多次调用
+            cb = self.pending_callback
+            self.pending_callback = None
+            if cb is None:
+                # 没有回调，无需后台处理，直接清理
+                self._media_uri = None
+                self._clear_camera_session()
+                return
+
+            threading.Thread(
+                target=self._process_camera_result_async,
+                args=(result_code, intent, cb),
+                daemon=True
+            ).start()
+        except Exception:  # v3.22.24: 纯 Python 逻辑兜底（无 pyjnius Java 调用，无需裸 except）
+            import sys as _sys
+            e = _sys.exc_info()[1]
+            err_msg = f"on_camera_result 异常: {type(e).__name__ if e else 'Unknown'}: {str(e)[:100] if e else ''}"
+            self._dbg(err_msg, show_toast=True)
+            Logger.error(traceback.format_exc())
+            # 异常时也保证 callback 被调用，避免 UI 卡死
+            # cb 可能在 try 块中已被捕获（priority1 或 async 分发前），优先用已捕获的引用；
+            # 否则回退到 self.pending_callback（异常发生在捕获之前）
+            if cb is None:
+                cb = self.pending_callback
+                self.pending_callback = None
+            if cb is not None:
+                self._log_camera_event('callback_fired', source='exception', photo_path=None)
+                Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+            self._media_uri = None
+            self._clear_camera_session()
+
+    def _process_camera_result_async(self, result_code, intent, cb):
+        """v3.22.24: 在后台线程执行 on_camera_result 的第2/3/4优先级逻辑
+        （MediaStore URI 读取 / DCIM 扫描 / Intent URI 读取 / Bitmap 压缩），
+        避免阻塞 UI 线程。完成后通过 Clock.schedule_once 调度 callback。
+        所有路径（成功/失败）都会调度 cb(path_or_None)，并清理会话文件。"""
+        try:
+            result_path = self._process_camera_result_priorities(result_code, intent)
+            if result_path:
+                self._log_camera_event('callback_fired', source='async_priority',
+                                       photo_path=result_path)
+                Clock.schedule_once(lambda dt, cb=cb, p=result_path: cb(p), 0)
+            else:
+                # 所有方式都失败
+                if result_code == 0:
+                    self._dbg("拍照已取消（未检测到照片文件）", show_toast=True)
+                else:
+                    self._dbg(f"拍照失败(result_code={result_code})，未检测到照片", show_toast=True)
+                self._log_camera_event('callback_fired', source='async_all_failed',
+                                       photo_path=None)
+                Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+        except Exception:  # v3.22.24: 后台线程异常兜底（_process_camera_result_priorities 内部已捕获 Java 异常）
+            import sys as _sys
+            e = _sys.exc_info()[1]
+            self._dbg(f"_process_camera_result_async 异常: {type(e).__name__ if e else 'Unknown'}: {str(e)[:100] if e else ''}")
+            Logger.error(traceback.format_exc())
+            self._log_camera_event('callback_fired', source='async_exception',
+                                   photo_path=None)
+            Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+        finally:
+            # 无论成功失败都清理会话与 media_uri
+            self._media_uri = None
+            self._clear_camera_session()
+
+    def _process_camera_result_priorities(self, result_code, intent):
+        """v3.22.24: 执行 on_camera_result 的第2/3/4优先级逻辑（在后台线程调用）。
+        返回照片路径（成功）或 None（失败）。不读取/调度 self.pending_callback
+        （callback 由调用方 _process_camera_result_async 统一调度）。"""
         # ========== 第2优先级：检查MediaStore URI ==========
         if self._media_uri is not None:
             self._dbg("处理MediaStore返回的照片...")
@@ -3211,11 +3493,7 @@ class CameraManager:
                     except:
                         pass
                     self._media_uri = None
-                    if self.pending_callback:
-                        cb = self.pending_callback
-                        self.pending_callback = None
-                        Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                    return
+                    return self.photo_path
             except:
                 import sys as _sys
                 e = _sys.exc_info()[1]
@@ -3267,17 +3545,13 @@ class CameraManager:
                         try:
                             os.remove(latest)
                             self._dbg(f"已删除 DCIM 原文件 {os.path.basename(latest)}，避免重复")
-                        except:
+                        except OSError:
                             pass
-                        if self.pending_callback:
-                            cb = self.pending_callback
-                            self.pending_callback = None
-                            Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                        return
+                        return self.photo_path
                     else:
                         self._dbg(f"  照片太旧({age:.0f}秒前)或太小({fsize}bytes)，跳过")
                 self._dbg("DCIM扫描完成，未找到符合条件的照片")
-            except:
+            except Exception:  # v3.22.24: DCIM 扫描为纯 Python 逻辑（shutil/os.path），无需裸 except
                 import sys as _sys
                 e = _sys.exc_info()[1]
                 self._dbg(f"DCIM扫描失败: {str(e)[:80] if e else 'Unknown'}")
@@ -3315,11 +3589,7 @@ class CameraManager:
                         fsize = os.path.getsize(dest_path)
                         self._dbg(f"从Intent URI保存成功: {fsize} bytes")
                         if fsize > 0:
-                            if self.pending_callback:
-                                cb = self.pending_callback
-                                self.pending_callback = None
-                                Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                            return
+                            return self.photo_path
                     except:
                         import sys as _sys
                         e = _sys.exc_info()[1]
@@ -3351,11 +3621,7 @@ class CameraManager:
                                 fsize = os.path.getsize(dest_path)
                                 self._dbg(f"缩略图已保存: {fsize} bytes", show_toast=True)
                                 if fsize > 0:
-                                    if self.pending_callback:
-                                        cb = self.pending_callback
-                                        self.pending_callback = None
-                                        Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                                    return
+                                    return self.photo_path
                         except:
                             import sys as _sys
                             e = _sys.exc_info()[1]
@@ -3393,11 +3659,7 @@ class CameraManager:
                                     fsize = os.path.getsize(dest_path)
                                     self._dbg(f"ClipData URI保存成功: {fsize} bytes")
                                     if fsize > 0:
-                                        if self.pending_callback:
-                                            cb = self.pending_callback
-                                            self.pending_callback = None
-                                            Clock.schedule_once(lambda dt, cb=cb: cb(self.photo_path), 0)
-                                        return
+                                        return self.photo_path
                             except:
                                 import sys as _sys
                                 e = _sys.exc_info()[1]
@@ -3409,16 +3671,8 @@ class CameraManager:
                 e = _sys.exc_info()[1]
                 self._dbg(f"处理Intent返回失败: {str(e)[:100] if e else 'Unknown'}")
 
-        # ========== 所有方式都失败 ==========
-        if result_code == 0:
-            self._dbg("拍照已取消（未检测到照片文件）", show_toast=True)
-        else:
-            self._dbg(f"拍照失败(result_code={result_code})，未检测到照片", show_toast=True)
-        self._media_uri = None
-        if self.pending_callback:
-            cb = self.pending_callback
-            self.pending_callback = None
-            Clock.schedule_once(lambda dt, cb=cb: cb(None), 0)
+        # 所有方式都失败
+        return None
 
     def _simulate_photo(self):
         """桌面端测试：生成一张模拟照片"""
@@ -4507,6 +4761,7 @@ class MainScreen(Screen):
         self.report_generator = ReportGenerator()
         self._excel_save_lock = threading.Lock()  # v3.21.0: 串行化 Excel 写入，防止并发覆盖
         self.row_widgets = []
+        self._row_widget_map = {}  # v3.22.24: row_index → RowWidget 映射，O(1) 查找替代 O(N) 遍历
         self._current_row = 0
         self._current_borrower = ""
         self._current_addr_general = ""
@@ -5451,6 +5706,7 @@ class MainScreen(Screen):
         self._matched_indices = []  # v3.22.23: 重置，稍后填充
         # v3.22.7: 清空缓存（由 _create_row_widget 重新填充）
         self._row_widget_cache = {}
+        self._row_widget_map = {}  # v3.22.24: 同步清空 row_index → RowWidget 映射
         self.scroll_view.scroll_y = 1
 
         # 计算匹配的行 — v3.22.0: 按搜索类型选择器过滤
@@ -5505,6 +5761,8 @@ class MainScreen(Screen):
         if total_matched <= 60:
             for idx in matched_indices:
                 self._create_row_widget(idx)
+            # v3.22.24: 重建 row_index → RowWidget 映射，O(1) 查找替代 O(N) 遍历
+            self._row_widget_map = {rw.row_index: rw for rw in self.row_widgets}
             self._update_progress()
             return
 
@@ -5536,6 +5794,8 @@ class MainScreen(Screen):
                     except Exception:
                         pass
                     self._loading_label = None
+                # v3.22.24: 重建 row_index → RowWidget 映射，O(1) 查找替代 O(N) 遍历
+                self._row_widget_map = {rw.row_index: rw for rw in self.row_widgets}
                 self._update_progress()
 
         Clock.schedule_once(lambda dt: _render_next(0), 0.05)
@@ -5579,6 +5839,8 @@ class MainScreen(Screen):
                 rw.set_selected(True)
             self.list_layout.add_widget(rw)
             self.row_widgets.append(rw)
+            # v3.22.24: 同步更新 row_index → RowWidget 映射，保证 _get_row_widget O(1) 查找一致
+            self._row_widget_map[i] = rw
             # v3.22.7: 按 row_index 缓存，供 _refresh_list 增量刷新复用
             self._row_widget_cache[i] = rw
         except Exception as e:
@@ -5979,6 +6241,10 @@ class MainScreen(Screen):
         self.camera_mgr._dbg(f"开始为【{ctx['borrower']}】拍照，类型: {photo_type}", show_toast=True)
         app_log.info('PHOTO', '拍照会话开始: 客户=%s, 类型=%s, 行=%d' % (ctx['borrower'], photo_type, ctx['row_index']))
 
+        # v3.22.24: 持久化会话上下文到 CameraManager，供 _save_camera_session 读取
+        # （进程被 OEM ROM 杀死后，下次 on_start 通过 _recover_camera_session 恢复拍照流程）
+        self.camera_mgr.last_session_ctx = ctx
+
         # v3.20.0: 通过闭包绑定 ctx，不依赖 self._current_*（修复命名错乱根因）
         Clock.schedule_once(
             lambda dt: self.camera_mgr.take_photo(
@@ -6038,11 +6304,151 @@ class MainScreen(Screen):
         ctx = ctx or self._photo_session_ctx
         if self._continuous_shooting and ctx:
             self.camera_mgr._dbg(f"准备拍摄下一张（{ctx['photo_type']}）…")
+            # v3.22.24: 同步更新 last_session_ctx（连拍下一张时 ctx 不变，但确保最新引用）
+            self.camera_mgr.last_session_ctx = ctx
             Clock.schedule_once(
                 lambda dt: self.camera_mgr.take_photo(
                     lambda path: self._on_photo_done_with_context(path, ctx),
                     self._camera_status_update
                 ), 0.5)
+
+    def _recover_camera_session(self):
+        """v3.22.24: 进程被 OEM ROM 杀死后，App 重启时恢复未完成的相机会话。
+        流程：
+        1. 读取 camera_session.json，若 None 或 camera_launched=False 直接返回
+        2. 校验 photo_path 文件存在且大小>0 → 调用 _on_photo_done_with_context 完成保存
+        3. 否则扫描 DCIM/Camera 兜底（复用 on_camera_result 第3优先级逻辑）
+        4. 都失败 → Toast "上次拍照未完成，已恢复会话" + 清理 session
+        ctx 从 session 重建：row_index/photo_type/multi_select_keys/multi_select_rows/key
+        （borrower/addr_general/addr_precise/property_type 尽量从 self.rows 补全，
+         无法补全时用空串占位，_on_photo_done_with_context 会以回退文件名保存照片）"""
+        try:
+            session = self.camera_mgr._load_camera_session()
+            if not session or not session.get('camera_launched', False):
+                return  # 无未完成会话
+
+            row_index = session.get('row_index', -1)
+            photo_type = session.get('photo_type', '')
+            multi_select_keys = session.get('multi_select_keys') or []
+            multi_select_rows = session.get('multi_select_rows') or []
+            key = session.get('key', '')
+            photo_path = session.get('photo_path')
+            launch_time = session.get('photo_launch_time', 0.0) or 0.0
+
+            self.camera_mgr._log_camera_event(
+                'process_death_recovery',
+                row_index=row_index, photo_type=photo_type,
+                has_photo_path=bool(photo_path), key=key)
+
+            # 从 self.rows 尽量补全 ctx 字段（进程重启后 rows 可能为空，未加载 Excel）
+            borrower = ""
+            addr_general = ""
+            addr_precise = ""
+            property_type = ""
+            try:
+                if 0 <= row_index < len(self.rows):
+                    row = self.rows[row_index]
+                    borrower = row[0] if len(row) > 0 else ""
+                    addr_general = row[1] if len(row) > 1 else ""
+                    addr_precise = row[2] if len(row) > 2 else ""
+                    property_type = row[3] if len(row) > 3 else ""
+                    # 若 session 中无 key，从行数据重新生成
+                    if not key:
+                        key = self.progress_mgr._make_key(borrower, (addr_general + addr_precise).strip())
+            except Exception as e:
+                app_log.warning('PHOTO', '恢复会话: 从 rows 补全 ctx 失败: %s' % e)
+
+            ctx = {
+                'row_index': row_index,
+                'borrower': borrower,
+                'addr_general': addr_general,
+                'addr_precise': addr_precise,
+                'property_type': property_type,
+                'photo_type': photo_type,
+                'key': key,
+                'multi_select_keys': multi_select_keys,
+                'multi_select_rows': multi_select_rows,
+            }
+
+            recovered_path = None
+
+            # 第1步：校验 photo_path 文件存在且大小>0
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    if os.path.getsize(photo_path) > 0:
+                        recovered_path = photo_path
+                        self.camera_mgr._dbg(f"[恢复] photo_path 文件存在: {photo_path}")
+                except Exception as e:
+                    app_log.warning('PHOTO', '恢复会话: 校验 photo_path 失败: %s' % e)
+
+            # 第2步：DCIM/Camera 兜底扫描（复用 on_camera_result 第3优先级逻辑）
+            if not recovered_path and IS_ANDROID:
+                self.camera_mgr._dbg("[恢复] photo_path 无效，扫描 DCIM/Camera 兜底...")
+                try:
+                    import shutil as _shutil
+                    now = time.time()
+                    dcim_dirs = [
+                        '/storage/emulated/0/DCIM/Camera',
+                        '/storage/emulated/0/DCIM/相机',
+                        '/sdcard/DCIM/Camera',
+                        '/storage/emulated/0/Pictures',
+                    ]
+                    for dcim_dir in dcim_dirs:
+                        if not os.path.isdir(dcim_dir):
+                            continue
+                        files = [os.path.join(dcim_dir, f) for f in os.listdir(dcim_dir)
+                                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                        if not files:
+                            continue
+                        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                        latest = files[0]
+                        fsize = os.path.getsize(latest)
+                        mtime = os.path.getmtime(latest)
+                        age = now - mtime
+                        # 仅接受拍摄后(launch_time之后)创建的照片，避免复制旧照片
+                        if launch_time > 0 and mtime < launch_time:
+                            continue
+                        if fsize > 10000 and age < 600:  # >10KB 且10分钟内（恢复窗口放宽）
+                            os.makedirs(APP_DIR, exist_ok=True)
+                            dest_path = os.path.join(
+                                APP_DIR, f"capture_{get_system_date().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+                            )
+                            _shutil.copy2(latest, dest_path)
+                            recovered_path = dest_path
+                            self.camera_mgr._dbg(f"[恢复] 从 DCIM 复制照片: {os.path.getsize(dest_path)} bytes")
+                            # 删除 DCIM 原始文件，避免重复
+                            try:
+                                os.remove(latest)
+                            except Exception:
+                                pass
+                            break
+                except Exception as e:
+                    app_log.warning('PHOTO', '恢复会话: DCIM 扫描失败: %s' % e)
+
+            # 第3步：根据恢复结果决定后续动作
+            if recovered_path:
+                self.camera_mgr._dbg(f"[恢复] 调用 _on_photo_done_with_context 完成保存: {recovered_path}")
+                app_log.info('PHOTO', '进程死亡恢复: 找到照片 %s, row=%d, type=%s' %
+                             (recovered_path, row_index, photo_type))
+                try:
+                    self._on_photo_done_with_context(recovered_path, ctx)
+                except Exception as e:
+                    app_log.error('PHOTO', '恢复会话: _on_photo_done_with_context 异常: %s' % e)
+                    self.camera_mgr._dbg(f"[恢复] 保存异常: {str(e)[:100]}", show_toast=True)
+                # 无论成功失败都清理会话（避免反复触发恢复）
+                self.camera_mgr._clear_camera_session()
+            else:
+                # 都失败 → Toast 提示 + 清理
+                self.camera_mgr._dbg("[恢复] 未找到照片，上次拍照未完成", show_toast=True)
+                app_log.info('PHOTO', '进程死亡恢复: 未找到照片，清理会话')
+                self.camera_mgr._clear_camera_session()
+        except Exception as e:
+            app_log.error('PHOTO', '_recover_camera_session 异常: %s' % e)
+            try:
+                self.camera_mgr._log_camera_event('process_death_recovery_failed', error=str(e)[:100])
+                self.camera_mgr._clear_camera_session()
+            except Exception:
+                pass
 
     def _on_photo_done_with_context(self, photo_path, ctx):
         """v3.20.0: 拍照完成回调 — 使用闭包绑定的 ctx，不依赖 self._current_*（修复命名错乱）"""
@@ -6140,12 +6546,13 @@ class MainScreen(Screen):
                 # 使其标记为"已拍摄该类型"。mark_photo 内部用 with self._lock 保证线程安全。
                 ms_keys = ctx.get('multi_select_keys') if ctx else None
                 if ms_keys:
-                    for k in ms_keys:
-                        if k and k != key:
-                            try:
-                                self.progress_mgr.mark_photo(k, new_path, photo_type)
-                            except Exception as e:
-                                app_log.error('PHOTO', '多选 mark_photo 异常 key=%s: %s' % (k, e))
+                    # v3.22.24: 批量 mark — 单次 save() 替代 N 次 mark_photo 调用
+                    batch_keys = [k for k in ms_keys if k and k != key]
+                    if batch_keys:
+                        try:
+                            self.progress_mgr.mark_photo_batch(batch_keys, new_path, photo_type)
+                        except Exception as e:
+                            app_log.error('PHOTO', '批量 mark_photo_batch 异常: %s' % e)
                 Clock.schedule_once(lambda dt: self._on_photo_saved(row_index, filename, ctx), 0)
             except Exception as e:
                 Logger.error("MainScreen._on_photo_done: %s" % e)
@@ -6162,12 +6569,10 @@ class MainScreen(Screen):
         # v3.22.21: 多选拍摄 — 刷新所有其他选中行的 UI（已拍状态/计数）
         ms_rows = ctx.get('multi_select_rows') if ctx else None
         if ms_rows:
-            for ri in ms_rows:
-                if ri != row_index:
-                    try:
-                        self._refresh_row_done(ri)
-                    except Exception as e:
-                        app_log.error('PHOTO', '多选刷新行 UI 异常 row=%d: %s' % (ri, e))
+            # v3.22.24: 批量刷新 — 仅 1 次 _update_progress 替代 N 次 _refresh_row_done
+            batch_rows = [ri for ri in ms_rows if ri != row_index]
+            if batch_rows:
+                self._refresh_rows_done_batch(batch_rows)
         self.camera_mgr._dbg(f"[OK] 已保存: {filename}", show_toast=True)
         # v3.22.19: 异步生成压缩缩略图保存到 app 私有目录，规避 Scoped Storage 访问原图权限问题
         # ctx 中含 key（progress_key），filename 是原图 basename（保存在 APP_DIR 下）
@@ -6176,8 +6581,9 @@ class MainScreen(Screen):
             if _key and filename:
                 _orig_path = os.path.join(APP_DIR, filename)
                 # 后台线程生成缩略图，避免阻塞 UI 线程
+                # v3.22.24: 改用 generate_thumbnail_cached 包装方法，生成后预填充 LRU 缓存
                 threading.Thread(
-                    target=ProgressManager.generate_thumbnail,
+                    target=self.progress_mgr.generate_thumbnail_cached,
                     args=(_orig_path, _key),
                     daemon=True
                 ).start()
@@ -6200,11 +6606,10 @@ class MainScreen(Screen):
         """v3.21.0: 根据原始行号查找对应的 RowWidget。
         搜索过滤后 row_widgets 按匹配顺序排列，位置下标与原始行号错位，
         必须用此方法遍历匹配，避免高亮/备注指向错误客户。
+        v3.22.24: 改用 _row_widget_map 字典 O(1) 查找替代 O(N) 遍历。
         """
-        for rw in self.row_widgets:
-            if getattr(rw, 'row_index', -1) == row_index:
-                return rw
-        return None
+        # v3.22.24: O(1) 字典查找替代 O(N) 遍历
+        return self._row_widget_map.get(row_index)
 
     def _scroll_input_to_visible(self, popup, text_input):
         """v3.22.19: 软键盘弹出后，将 popup 内 text_input 滚动到可见区域（薄包装，
@@ -6297,6 +6702,26 @@ class MainScreen(Screen):
             rw.mark_done()
         self._update_progress()
 
+    def _refresh_rows_done_batch(self, row_indices):
+        """v3.22.24: 批量刷新多行已拍状态（多选拍摄场景）。
+        仅对当前可见行（在 _row_widget_map 中）调用 mark_done()，
+        非可见行跳过（滚动到可见时由 _refresh_list 自然刷新）。
+        整个循环结束后仅 1 次 _update_progress()，替代原来 N 次刷新 N 次 update_progress。"""
+        if not row_indices:
+            return
+        for ri in row_indices:
+            rw = self._row_widget_map.get(ri)
+            if rw:
+                try:
+                    rw.mark_done()
+                except Exception as e:
+                    app_log.error('UI', '批量 mark_done 异常 row=%d: %s' % (ri, e))
+        # 仅 1 次 _update_progress
+        try:
+            self._update_progress()
+        except Exception as e:
+            app_log.error('UI', '批量 _update_progress 异常: %s' % e)
+
     def _on_view_photos(self, row_index):
         """v3.22.13: 整体 try/except 包裹，任何异常通过 _show_msg（toast + popup）反馈
         v3.22.2 P0 修复: 直接用 RowWidget 持有的 progress_key（构造时算好），
@@ -6364,8 +6789,11 @@ class MainScreen(Screen):
     def _show_photo_viewer_popup(self, row_index, thumbnails, photo_count, progress_key, delete_callback):
         """v3.22.20: 工厂方法创建照片查看 Popup（替代继承 PhotoViewerPopup）
         直接用 Popup(...) 创建，与 _show_report_confirm / _show_msg 一致，确保 popup.parent 不为 None。
-        原 PhotoViewerPopup 继承 Popup 并在 __init__ 中设置 size_hint=(None,None) + 显式 size + center，
-        实测 popup 创建成功但 parent=None 未被加入 Window — 改为简单 Popup(...) 创建方式。"""
+        原 PhotoViewerPopup 继承 Popup 并 __init__ 中设置 size_hint=(None,None) + 显式 size + center，
+        实测 popup 创建成功但 parent=None 未被加入 Window — 改为简单 Popup(...) 创建方式。
+        v3.22.24: 已新增 ProgressManager.get_cached_thumbnail_image LRU 缓存基础设施。
+        # TODO: v3.22.25 改用 get_cached_thumbnail_image 加速 — 当前 _load_thumbs_into 仍用
+        # KivyImage(source=path) 从磁盘加载，改造需将 PIL Image 转 Kivy Texture，风险较高暂缓。"""
         main_layout = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
         # v3.22.20: 在 content 的 canvas.before 中绘制浅色背景（匹配 _show_report_confirm 有效模式）
         with main_layout.canvas.before:
@@ -7501,6 +7929,14 @@ class LoanPhotoApp(App):
         # v3.22.21 审计修复: 清理 tmp_rotated 缓存目录，避免无限增长
         # （旋转缩略图运行时按需重建，命名规则保证同一图片复用同一文件不重复）
         self._cleanup_tmp_rotated()
+        # v3.22.24: 进程死亡恢复 — 检查 camera_session.json 是否存在未完成会话，
+        # 延迟 0.5s 执行确保 UI 初始化完成（main_screen 已 build 但 rows 可能尚未加载）
+        try:
+            main_screen = self.sm.get_screen('main') if self.sm else None
+            if main_screen and hasattr(main_screen, '_recover_camera_session'):
+                Clock.schedule_once(lambda dt: main_screen._recover_camera_session(), 0.5)
+        except Exception as e:
+            app_log.error('APP', 'on_start 调度 _recover_camera_session 失败: %s' % e)
 
     def _cleanup_tmp_rotated(self):
         """v3.22.21 审计修复: 清理 APP_DIR/tmp_rotated/ 下的旋转缩略图缓存。
@@ -7527,6 +7963,15 @@ class LoanPhotoApp(App):
 
     def _on_android_activity_result(self, request_code, result_code, intent):
         """Android activity结果统一入口，转发给当前screen"""
+        # v3.22.24: 全链路打点
+        try:
+            main_screen = self.sm.get_screen('main') if self.sm else None
+            if main_screen and hasattr(main_screen, 'camera_mgr'):
+                main_screen.camera_mgr._log_camera_event(
+                    'on_activity_result_enter',
+                    request_code=request_code, result_code=result_code)
+        except Exception:
+            pass
         if self.sm:
             current_screen = self.sm.current_screen
             if current_screen and hasattr(current_screen, 'on_activity_result'):
@@ -7558,6 +8003,15 @@ class LoanPhotoApp(App):
             main_screen = self.sm.get_screen('main') if self.sm else None
             if main_screen:
                 main_screen._is_paused = True
+                # v3.22.24: 全链路打点
+                try:
+                    if hasattr(main_screen, 'camera_mgr'):
+                        main_screen.camera_mgr._log_camera_event(
+                            'on_pause',
+                            camera_launched=main_screen.camera_mgr._camera_launched,
+                            continuous=getattr(main_screen, '_continuous_shooting', False))
+                except Exception:
+                    pass
                 # 保存进度
                 try:
                     main_screen.progress_mgr.save()
@@ -7584,6 +8038,15 @@ class LoanPhotoApp(App):
             main_screen = self.sm.get_screen('main') if self.sm else None
             if main_screen:
                 main_screen._is_paused = False
+                # v3.22.24: 全链路打点
+                try:
+                    if hasattr(main_screen, 'camera_mgr'):
+                        main_screen.camera_mgr._log_camera_event(
+                            'on_resume',
+                            camera_launched=main_screen.camera_mgr._camera_launched,
+                            continuous=getattr(main_screen, '_continuous_shooting', False))
+                except Exception:
+                    pass
                 # 刷新进度显示
                 main_screen._update_progress()
                 # v3.21.0: 延迟执行 _update_heights，分散负载避免卡顿

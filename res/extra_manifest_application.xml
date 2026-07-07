@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- v3.22.24: android:largeHeap="true" 期望注入 <application> 标签以启用大堆内存 -->
 <provider
     android:name="androidx.core.content.FileProvider"
     android:authorities="${packageId}.fileprovider"
     android:exported="false"
-    android:grantUriPermissions="true">
+    android:grantUriPermissions="true"
+    android:largeHeap="true">
     <meta-data
         android:name="android.support.FILE_PROVIDER_PATHS"
         android:resource="@xml/file_paths" />

@@ -6,11 +6,12 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,xlsx,ttf,otf,xml
 source.exclude_dirs = venv,__pycache__,tests,.git
 android.aars =
-version = 3.22.23
+version = 3.22.24
 
 requirements = python3,kivy,openpyxl,plyer,pillow,android,pyjnius,requests,certifi,urllib3
 
 android.permissions = CAMERA,INTERNET,ACCESS_NETWORK_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION
+android.large_heap = 1
 android.api = 35
 android.minapi = 24
 android.ndk = 28c
