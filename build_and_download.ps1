@@ -92,8 +92,8 @@ while ($true) {
 
 Write-Host ""
 Write-Host "=== Step 4: Downloading APK via nightly.link ===" -ForegroundColor Cyan
-$tempZip = Join-Path $env:TEMP "loan-apk-v32223.zip"
-$extractDir = Join-Path $env:TEMP "loan-apk-v32223-extract"
+$tempZip = Join-Path $env:TEMP "loan-apk-v32224.zip"
+$extractDir = Join-Path $env:TEMP "loan-apk-v32224-extract"
 $downloadUrl = "https://nightly.link/$repo/actions/runs/$runId/loan-photo-apk.zip"
 if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
 if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
